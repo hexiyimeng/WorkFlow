@@ -1,10 +1,43 @@
 # scripts/setup.ps1
-# BrainFlow basic setup script - Windows PowerShell
+# WorkFlow basic setup script - Windows PowerShell
 # Usage from project root: .\scripts\setup.ps1
 # Usage from scripts dir: .\setup.ps1
+# This script is generated for WorkFlow deployment.
+# It assumes this file lives in: <project-root>\scripts\
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
+function Invoke-Step {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ScriptBlock]$Command,
+        [Parameter(Mandatory=$true)]
+        [string]$ErrorMessage
+    )
+
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw $ErrorMessage
+    }
+}
+
+function Get-PipInstallArgs {
+    $args = @()
+    if ($env:WORKFLOW_PIP_INDEX_URL) {
+        $args += @("-i", $env:WORKFLOW_PIP_INDEX_URL)
+    } else {
+        $args += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple")
+    }
+
+    if ($env:WORKFLOW_PIP_TRUSTED_HOST) {
+        $args += @("--trusted-host", $env:WORKFLOW_PIP_TRUSTED_HOST)
+    } else {
+        $args += @("--trusted-host", "pypi.tuna.tsinghua.edu.cn")
+    }
+    return $args
+}
+
 $VenvDir = Join-Path $ProjectRoot ".venv"
 $FrontendDir = Join-Path $ProjectRoot "frontend"
 $BackendDir = Join-Path $ProjectRoot "backend"
@@ -14,12 +47,11 @@ $PythonExe = Join-Path $VenvDir "Scripts\python.exe"
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " BrainFlow Setup" -ForegroundColor Cyan
+Write-Host " WorkFlow Setup" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Project root: $ProjectRoot" -ForegroundColor Gray
 Write-Host ""
 
-# 1. Python venv
 Write-Host "[1/5] Setting up Python virtual environment..." -ForegroundColor Yellow
 if (Test-Path $PythonExe) {
     Write-Host "  .venv already exists, reusing: $VenvDir"
@@ -28,33 +60,33 @@ if (Test-Path $PythonExe) {
         Write-Warning "  .venv exists but python.exe is missing. Removing broken venv..."
         Remove-Item -Recurse -Force $VenvDir
     }
+
     Write-Host "  Creating .venv at $VenvDir ..."
-    python -m venv $VenvDir
+    Invoke-Step -Command { python -m venv $VenvDir } -ErrorMessage "Failed to create Python virtual environment."
 }
 
 if (-not (Test-Path $PythonExe)) {
     throw "Python executable was not created at $PythonExe"
 }
 
-# Ensure pip exists
 Write-Host "[2/5] Ensuring pip is available and up to date..." -ForegroundColor Yellow
 & $PythonExe -m pip --version *> $null
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "  pip is missing in .venv. Running ensurepip..."
-    & $PythonExe -m ensurepip --upgrade
+    Invoke-Step -Command { & $PythonExe -m ensurepip --upgrade } -ErrorMessage "ensurepip failed. Your Python installation may be broken."
 }
-& $PythonExe -m pip install --upgrade pip
 
-# 3. Install backend requirements
+$PipArgs = Get-PipInstallArgs
+Invoke-Step -Command { & $PythonExe -m pip install --upgrade pip @PipArgs } -ErrorMessage "Failed to upgrade pip."
+
 Write-Host "[3/5] Installing backend dependencies..." -ForegroundColor Yellow
 if (Test-Path $ReqFile) {
-    & $PythonExe -m pip install -r $ReqFile
+    Invoke-Step -Command { & $PythonExe -m pip install -r $ReqFile @PipArgs } -ErrorMessage "Backend dependency installation failed."
     Write-Host "  Backend deps installed." -ForegroundColor Green
 } else {
-    Write-Warning "  requirements.txt not found at $ReqFile, skipping."
+    throw "requirements.txt not found at $ReqFile"
 }
 
-# 4. Install frontend deps
 Write-Host "[4/5] Installing frontend dependencies..." -ForegroundColor Yellow
 if (Test-Path $FrontendDir) {
     Push-Location $FrontendDir
@@ -62,25 +94,27 @@ if (Test-Path $FrontendDir) {
         $LockFile = Join-Path $FrontendDir "package-lock.json"
         if (Test-Path $LockFile) {
             Write-Host "  package-lock.json found. Running npm ci..."
-            npm ci
+            Invoke-Step -Command { npm ci } -ErrorMessage "npm ci failed."
         } else {
             Write-Host "  package-lock.json not found. Running npm install..."
-            npm install
+            Invoke-Step -Command { npm install } -ErrorMessage "npm install failed."
         }
         Write-Host "  Frontend deps installed." -ForegroundColor Green
     } finally {
         Pop-Location
     }
 } else {
-    Write-Warning "  frontend/ not found at $FrontendDir, skipping."
+    throw "frontend/ not found at $FrontendDir"
 }
 
-# 5. Build frontend
 Write-Host "[5/5] Building frontend..." -ForegroundColor Yellow
 if (Test-Path $BuildScript) {
     & $BuildScript
+    if ($LASTEXITCODE -ne 0) {
+        throw "Frontend build failed."
+    }
 } else {
-    Write-Warning "  build_frontend.ps1 not found at $BuildScript, skipping build."
+    throw "build_frontend.ps1 not found at $BuildScript"
 }
 
 Write-Host ""

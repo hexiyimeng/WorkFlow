@@ -1,10 +1,43 @@
 # scripts/update.ps1
-# BrainFlow update script - pull latest code and rebuild - Windows PowerShell
+# WorkFlow update script - pull latest code and rebuild - Windows PowerShell
 # Usage from project root: .\scripts\update.ps1
 # Usage from scripts dir: .\update.ps1
+# This script is generated for WorkFlow deployment.
+# It assumes this file lives in: <project-root>\scripts\
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
+function Invoke-Step {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ScriptBlock]$Command,
+        [Parameter(Mandatory=$true)]
+        [string]$ErrorMessage
+    )
+
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw $ErrorMessage
+    }
+}
+
+function Get-PipInstallArgs {
+    $args = @()
+    if ($env:WORKFLOW_PIP_INDEX_URL) {
+        $args += @("-i", $env:WORKFLOW_PIP_INDEX_URL)
+    } else {
+        $args += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple")
+    }
+
+    if ($env:WORKFLOW_PIP_TRUSTED_HOST) {
+        $args += @("--trusted-host", $env:WORKFLOW_PIP_TRUSTED_HOST)
+    } else {
+        $args += @("--trusted-host", "pypi.tuna.tsinghua.edu.cn")
+    }
+    return $args
+}
+
 $VenvDir = Join-Path $ProjectRoot ".venv"
 $BackendDir = Join-Path $ProjectRoot "backend"
 $FrontendDir = Join-Path $ProjectRoot "frontend"
@@ -14,53 +47,53 @@ $BuildScript = Join-Path $ProjectRoot "scripts\build_frontend.ps1"
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " BrainFlow Update" -ForegroundColor Cyan
+Write-Host " WorkFlow Update" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Project root: $ProjectRoot" -ForegroundColor Gray
 Write-Host ""
 
-# 1. Git pull
 Write-Host "[1/4] Pulling latest code..." -ForegroundColor Yellow
 Set-Location $ProjectRoot
-git pull
-if ($LASTEXITCODE -ne 0) { throw "git pull failed." }
+Invoke-Step -Command { git pull } -ErrorMessage "git pull failed."
 
 if (-not (Test-Path $PythonExe)) {
     throw "Python venv not found at $VenvDir. Run .\scripts\setup.ps1 first."
 }
 
-# 2. Update backend deps
+$PipArgs = Get-PipInstallArgs
+
 Write-Host "[2/4] Updating backend dependencies..." -ForegroundColor Yellow
 if (Test-Path $ReqFile) {
-    & $PythonExe -m pip install -r $ReqFile --upgrade
+    Invoke-Step -Command { & $PythonExe -m pip install -r $ReqFile --upgrade @PipArgs } -ErrorMessage "Backend dependency update failed."
     Write-Host "  Backend deps updated." -ForegroundColor Green
 } else {
-    Write-Warning "  requirements.txt not found at $ReqFile, skipping."
+    throw "requirements.txt not found at $ReqFile"
 }
 
-# 3. Update frontend deps
 Write-Host "[3/4] Updating frontend dependencies..." -ForegroundColor Yellow
 if (Test-Path $FrontendDir) {
     Push-Location $FrontendDir
     try {
         $LockFile = Join-Path $FrontendDir "package-lock.json"
         if (Test-Path $LockFile) {
-            npm ci
+            Invoke-Step -Command { npm ci } -ErrorMessage "npm ci failed."
         } else {
-            npm install
+            Invoke-Step -Command { npm install } -ErrorMessage "npm install failed."
         }
         Write-Host "  Frontend deps updated." -ForegroundColor Green
     } finally {
         Pop-Location
     }
 } else {
-    Write-Warning "  frontend/ not found at $FrontendDir, skipping."
+    throw "frontend/ not found at $FrontendDir"
 }
 
-# 4. Rebuild frontend
 Write-Host "[4/4] Rebuilding frontend..." -ForegroundColor Yellow
 if (Test-Path $BuildScript) {
     & $BuildScript
+    if ($LASTEXITCODE -ne 0) {
+        throw "Frontend rebuild failed."
+    }
 } else {
     throw "build_frontend.ps1 not found at $BuildScript"
 }
