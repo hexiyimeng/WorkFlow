@@ -20,75 +20,77 @@ KNOWN_MODEL_EXTENSIONS = (
 
 class ModelRegistry:
     """
-    Local model catalog for WorkFlow.
+    Generic local model catalog for WorkFlow.
 
-    The registry scans local ``backend/models/{provider}/`` directories (or
-    ``WorkFlow_MODELS_DIR/{provider}/`` when overridden), lists local model
-    files/directories, and resolves requested model names or paths to absolute
-    local paths.
+    Storage convention:
 
-    It intentionally does not hardcode third-party library built-in models,
-    download models, know provider-specific defaults, or decide whether a
-    missing model name is valid for a provider library.
+        backend/models/{provider}/{model-file-or-directory}
+
+    or, when WorkFlow_MODELS_DIR is set:
+
+        {WorkFlow_MODELS_DIR}/{provider}/{model-file-or-directory}
+
+    This registry is provider-agnostic. It does not set third-party environment
+    variables, download weights, know model zoo defaults, or special-case
+    Cellpose/SAM/StarDist/etc. Provider nodes/adapters can use provider_dir()
+    when a library needs its own cache directory.
     """
 
     def __init__(self, models_root: Path | None = None):
         env_root = os.getenv("WorkFlow_MODELS_DIR")
         self.models_root = Path(models_root or env_root or DEFAULT_MODELS_ROOT)
 
+    def provider_dir(self, provider: str, *, create: bool = False) -> Path:
+        provider = self._normalize_provider(provider)
+        if not provider:
+            raise ValueError("provider must be a non-empty string")
+        directory = self.models_root / provider
+        if create:
+            directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
     def list_models(self, provider: str) -> list[str]:
-        """List local model files/directories for a provider."""
         provider = self._normalize_provider(provider)
         names: set[str] = set()
-        for directory in self._provider_dirs(provider):
-            if not directory.exists() or not directory.is_dir():
+        directory = self.provider_dir(provider)
+        if not directory.exists() or not directory.is_dir():
+            return []
+        for item in directory.iterdir():
+            if item.name.startswith("."):
                 continue
-            for item in directory.iterdir():
-                if item.name.startswith("."):
-                    continue
-                if item.is_file() or item.is_dir():
-                    names.add(item.name)
-                if item.is_file() and item.suffix.lower() in KNOWN_MODEL_EXTENSIONS:
-                    names.add(item.stem)
+            if item.is_file() or item.is_dir():
+                names.add(item.name)
+            if item.is_file() and item.suffix.lower() in KNOWN_MODEL_EXTENSIONS:
+                names.add(item.stem)
         return sorted(names)
 
     def resolve_model_path(self, provider: str, name: str) -> str | None:
         """
-        Resolve a local model reference to an absolute path.
+        Resolve a model reference to an absolute local path.
 
-        Missing names return ``None`` because they may be valid provider
-        built-ins, remote identifiers, or downloadable model names.
+        Search order:
+          1. Existing absolute/relative path exactly as provided.
+          2. backend/models/{provider}/{name}
+          3. backend/models/{provider}/{name}{known_extension}
+
+        Missing names return None because they may be valid provider built-ins,
+        remote identifiers, or downloadable model names. Provider-specific code
+        decides what to do with unresolved names.
         """
         provider = self._normalize_provider(provider)
         name = str(name or "").strip()
-        if not name:
+        if not provider or not name:
             return None
 
         candidate = Path(name)
         if candidate.exists():
             return str(candidate.resolve())
 
-        for directory in self._provider_dirs(provider):
-            resolved = self._resolve_in_directory(directory, name)
-            if resolved:
-                return resolved
-
-        if provider == "cellpose":
-            for directory in self._cellpose_legacy_dirs():
-                resolved = self._resolve_in_directory(directory, name)
-                if resolved:
-                    return resolved
+        directory = self.provider_dir(provider)
+        resolved = self._resolve_in_directory(directory, name)
+        if resolved:
+            return resolved
         return None
-
-    def _provider_dirs(self, provider: str) -> Iterable[Path]:
-        yield self.models_root / provider
-
-    def _cellpose_legacy_dirs(self) -> Iterable[Path]:
-        legacy_root = os.getenv("CELLPOSE_LOCAL_MODELS_PATH")
-        if legacy_root:
-            legacy = Path(legacy_root)
-            yield legacy / "cellpose"
-            yield legacy
 
     def _resolve_in_directory(self, directory: Path, name: str) -> str | None:
         path = directory / name
@@ -107,6 +109,14 @@ class ModelRegistry:
 
 
 model_registry = ModelRegistry()
+
+
+def get_models_root() -> str:
+    return str(model_registry.models_root)
+
+
+def get_provider_model_dir(provider: str, *, create: bool = False) -> str:
+    return str(model_registry.provider_dir(provider, create=create))
 
 
 def list_models(provider: str) -> list[str]:

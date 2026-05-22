@@ -6,12 +6,6 @@ import socket
 
 logger = logging.getLogger("WorkFlow.Config")
 
-# Cellpose model cache directory. Keep models outside git-tracked source by default.
-os.environ.setdefault(
-    "CELLPOSE_LOCAL_MODELS_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), "models"),
-)
-
 
 def _get_system_memory_gb():
     """Return total physical memory in GB, or None if detection fails."""
@@ -27,7 +21,6 @@ def _get_system_memory_gb():
         if platform.system() == "Windows":
             import ctypes
 
-            # DWORD for the first two fields; DWORDLONG/ULONGLONG for ull* fields.
             class MEMORYSTATUSEX(ctypes.Structure):
                 _fields_ = [
                     ("dwLength", ctypes.c_ulong),
@@ -75,21 +68,25 @@ def _log_override(message):
 
 class AppConfig:
     """
-    Global configuration.
+    Global runtime configuration.
 
-    AppConfig must not import torch or initialize CUDA. DaskService performs
-    GPU detection immediately before starting the LocalCluster.
+    This module intentionally does not configure provider-specific model cache
+    paths such as Cellpose, StarDist, SAM, etc. Model storage is handled by
+    core.model_registry using a generic provider layout:
+
+        backend/models/{provider}/
+
+    Provider-specific nodes may translate that generic directory into whatever
+    a third-party library requires at import/load time.
     """
 
     _instance = None
 
-    # Basic config. Environment variables can override these.
     N_WORKERS = 1
     CHUNK_MULTIPLE = 1
     DASHBOARD_ADDRESS = ":8787"
     DASHBOARD_HOST = None
 
-    # Dask worker memory limit. 0 means DaskService auto-computes it.
     WORKER_MEMORY_LIMIT_GB = 0
     DASK_LOCAL_DIR = None
     CHUNK_RISK_THRESHOLD_MB = 256
@@ -111,7 +108,6 @@ class AppConfig:
 
         logger.debug("[Config] CUDA detection is deferred to DaskService.start_cluster().")
 
-        # CPU fallback defaults. DaskService may override worker count for GPU mode.
         self.N_WORKERS = max(1, cpu_count - 2)
         self.CHUNK_MULTIPLE = 1
         logger.debug(
@@ -127,7 +123,6 @@ class AppConfig:
                 f"(system {sys_mem_gb:.1f}GB / {self.N_WORKERS} workers * 0.7)"
             )
 
-        # Environment overrides.
         if os.getenv("WorkFlow_WORKERS"):
             self.N_WORKERS = int(os.getenv("WorkFlow_WORKERS"))
             _log_override(f"   -> [Override] WorkFlow_WORKERS={self.N_WORKERS}")

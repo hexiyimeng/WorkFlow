@@ -1,7 +1,0 @@
-# BrainFlow Backend - GPU / Model Dependencies
-# Install AFTER requirements.txt: pip install -r backend/requirements-gpu.txt
-# These are optional; the framework works without them but cellpose/star_dist nodes need them.
-
-torch>=2.0.0
-cellpose>=0.7.0
-scikit-image>=0.21.0
