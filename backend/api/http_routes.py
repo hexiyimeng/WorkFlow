@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from core.registry import get_node_info
 from services.dask_service import dask_service
-import os
+from core.config import config
 
 router = APIRouter()
 
@@ -21,7 +21,7 @@ async def get_dashboard_url():
     client = dask_service.get_client()
     if client and client.dashboard_link:
         # 检查是否配置了自定义 host
-        custom_host = os.getenv("WorkFlow_DASHBOARD_HOST")
+        custom_host = config.DASHBOARD_HOST
         if custom_host:
             # 提取端口号并替换 host
             try:

@@ -58,14 +58,6 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while initialized:
             try:
-                # 检查当前客户端的 execution 是否在运行
-                current_execution_id = state_manager.get_client_execution(websocket)
-                has_running_task = False
-                if current_execution_id:
-                    session = state_manager.get_execution(current_execution_id)
-                    if session and session.status in (ExecutionStatus.RUNNING, ExecutionStatus.CANCELLING):
-                        has_running_task = True
-
                 timeout = 30
                 data = await asyncio.wait_for(websocket.receive_json(), timeout=timeout)
                 command = data.get("command")

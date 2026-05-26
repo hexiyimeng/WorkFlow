@@ -1,4 +1,5 @@
 import { memo, useCallback, useMemo, useState, useRef, useEffect, useLayoutEffect } from 'react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { Handle, Position, NodeResizer, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeData } from '../types';
 import { useFlow } from '../hooks/useFlowContext';
@@ -43,7 +44,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 function getCategoryAccent(category?: string): string {
   if (!category) return '#6b7280';
   const top = category.split('/')[0];
-  return CATEGORY_COLORS[top] ?? '#6b7280';
+  return CATEGORY_COLORS[category] ?? CATEGORY_COLORS[top] ?? '#6b7280';
 }
 
 // === NodeStatus map ===
@@ -74,7 +75,7 @@ const ValuePopup = ({ initialValue, onSave, onClose, anchorRect }: ValuePopupPro
   const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => { inputRef.current?.focus(); inputRef.current?.select(); }, []);
 
-  const style: React.CSSProperties = useMemo(() => {
+  const style: CSSProperties = useMemo(() => {
     if (!anchorRect) return { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' };
     let top = anchorRect.bottom + 6;
     let left = anchorRect.left + anchorRect.width / 2 - 160;
@@ -129,8 +130,8 @@ const ControlWidget = ({ name, config, value, onChange, disabled = false }: Cont
   const [showPopup, setShowPopup] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null);
-  const stopProp = (e: React.MouseEvent | React.PointerEvent) => e.stopPropagation();
-  const stopPropKey = (e: React.KeyboardEvent) => e.stopPropagation();
+  const stopProp = (e: ReactMouseEvent | ReactPointerEvent) => e.stopPropagation();
+  const stopPropKey = (e: ReactKeyboardEvent) => e.stopPropagation();
 
   // --- Boolean ---
   if (type === 'BOOLEAN') {

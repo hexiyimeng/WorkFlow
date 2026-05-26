@@ -101,7 +101,7 @@ def _get_dask_local_dir():
     return dask_dir
 
 
-class WindowsMultiGPUPlugin(WorkerPlugin):
+class MultiGPUDevicePlugin(WorkerPlugin):
     def setup(self, worker):
         """Bind a Dask worker process to a GPU when CUDA is available."""
         try:
@@ -121,6 +121,10 @@ class WindowsMultiGPUPlugin(WorkerPlugin):
             allow_implicit = os.getenv("WorkFlow_ALLOW_IMPLICIT_CUDA0", "").lower() in ("1", "true", "yes")
             worker.assigned_gpu = "cuda:0" if allow_implicit else "cpu"
             logger.debug(f"Failed to bind GPU for worker {worker.name}, assigned={worker.assigned_gpu}: {e}")
+
+
+# Backward-compatible alias for external code that may import the old name.
+WindowsMultiGPUPlugin = MultiGPUDevicePlugin
 
 
 _memory_thresholds = _get_dask_memory_thresholds()
@@ -199,7 +203,7 @@ class DaskService:
                         local_directory=dask_local_dir,
                     )
                     self.client = Client(self.cluster)
-                    self.client.register_plugin(WindowsMultiGPUPlugin(), name="windows_gpu_pinning")
+                    self.client.register_plugin(MultiGPUDevicePlugin(), name="gpu_device_pinning")
                 else:
                     logger.info("[Dask] Starting GPU mode: 1 worker on cuda:0")
                     self.cluster = LocalCluster(
@@ -212,7 +216,7 @@ class DaskService:
                         local_directory=dask_local_dir,
                     )
                     self.client = Client(self.cluster)
-                    self.client.register_plugin(WindowsMultiGPUPlugin(), name="windows_gpu_pinning")
+                    self.client.register_plugin(MultiGPUDevicePlugin(), name="gpu_device_pinning")
             else:
                 logger.info(f"[Dask] Starting CPU mode: {cluster_workers} workers")
                 self.cluster = LocalCluster(

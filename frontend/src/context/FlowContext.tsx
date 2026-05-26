@@ -29,7 +29,10 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     logBufferRef.current.push({ id: Date.now().toString() + Math.random(), timestamp: new Date().toLocaleTimeString(), type, message });
   }, []);
 
-  const clearLogs = useCallback(() => setLogs([]), []);
+  const clearLogs = useCallback(() => {
+    logBufferRef.current = [];
+    setLogs([]);
+  }, []);
 
   // Log tick loop — batch updates to avoid high-frequency setState
   useEffect(() => {

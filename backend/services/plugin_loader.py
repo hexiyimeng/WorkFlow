@@ -8,25 +8,25 @@ from typing import List, Tuple
 logger = logging.getLogger("WorkFlow.Plugins")
 
 
-# Critical plugins. These failures should stop startup.
-# Extend with WorkFlow_CRITICAL_PLUGINS=nodes.cellpose_node,nodes.ome_zarr_reader,nodes.ome_zarr_writer
-CRITICAL_PLUGINS = {
-    "nodes.cellpose_node",
-    "nodes.ome_zarr_reader",
-    "nodes.ome_zarr_writer",
-    "nodes.instance_partition_writer",
-}
+# Critical plugins are opt-in only.
+#
+# The framework is provider-agnostic: Cellpose, OME-Zarr, SAM, StarDist, etc.
+# are plugins, not core startup requirements.  Set WorkFlow_CRITICAL_PLUGINS
+# when a deployment wants selected plugins to fail-fast, for example:
+#
+#   WorkFlow_CRITICAL_PLUGINS=nodes.ome_zarr_reader,nodes.ome_zarr_writer
+#
+CRITICAL_PLUGINS: set[str] = set()
 
 
-def _get_critical_plugins() -> set:
-    """Return built-in critical plugins plus environment-configured plugins."""
+def _get_critical_plugins() -> set[str]:
+    """Return environment-configured critical plugins."""
     critical = set(CRITICAL_PLUGINS)
     env_plugins = os.getenv("WorkFlow_CRITICAL_PLUGINS", "")
-    if env_plugins:
-        for plugin in env_plugins.split(","):
-            plugin = plugin.strip()
-            if plugin:
-                critical.add(plugin)
+    for plugin in env_plugins.split(","):
+        plugin = plugin.strip()
+        if plugin:
+            critical.add(plugin)
     return critical
 
 

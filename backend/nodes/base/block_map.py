@@ -23,7 +23,7 @@ class BlockContext:
     Attributes:
         device_hint: WorkFlow-inferred device hint (e.g. "cpu", "cuda:0").
             This is NOT a Dask-provided CUDA device. It is a hint derived from
-            worker.assigned_gpu (set by WindowsMultiGPUPlugin) or CPU fallback.
+            worker.assigned_gpu (set by MultiGPUDevicePlugin) or CPU fallback.
             Used for worker-local model cache keys and factory(device) calls.
         device: Backward-compatible alias for device_hint.
             Prefer ctx.device_hint in new code; ctx.device is retained for

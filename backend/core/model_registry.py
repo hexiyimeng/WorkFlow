@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -69,9 +68,10 @@ class ModelRegistry:
         Resolve a model reference to an absolute local path.
 
         Search order:
-          1. Existing absolute/relative path exactly as provided.
-          2. backend/models/{provider}/{name}
-          3. backend/models/{provider}/{name}{known_extension}
+          1. Existing absolute path exactly as provided.
+          2. Safe relative path exactly as provided (no ".." traversal).
+          3. backend/models/{provider}/{name}
+          4. backend/models/{provider}/{name}{known_extension}
 
         Missing names return None because they may be valid provider built-ins,
         remote identifiers, or downloadable model names. Provider-specific code
@@ -82,30 +82,70 @@ class ModelRegistry:
         if not provider or not name:
             return None
 
-        candidate = Path(name)
-        if candidate.exists():
+        candidate = Path(name).expanduser()
+        if candidate.is_absolute() and candidate.exists():
+            return str(candidate.resolve())
+
+        # Keep compatibility with explicitly supplied relative file paths, while
+        # rejecting traversal such as "../other-provider/model.pth".
+        if self._is_safe_relative_path(candidate) and candidate.exists():
             return str(candidate.resolve())
 
         directory = self.provider_dir(provider)
+        if not self._is_safe_relative_path(Path(name)):
+            return None
         resolved = self._resolve_in_directory(directory, name)
         if resolved:
             return resolved
         return None
 
     def _resolve_in_directory(self, directory: Path, name: str) -> str | None:
+        directory_resolved = directory.resolve()
         path = directory / name
         if path.exists():
-            return str(path.resolve())
+            return self._safe_resolved_child(path, directory_resolved)
 
         for extension in KNOWN_MODEL_EXTENSIONS:
             path = directory / f"{name}{extension}"
             if path.exists():
-                return str(path.resolve())
+                return self._safe_resolved_child(path, directory_resolved)
         return None
 
     @staticmethod
+    def _safe_resolved_child(path: Path, directory_resolved: Path) -> str | None:
+        resolved = path.resolve()
+        try:
+            if not resolved.is_relative_to(directory_resolved):
+                return None
+        except AttributeError:  # pragma: no cover - Python < 3.9 fallback
+            if directory_resolved not in resolved.parents and resolved != directory_resolved:
+                return None
+        return str(resolved)
+
+    @staticmethod
+    def _is_safe_relative_path(path: Path) -> bool:
+        if path.is_absolute():
+            return False
+        parts = path.parts
+        unsafe_parts = {"", ".", ".."}
+        return bool(parts) and all(part not in unsafe_parts for part in parts)
+
+    @staticmethod
     def _normalize_provider(provider: str) -> str:
-        return str(provider or "").strip().lower()
+        provider = str(provider or "").strip().lower()
+        if not provider:
+            return ""
+        if "/" in provider or "\\" in provider:
+            raise ValueError(
+                "provider must be a simple name, not a path "
+                f"(received {provider!r})"
+            )
+        if not ModelRegistry._is_safe_relative_path(Path(provider)) or len(Path(provider).parts) != 1:
+            raise ValueError(
+                "provider must be a simple name, not a path "
+                f"(received {provider!r})"
+            )
+        return provider
 
 
 model_registry = ModelRegistry()

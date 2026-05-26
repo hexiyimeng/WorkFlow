@@ -256,9 +256,6 @@ class MemoryMonitor:
         return " -> ".join(summary_parts) if summary_parts else "No process memory data"
 
 
-# 全局单例（便于跨函数使用）
-_memory_monitor: Optional[MemoryMonitor] = None
-
 # Process-global singleton. This is valid only while state_manager enforces one
 # active execution at a time. Multi-active execution would need per-execution
 # snapshot storage to avoid mixed diagnostics.
