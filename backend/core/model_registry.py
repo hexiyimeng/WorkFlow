@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from core.platform import default_models_root, normalize_path
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODELS_ROOT = BACKEND_ROOT / "models"
+DEFAULT_MODELS_ROOT = default_models_root()
 KNOWN_MODEL_EXTENSIONS = (
     ".pth",
     ".pt",
@@ -37,7 +38,7 @@ class ModelRegistry:
 
     def __init__(self, models_root: Path | None = None):
         env_root = os.getenv("WorkFlow_MODELS_DIR")
-        self.models_root = Path(models_root or env_root or DEFAULT_MODELS_ROOT)
+        self.models_root = normalize_path(models_root or env_root or DEFAULT_MODELS_ROOT).resolve()
 
     def provider_dir(self, provider: str, *, create: bool = False) -> Path:
         provider = self._normalize_provider(provider)
@@ -82,17 +83,19 @@ class ModelRegistry:
         if not provider or not name:
             return None
 
-        candidate = Path(name).expanduser()
+        candidate = normalize_path(name)
         if candidate.is_absolute() and candidate.exists():
             return str(candidate.resolve())
 
-        # Keep compatibility with explicitly supplied relative file paths, while
-        # rejecting traversal such as "../other-provider/model.pth".
-        if self._is_safe_relative_path(candidate) and candidate.exists():
-            return str(candidate.resolve())
+        # Resolve explicitly supplied relative paths against backend root so the
+        # result does not depend on the process working directory.
+        if self._is_safe_relative_path(candidate):
+            relative_candidate = BACKEND_ROOT / candidate
+            if relative_candidate.exists():
+                return str(relative_candidate.resolve())
 
         directory = self.provider_dir(provider)
-        if not self._is_safe_relative_path(Path(name)):
+        if not self._is_safe_relative_path(normalize_path(name)):
             return None
         resolved = self._resolve_in_directory(directory, name)
         if resolved:
@@ -101,12 +104,12 @@ class ModelRegistry:
 
     def _resolve_in_directory(self, directory: Path, name: str) -> str | None:
         directory_resolved = directory.resolve()
-        path = directory / name
+        path = directory / normalize_path(name)
         if path.exists():
             return self._safe_resolved_child(path, directory_resolved)
 
         for extension in KNOWN_MODEL_EXTENSIONS:
-            path = directory / f"{name}{extension}"
+            path = directory / normalize_path(f"{name}{extension}")
             if path.exists():
                 return self._safe_resolved_child(path, directory_resolved)
         return None

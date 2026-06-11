@@ -1,6 +1,8 @@
 import logging
 from pathlib import Path
 
+import numpy as np
+
 logger = logging.getLogger("WorkFlow.Cellpose")
 
 
@@ -49,6 +51,11 @@ def cellpose_block(
     """
     if ctx is None:
         raise RuntimeError("Cellpose block requires a BlockContext.")
+    if block.ndim not in (2, 3):
+        raise ValueError(
+            "DaskCellpose supports 2D YX blocks or 3D ZYX blocks only. "
+            f"Received block ndim={block.ndim}, shape={block.shape}."
+        )
 
     model_spec = ctx.resources.get("model_spec") if ctx.resources else None
     if not isinstance(model_spec, dict):
@@ -90,7 +97,7 @@ def cellpose_block(
         if diameter and diameter > 0:
             eval_kwargs["diameter"] = diameter
 
-        if block.ndim >= 3:
+        if block.ndim == 3:
             eval_kwargs["do_3D"] = True
             eval_kwargs["z_axis"] = 0
         else:
@@ -108,8 +115,6 @@ def cellpose_block(
         if styles is not None:
             del styles
 
-
-import numpy as np
 from core.model_registry import list_models, resolve_model_path
 from core.registry import register_node
 from nodes.base import BaseBlockMapNode
@@ -117,6 +122,13 @@ from nodes.base import BaseBlockMapNode
 
 @register_node("DaskCellpose")
 class DaskCellpose(BaseBlockMapNode):
+    """
+    Blockwise Cellpose segmentation.
+
+    Supported block shapes are 2D YX and 3D ZYX. Higher-dimensional arrays must
+    be sliced or reshaped upstream because channel/time axis semantics are not
+    implemented here. Model loading is worker-local and lazy through ctx.model().
+    """
     CATEGORY = "WorkFlow/Segmentation"
     DISPLAY_NAME = "Cellpose Segmentation"
     FAILURE_POLICY = "raise"
@@ -129,10 +141,11 @@ class DaskCellpose(BaseBlockMapNode):
     def INPUT_TYPES(cls):
         local_models = list_models("cellpose")
         models = sorted(set(local_models))
+        default_model = models[0] if models else "cpsam"
         return {
             "required": {
                 "dask_arr": ("DASK_ARRAY[any]",),
-                "model_name": (models,),
+                "model_name": ("STRING", {"default": default_model, "multiline": False}),
                 "diameter": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 500.0}),
                 "flow_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0}),
                 "cellprob_threshold": ("FLOAT", {"default": 0.0, "min": -6.0, "max": 6.0}),
@@ -144,12 +157,21 @@ class DaskCellpose(BaseBlockMapNode):
     RETURN_NAMES = ("mask_dask",)
     FUNCTION = "execute"
     PROCESS_BLOCK = cellpose_block
+    
 
     def preprocess(self, dask_arr, params: dict, runtime: dict) -> dict:
+        if int(getattr(dask_arr, "ndim", 0)) not in (2, 3):
+            raise ValueError(
+                "DaskCellpose supports 2D YX arrays or 3D ZYX arrays only. "
+                f"Received ndim={getattr(dask_arr, 'ndim', None)}, shape={getattr(dask_arr, 'shape', None)}."
+            )
         requested_name = params.get("model_name") or "cpsam"
         load_name = resolve_model_path("cellpose", requested_name)
         if not load_name:
-            raise RuntimeError(f"Model {requested_name!r} for provider 'cellpose' is not installed locally.")
+            raise RuntimeError(
+                f"Cellpose model {requested_name!r} is not installed locally. "
+                "Install it under backend/models/cellpose/ or set WorkFlow_MODELS_DIR."
+            )
 
         logger.info(
             "[Cellpose] requested_model=%r resolved_load_name=%r",

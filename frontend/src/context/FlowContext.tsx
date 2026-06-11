@@ -10,6 +10,7 @@ import { useFlowOperations } from '../hooks/useFlowOperations';
 import { useFlowEngine } from '../hooks/useFlowEngine';
 import { useWorkflows } from '../hooks/useWorkflows';
 import { canConnectPorts, resolveNodeOutputTypes } from '../utils/portTypes';
+import { visibleNodeInputNames } from '../utils/inputVisibility';
 
 export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // ===========================================
@@ -243,8 +244,18 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const addNode = useCallback((type: string) => addNodeAt(type, { x: Math.random() * 400 + 200, y: Math.random() * 300 + 100 }), [addNodeAt]);
 
   const updateNodeData = useCallback((id: string, newData: Partial<NodeData>) => {
+    const targetNode = nodes.find(n => n.id === id);
+    if (targetNode) {
+      const nextData = { ...targetNode.data, ...newData };
+      const visibleInputs = visibleNodeInputNames(nextData.nodeSpec, nextData.values ?? {});
+      setEdges(eds => eds.filter(edge => (
+        edge.target !== id
+        || !edge.targetHandle
+        || visibleInputs.has(edge.targetHandle)
+      )));
+    }
     setNodes(nds => nds.map(n => n.id === id ? { ...n, data: { ...n.data, ...newData } } : n));
-  }, [setNodes]);
+  }, [nodes, setEdges, setNodes]);
 
   // ===========================================
   // 10. Context memoization

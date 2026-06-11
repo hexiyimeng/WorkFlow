@@ -7,7 +7,7 @@
 - GPU 显存（如果可用）
 
 使用方式：
-    from utils.memory_monitor import MemoryMonitor
+    from services.memory_monitor import MemoryMonitor
 
     monitor = MemoryMonitor()
     monitor.log_snapshot("execution_start")

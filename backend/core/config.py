@@ -3,6 +3,9 @@ import multiprocessing
 import os
 import platform
 import socket
+from pathlib import Path
+
+from core.platform import dask_spill_dir
 
 logger = logging.getLogger("WorkFlow.Config")
 
@@ -42,7 +45,7 @@ def _get_system_memory_gb():
             return None
 
         try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            with Path("/proc/meminfo").open("r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
                         total_gb = float(line.split()[1]) / (1024 * 1024)
@@ -88,6 +91,7 @@ class AppConfig:
     DASHBOARD_HOST = None
 
     WORKER_MEMORY_LIMIT_GB = 0
+    WORKER_CACHE_POLICY = "on_failure"
     DASK_LOCAL_DIR = None
     CHUNK_RISK_THRESHOLD_MB = 256
 
@@ -137,8 +141,19 @@ class AppConfig:
                 f"   -> [Override] WorkFlow_WORKER_MEMORY_LIMIT_GB={self.WORKER_MEMORY_LIMIT_GB}"
             )
 
+        if os.getenv("WorkFlow_WORKER_CACHE_POLICY"):
+            policy = os.getenv("WorkFlow_WORKER_CACHE_POLICY", "").strip().lower()
+            if policy not in {"always", "on_failure", "never"}:
+                logger.warning(
+                    "[Config] Invalid WorkFlow_WORKER_CACHE_POLICY=%r; using on_failure.",
+                    policy,
+                )
+                policy = "on_failure"
+            self.WORKER_CACHE_POLICY = policy
+            _log_override(f"   -> [Override] WorkFlow_WORKER_CACHE_POLICY={self.WORKER_CACHE_POLICY}")
+
         if os.getenv("WorkFlow_DASK_LOCAL_DIR"):
-            self.DASK_LOCAL_DIR = os.getenv("WorkFlow_DASK_LOCAL_DIR")
+            self.DASK_LOCAL_DIR = str(dask_spill_dir(os.getenv("WorkFlow_DASK_LOCAL_DIR")))
             _log_override(f"   -> [Override] WorkFlow_DASK_LOCAL_DIR={self.DASK_LOCAL_DIR}")
 
         if os.getenv("WorkFlow_DASHBOARD_HOST"):
@@ -150,7 +165,8 @@ class AppConfig:
         logger.debug(
             f"[Config] Final base config: Workers={self.N_WORKERS}, "
             f"ChunkMult={self.CHUNK_MULTIPLE}, WorkerMemLimit={mem_limit_str}, "
-            f"SpillDir={spill_str}; GPU worker settings are finalized by DaskService."
+            f"SpillDir={spill_str}, WorkerCachePolicy={self.WORKER_CACHE_POLICY}; "
+            "GPU worker settings are finalized by DaskService."
         )
 
 

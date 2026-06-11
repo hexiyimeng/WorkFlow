@@ -8,12 +8,18 @@ import dask
 from dask.base import is_dask_collection
 from distributed import wait as dist_wait
 
+from core.invocation_builder import (
+    build_node_invocation,
+    get_node_input_defs,
+    prepare_node_inputs,
+)
+from core.config import config
 from core.registry import NODE_CLASS_MAPPINGS
 from core.state_manager import state_manager, ExecutionStatus
 from core.type_system import can_connect_types
 from core.worker_cache import force_clear_worker_cache
 from services.dask_service import dask_service
-from utils.memory_monitor import get_memory_monitor
+from services.memory_monitor import get_memory_monitor
 
 logger = logging.getLogger("BrainFlow.Executor")
 logging.getLogger("distributed.core").setLevel(logging.CRITICAL)
@@ -80,13 +86,7 @@ def validate_graph_acyclic(graph: dict):
 
 
 def _get_node_input_defs(node_cls) -> dict:
-    if not hasattr(node_cls, "INPUT_TYPES"):
-        return {"required": {}, "optional": {}}
-    try:
-        return node_cls.INPUT_TYPES()
-    except Exception as e:
-        logger.warning(f"Failed to get INPUT_TYPES from {node_cls}: {e}")
-        return {"required": {}, "optional": {}}
+    return get_node_input_defs(node_cls)
 
 
 def _get_declared_input_type(node_cls, input_name: str):
@@ -103,16 +103,44 @@ def _get_declared_input_type(node_cls, input_name: str):
     return declared
 
 
-def _resolve_source_return_types(node_cls, node_inputs: dict):
+def _resolve_source_return_types(node_cls, node_inputs: dict, graph: dict | None = None):
     resolver = getattr(node_cls, "RESOLVE_RETURN_TYPES", None)
     if resolver is not None:
         try:
-            resolved = resolver(node_inputs or {})
+            input_types = _resolve_connected_input_types(node_cls, node_inputs or {}, graph)
+            try:
+                resolved = resolver(node_inputs or {}, input_types=input_types)
+            except TypeError:
+                resolved = resolver(node_inputs or {})
             if resolved:
                 return tuple(resolved)
         except Exception as e:
             logger.warning(f"Failed to resolve dynamic RETURN_TYPES for {node_cls}: {e}")
     return tuple(getattr(node_cls, "RETURN_TYPES", ()))
+
+
+def _resolve_connected_input_types(node_cls, node_inputs: dict, graph: dict | None = None) -> dict:
+    if not graph:
+        return {}
+    input_types = {}
+    for input_name, input_value in (node_inputs or {}).items():
+        if not (isinstance(input_value, list) and len(input_value) == 2):
+            continue
+        source_id, source_output_index = input_value
+        source_data = graph.get(source_id)
+        if source_data is None:
+            continue
+        source_cls = NODE_CLASS_MAPPINGS.get(source_data.get("type"))
+        if source_cls is None:
+            continue
+        try:
+            source_output_index = int(source_output_index)
+        except Exception:
+            continue
+        source_types = _resolve_source_return_types(source_cls, source_data.get("inputs", {}), graph)
+        if 0 <= source_output_index < len(source_types):
+            input_types[input_name] = str(source_types[source_output_index])
+    return input_types
 
 
 def validate_graph_types(graph: dict):
@@ -151,6 +179,7 @@ def validate_graph_types(graph: dict):
             source_return_types = _resolve_source_return_types(
                 source_cls,
                 source_data.get("inputs", {}),
+                graph,
             )
             if source_output_index < 0 or source_output_index >= len(source_return_types):
                 raise ValueError(
@@ -186,64 +215,7 @@ def validate_graph_types(graph: dict):
 # 2. Input preparation
 # =============================================================================
 def validate_and_prepare_inputs(node_cls, raw_inputs, node_id="Unknown"):
-    final_inputs = {}
-    if hasattr(node_cls, "INPUT_TYPES"):
-        try:
-            input_defs = node_cls.INPUT_TYPES()
-        except Exception as e:
-            logger.warning(f"Failed to get INPUT_TYPES from {node_cls}: {e}")
-            input_defs = {"required": {}, "optional": {}}
-    else:
-        input_defs = {"required": {}, "optional": {}}
-
-    for name, config in input_defs.get("required", {}).items():
-        val = raw_inputs.get(name)
-        input_type = config[0]
-        meta = config[1] if len(config) > 1 and isinstance(config[1], dict) else {}
-
-        is_enum_or_list = isinstance(input_type, list) and len(input_type) > 0
-
-        if val is None or (isinstance(val, str) and val == ""):
-            if "default" in meta:
-                val = meta["default"]
-            elif is_enum_or_list:
-                val = input_type[0]
-
-        if val is None or (isinstance(val, str) and val == ""):
-            if input_type == "STRING":
-                raise ValueError(f"Required input '{name}' is missing for Node {node_id}.")
-            else:
-                raise ValueError(
-                    f"Required input '{name}' is missing for Node {node_id} "
-                    f"(type={input_type}, received={val!r})."
-                )
-        final_inputs[name] = val
-
-    for name, config in input_defs.get("optional", {}).items():
-        val = raw_inputs.get(name)
-        meta = config[1] if len(config) > 1 and isinstance(config[1], dict) else {}
-        if val is None and "default" in meta:
-            val = meta["default"]
-        final_inputs[name] = val
-
-    for name, val in final_inputs.items():
-        if val is not None and isinstance(val, (str, int, float)):
-            def_info = input_defs.get("required", {}).get(name) or input_defs.get("optional", {}).get(name)
-            if def_info:
-                target_type = def_info[0]
-                try:
-                    if target_type == "INT":
-                        final_inputs[name] = int(float(val))
-                    elif target_type == "FLOAT":
-                        final_inputs[name] = float(val)
-                    elif target_type == "BOOLEAN":
-                        if isinstance(val, str):
-                            final_inputs[name] = val.lower() == "true"
-                        else:
-                            final_inputs[name] = bool(val)
-                except Exception as e:
-                    logger.warning(f"Failed to convert input {name}: {e}")
-    return final_inputs
+    return prepare_node_inputs(node_cls, raw_inputs, node_id)
 
 
 # =============================================================================
@@ -297,6 +269,25 @@ def _extract_compute_collection(item):
     return None
 
 
+def _should_clear_worker_cache(execution_failed_or_cancelled: bool) -> bool:
+    policy = str(getattr(config, "WORKER_CACHE_POLICY", "on_failure") or "on_failure").lower()
+    if policy == "always":
+        return True
+    if policy == "never":
+        return False
+    return execution_failed_or_cancelled
+
+
+def _cancel_sink_futures(client, sink_futures) -> None:
+    if not client or not sink_futures:
+        return
+    client.cancel(sink_futures, force=True)
+    try:
+        dist_wait(sink_futures, timeout=2)
+    except Exception as exc:
+        logger.debug(f"[Cleanup] Future cancellation drain skipped/failed: {exc}")
+
+
 # =============================================================================
 # 4. Core executor
 # =============================================================================
@@ -314,6 +305,8 @@ async def execute_graph(graph: dict, execution_id: str = None):
     """
     tasks = {}
     sink_futures = []
+    results = {}
+    node_instances = {}
     client = None
     should_cancel_dask_objects = False
 
@@ -326,7 +319,7 @@ async def execute_graph(graph: dict, execution_id: str = None):
     session = state_manager.create_execution(execution_id)
 
     try:
-        client = dask_service.get_client()
+        client = dask_service.ensure_client()
         validate_graph_structure(graph)
         validate_graph_acyclic(graph)
         validate_graph_types(graph)
@@ -356,8 +349,6 @@ async def execute_graph(graph: dict, execution_id: str = None):
             state_manager.add_log("No output node found. Cannot execute.", "error", execution_id=execution_id)
             return execution_id
 
-        results = {}
-        node_instances = {}
         loop = asyncio.get_running_loop()
 
         async def progress_callback(
@@ -414,7 +405,6 @@ async def execute_graph(graph: dict, execution_id: str = None):
 
                 pending_inputs = {}
                 final_inputs = {}
-                upstream_metadatas = []
 
                 for k, v in node_data.get("inputs", {}).items():
                     if isinstance(v, list) and len(v) == 2:
@@ -450,9 +440,6 @@ async def execute_graph(graph: dict, execution_id: str = None):
                                 f"(source '{dep_id}' has {len(src_result)} slots)."
                             )
                         val = src_result[slot_idx]
-                        for item in src_result:
-                            if isinstance(item, dict) and ("axes" in item or "source_path" in item):
-                                upstream_metadatas.append(item)
                     else:
                         if slot_idx != 0:
                             raise ValueError(
@@ -466,9 +453,17 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 if NodeCls is None:
                     raise ValueError(f"Node class '{class_name}' not found.")
 
-                func_args = validate_and_prepare_inputs(NodeCls, final_inputs, node_id)
+                func_args = prepare_node_inputs(NodeCls, final_inputs, node_id)
+                invocation = build_node_invocation(
+                    NodeCls,
+                    func_args,
+                    node_id=node_id,
+                    execution_id=execution_id,
+                )
                 func_args["_node_id"] = node_id
                 func_args["_execution_id"] = execution_id
+                func_args["_runtime"] = invocation.runtime
+                func_args["_invocation"] = invocation
 
                 # Instantiate FIRST, then get method from the instance
                 instance = NodeCls()
@@ -501,10 +496,6 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 output_list = list(output if isinstance(output, tuple) else (output,))
 
                 is_lazy = any(_is_dask_collection(item) for item in output_list)
-                has_meta = any(isinstance(x, dict) for x in output_list)
-                if not has_meta and upstream_metadatas:
-                    output_list.append(dict(upstream_metadatas[0]))
-                    output = tuple(output_list)
 
                 if is_lazy:
                     await progress_callback(node_id, None, "Ready", "ready")
@@ -590,11 +581,7 @@ async def execute_graph(graph: dict, execution_id: str = None):
 
         # Dask client is only required when there are collections to compute
         if output_sinks:
-            client = dask_service.get_client()
-            if client is None:
-                raise RuntimeError(
-                    "Dask client is not available; cannot compute Dask output collections."
-                )
+            client = dask_service.ensure_client()
 
             # Send submitted state for all output nodes
             for nid in output_nodes:
@@ -717,7 +704,17 @@ async def execute_graph(graph: dict, execution_id: str = None):
             if not t.done():
                 t.cancel()
 
-        # node cleanup: only on abnormal exit (failure/cancel), never on success
+        if client:
+            if sink_futures and should_cancel_dask_objects:
+                try:
+                    _cancel_sink_futures(client, sink_futures)
+                    logger.info(f"[Cleanup] Force cancelled {len(sink_futures)} sink futures")
+                except Exception as exc:
+                    logger.debug(f"[Cleanup] Cancel failed: {exc}")
+
+        # Node cleanup runs after Dask sink futures are cancelled/drained so
+        # writer-owned temporary resources are not deleted while workers may
+        # still be using them.
         if should_cancel_dask_objects:
             for nid, instance in node_instances.items():
                 cleanup_fn = getattr(instance, "cleanup", None)
@@ -728,15 +725,7 @@ async def execute_graph(graph: dict, execution_id: str = None):
                     except Exception as exc:
                         logger.warning(f"[Cleanup] cleanup() failed for {nid}: {exc}")
 
-        # Dask operations: only when client is available
-        if client:
-            if sink_futures and should_cancel_dask_objects:
-                try:
-                    client.cancel(sink_futures, force=True)
-                    logger.info(f"[Cleanup] Force cancelled {len(sink_futures)} sink futures")
-                except Exception as exc:
-                    logger.debug(f"[Cleanup] Cancel failed: {exc}")
-
+        if client and _should_clear_worker_cache(should_cancel_dask_objects):
             try:
                 stats = client.run(force_clear_worker_cache)
                 logger.info(f"[Cleanup] Worker cache cleared: {stats}")

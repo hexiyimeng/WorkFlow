@@ -1,7 +1,6 @@
 import logging
 import os
-import platform
-import tempfile
+import threading
 
 import dask.config
 from dask.distributed import Client, LocalCluster
@@ -9,10 +8,16 @@ from distributed import WorkerPlugin
 
 from core.logger import logger
 from core.config import _get_system_memory_gb, _is_main_process, config
+from core.platform import current_platform, dask_spill_dir, should_schedule_malloc_trim
 
 
 def _detect_cuda_for_cluster():
     """Lazily check CUDA when starting the cluster, not while importing this module."""
+    cuda_mode = os.getenv("WorkFlow_CUDA_MODE", "auto").strip().lower()
+    if cuda_mode in {"0", "false", "off", "disabled", "cpu"}:
+        logger.info("[Dask] CUDA detection disabled by WorkFlow_CUDA_MODE=%s", cuda_mode)
+        return False, 0
+
     try:
         import torch
     except Exception as e:
@@ -93,12 +98,31 @@ def _compute_worker_memory_limit(n_workers=None):
 
 def _get_dask_local_dir():
     """Return the Dask spill directory, honoring config/env overrides."""
-    if config.DASK_LOCAL_DIR:
-        return config.DASK_LOCAL_DIR
+    directory = dask_spill_dir(config.DASK_LOCAL_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory)
 
-    dask_dir = os.path.join(tempfile.gettempdir(), "WorkFlow_dask_spill")
-    os.makedirs(dask_dir, exist_ok=True)
-    return dask_dir
+
+def _worker_index(worker) -> int:
+    try:
+        return int(worker.name)
+    except Exception:
+        return abs(hash(str(getattr(worker, "name", "")))) % 10_000
+
+
+def _malloc_trim_once():
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception as e:
+        logger.debug(f"Memory trim failed: {e}")
+
+
+def _schedule_malloc_trim_on_scheduler(dask_scheduler):
+    dask_scheduler.loop.call_later(60, _malloc_trim_once)
 
 
 class MultiGPUDevicePlugin(WorkerPlugin):
@@ -109,7 +133,7 @@ class MultiGPUDevicePlugin(WorkerPlugin):
 
             gpu_count = torch.cuda.device_count()
             if gpu_count > 0:
-                worker_idx = int(worker.name)
+                worker_idx = _worker_index(worker)
                 assigned_gpu = worker_idx % gpu_count
                 worker.assigned_gpu = f"cuda:{assigned_gpu}"
                 logger.debug(f"Worker {worker.name} bound to {worker.assigned_gpu}")
@@ -132,7 +156,6 @@ _worker_ttl = os.getenv("WorkFlow_DASK_WORKER_TTL", "2h")
 dask.config.set({
     "optimization.fuse.active": True,
     "optimization.fuse.max_width": 2,
-    "array.chunk-size": "256MB",
     "distributed.worker.memory.target": _memory_thresholds["distributed.worker.memory.target"],
     "distributed.worker.memory.spill": _memory_thresholds["distributed.worker.memory.spill"],
     "distributed.worker.memory.pause": _memory_thresholds["distributed.worker.memory.pause"],
@@ -153,6 +176,7 @@ class DaskService:
     _instance = None
     client = None
     cluster = None
+    _cluster_lock = threading.RLock()
 
     recommended_chunk_multiple = 1
 
@@ -170,29 +194,102 @@ class DaskService:
             logger.debug(f"Failed to get current client: {e}")
             return None
 
+    def ensure_client(self):
+        """Return an available Dask client, starting a local cluster if needed."""
+        with self._cluster_lock:
+            if self.client:
+                try:
+                    self.client.scheduler_info()
+                    return self.client
+                except Exception as e:
+                    logger.warning(f"[Dask] Existing client is unavailable; restarting cluster: {e}")
+                    self.client = None
+                    self.cluster = None
+
+            try:
+                current = Client.current()
+                current.scheduler_info()
+                self.client = current
+                return self.client
+            except Exception as e:
+                logger.debug(f"[Dask] No current client available before ensure_client startup: {e}")
+
+            client = self.start_cluster()
+            if client is None:
+                raise RuntimeError(
+                    "Dask cluster startup failed: DaskService.start_cluster() returned None. "
+                    "Check Dask startup logs and environment configuration."
+                )
+            try:
+                client.scheduler_info()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Dask cluster startup failed: created client is not usable ({type(exc).__name__}: {exc})."
+                ) from exc
+            return client
+
     def start_cluster(self):
         """Start the Dask cluster."""
-        if self.client:
-            return self.client
+        with self._cluster_lock:
+            if self.client:
+                return self.client
 
-        n_workers = config.N_WORKERS
-        dask_local_dir = _get_dask_local_dir()
+            n_workers = config.N_WORKERS
+            dask_local_dir = _get_dask_local_dir()
 
-        try:
-            has_gpu, gpu_count = _detect_cuda_for_cluster()
-            if has_gpu and not os.getenv("WorkFlow_WORKERS"):
-                n_workers = gpu_count if gpu_count > 1 else 1
+            try:
+                has_gpu, gpu_count = _detect_cuda_for_cluster()
+                if has_gpu and not os.getenv("WorkFlow_WORKERS"):
+                    n_workers = gpu_count if gpu_count > 1 else 1
 
-            if has_gpu and gpu_count <= 1:
-                cluster_workers = 1
-            else:
-                cluster_workers = n_workers
+                if has_gpu and gpu_count <= 1:
+                    cluster_workers = 1
+                else:
+                    cluster_workers = n_workers
 
-            memory_limit = _compute_worker_memory_limit(cluster_workers)
+                cluster_workers = max(1, int(cluster_workers or 1))
+                memory_limit = _compute_worker_memory_limit(cluster_workers)
+                logger.info(
+                    "[Dask] Startup plan: platform=%s processes=True workers=%s threads_per_worker=1 "
+                    "memory_limit=%s local_directory=%s cuda_mode=%s gpu_count=%s dashboard_address=%s",
+                    current_platform(),
+                    cluster_workers,
+                    memory_limit,
+                    dask_local_dir,
+                    "gpu" if has_gpu else "cpu",
+                    gpu_count,
+                    config.DASHBOARD_ADDRESS,
+                )
 
-            if has_gpu:
-                if gpu_count > 1 and cluster_workers > 1:
-                    logger.info(f"[Dask] Starting GPU mode: {cluster_workers} workers on {gpu_count} GPUs")
+                if has_gpu:
+                    if gpu_count > 1 and cluster_workers > 1:
+                        logger.info(f"[Dask] Starting GPU mode: {cluster_workers} workers on {gpu_count} GPUs")
+                        self.cluster = LocalCluster(
+                            n_workers=cluster_workers,
+                            threads_per_worker=1,
+                            processes=True,
+                            dashboard_address=config.DASHBOARD_ADDRESS,
+                            silence_logs=logging.WARNING,
+                            memory_limit=memory_limit,
+                            local_directory=dask_local_dir,
+                        )
+                        self.client = Client(self.cluster)
+                        self.client.register_plugin(MultiGPUDevicePlugin(), name="gpu_device_pinning")
+                    else:
+                        logger.info("[Dask] Starting GPU mode: 1 worker on cuda:0")
+                        self.cluster = LocalCluster(
+                            n_workers=1,
+                            threads_per_worker=1,
+                            processes=True,
+                            dashboard_address=config.DASHBOARD_ADDRESS,
+                            silence_logs=logging.WARNING,
+                            memory_limit=memory_limit,
+                            local_directory=dask_local_dir,
+                        )
+                        self.client = Client(self.cluster)
+                        self.client.register_plugin(MultiGPUDevicePlugin(), name="gpu_device_pinning")
+                else:
+                    logger.info(f"[Dask] Starting CPU mode: {cluster_workers} workers")
                     self.cluster = LocalCluster(
                         n_workers=cluster_workers,
                         threads_per_worker=1,
@@ -203,53 +300,26 @@ class DaskService:
                         local_directory=dask_local_dir,
                     )
                     self.client = Client(self.cluster)
-                    self.client.register_plugin(MultiGPUDevicePlugin(), name="gpu_device_pinning")
-                else:
-                    logger.info("[Dask] Starting GPU mode: 1 worker on cuda:0")
-                    self.cluster = LocalCluster(
-                        n_workers=1,
-                        threads_per_worker=1,
-                        processes=True,
-                        dashboard_address=config.DASHBOARD_ADDRESS,
-                        silence_logs=logging.WARNING,
-                        memory_limit=memory_limit,
-                        local_directory=dask_local_dir,
-                    )
-                    self.client = Client(self.cluster)
-                    self.client.register_plugin(MultiGPUDevicePlugin(), name="gpu_device_pinning")
-            else:
-                logger.info(f"[Dask] Starting CPU mode: {cluster_workers} workers")
-                self.cluster = LocalCluster(
-                    n_workers=cluster_workers,
-                    threads_per_worker=1,
-                    dashboard_address=config.DASHBOARD_ADDRESS,
-                    silence_logs=logging.WARNING,
-                    memory_limit=memory_limit,
-                    local_directory=dask_local_dir,
-                )
-                self.client = Client(self.cluster)
 
-            if platform.system() == "Linux":
-                self.client.run_on_scheduler(
-                    lambda dask_scheduler: dask_scheduler.loop.call_later(60, self._trim_memory)
-                )
+                if should_schedule_malloc_trim():
+                    # Dask serializes scheduler callables; keep this as a module-level function.
+                    self.client.run_on_scheduler(_schedule_malloc_trim_on_scheduler)
 
-            logger.info(f"[Dask] Dashboard: {self.client.dashboard_link}")
-            logger.info(f"[Dask] Worker memory_limit: {memory_limit}")
-            if has_gpu:
+                logger.info(f"[Dask] Dashboard: {self.client.dashboard_link}")
+                logger.info(f"[Dask] Worker memory_limit: {memory_limit}")
                 logger.info(f"[Dask] Spill directory: {dask_local_dir}")
-            logger.debug(
-                f"[Dask] Memory thresholds: target={_memory_thresholds['distributed.worker.memory.target']}, "
-                f"spill={_memory_thresholds['distributed.worker.memory.spill']}, "
-                f"pause={_memory_thresholds['distributed.worker.memory.pause']}, "
-                f"terminate={_memory_thresholds['distributed.worker.memory.terminate']}"
-            )
+                logger.debug(
+                    f"[Dask] Memory thresholds: target={_memory_thresholds['distributed.worker.memory.target']}, "
+                    f"spill={_memory_thresholds['distributed.worker.memory.spill']}, "
+                    f"pause={_memory_thresholds['distributed.worker.memory.pause']}, "
+                    f"terminate={_memory_thresholds['distributed.worker.memory.terminate']}"
+                )
 
-            return self.client
+                return self.client
 
-        except Exception as e:
-            logger.error(f"[Dask] Start failed: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"[Dask] Start failed: {e}")
+                return None
 
     def stop_cluster(self):
         # Clear worker cache on all workers.
@@ -273,16 +343,6 @@ class DaskService:
             except Exception as e:
                 logger.warning(f"Error closing cluster: {e}")
             self.cluster = None
-
-    def _trim_memory(self):
-        import ctypes
-        import gc
-
-        gc.collect()
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception as e:
-            logger.debug(f"Memory trim failed: {e}")
 
 
 dask_service = DaskService()

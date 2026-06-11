@@ -1,14 +1,97 @@
-import os
+from __future__ import annotations
+
 import logging
-import numpy as np
+from pathlib import Path
+from typing import Any
+
 import dask.array as da
+import numpy as np
+
 from core.registry import register_node
+
 
 logger = logging.getLogger("WorkFlow.OMEZarrReader")
 
 
+DEFAULT_AXES = {
+    2: ["Y", "X"],
+    3: ["Z", "Y", "X"],
+    4: ["C", "Z", "Y", "X"],
+    5: ["T", "C", "Z", "Y", "X"],
+}
+
+
+def _sanitize_zarr_path(file_path: str, node_id: str) -> Path:
+    raw = str(file_path or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError(f"[Node {node_id}] File path cannot be empty.")
+    if "\x00" in raw:
+        raise ValueError(f"[Node {node_id}] File path contains a null byte.")
+    path = Path(raw).expanduser().resolve()
+    if not path.exists() or not path.is_dir():
+        raise FileNotFoundError(f"[Node {node_id}] Not a valid zarr directory: {path}")
+    return path
+
+
+def _axis_names_from_ngff_axes(axes: Any, ndim: int) -> list[str] | None:
+    if not isinstance(axes, list) or len(axes) != ndim:
+        return None
+    names = []
+    for axis in axes:
+        if isinstance(axis, dict):
+            names.append(str(axis.get("name", "")).upper())
+        else:
+            names.append(str(axis).upper())
+    return names if all(names) else None
+
+
+def _default_axes(ndim: int) -> list[str]:
+    return list(DEFAULT_AXES.get(ndim, [f"DIM_{i}" for i in range(ndim)]))
+
+
+def _target_chunks_by_axes(
+    *,
+    shape: tuple[int, ...],
+    original_chunks: tuple[int, ...] | None,
+    axes: list[str],
+    chunk_z: int,
+    chunk_y: int,
+    chunk_x: int,
+    keep_first_dim: bool,
+) -> tuple[int, ...]:
+    chunks = []
+    original_chunks = original_chunks or tuple(min(64, int(s)) for s in shape)
+    for index, (axis_name, extent) in enumerate(zip(axes, shape)):
+        axis = str(axis_name).lower()
+        extent = int(extent)
+        if axis == "x":
+            chunks.append(min(int(chunk_x), extent))
+        elif axis == "y":
+            chunks.append(min(int(chunk_y), extent))
+        elif axis == "z":
+            chunks.append(min(int(chunk_z), extent))
+        elif axis == "c":
+            chunks.append(extent)
+        elif axis == "t":
+            chunks.append(extent if keep_first_dim else 1)
+        elif index == 0 and keep_first_dim:
+            chunks.append(extent)
+        else:
+            fallback = original_chunks[index] if index < len(original_chunks) else min(64, extent)
+            chunks.append(min(int(fallback), extent))
+    return tuple(chunks)
+
+
 @register_node("OMEZarrReader")
 class OMEZarrReader:
+    """
+    Lazy OME-Zarr source node.
+
+    Returns a Dask Array and metadata without computing the array. Chunk planning
+    is based on OME-NGFF axes when available, otherwise defaults to YX, ZYX,
+    CZYX, or TCZYX for 2D-5D arrays.
+    """
+
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "OME-Zarr Reader"
 
@@ -26,79 +109,84 @@ class OMEZarrReader:
             }
         }
 
-    RETURN_TYPES = ("DASK_ARRAY", "DICT")
+    RETURN_TYPES = ("DASK_ARRAY[any]", "DICT")
     RETURN_NAMES = ("dask_arr", "metadata")
     FUNCTION = "load_zarr"
 
-    def load_zarr(self, file_path,
-                  chunk_z=64, chunk_y=64, chunk_x=64,
-                  keep_first_dim=False,
-                  callback=None, **kwargs):
-        node_id = kwargs.get('_node_id', 'unknown')
-
-        if not file_path:
-            raise ValueError(f"[Node {node_id}] File path cannot be empty")
-
-        file_path = os.path.realpath(file_path.strip().strip('"').strip("'"))
-
-        if not os.path.exists(file_path) or not os.path.isdir(file_path):
-            raise FileNotFoundError(f"[Node {node_id}] Not a valid zarr directory: {file_path}")
+    def load_zarr(
+        self,
+        file_path,
+        chunk_z=64,
+        chunk_y=64,
+        chunk_x=64,
+        keep_first_dim=False,
+        callback=None,
+        **kwargs,
+    ):
+        node_id = kwargs.get("_node_id", "unknown")
+        root_path = _sanitize_zarr_path(file_path, node_id)
 
         import zarr
+
         multiscales = []
         dataset_path = None
-        axes = None
-        voxel_size = None
         try:
-            z_arr = zarr.open_array(file_path, mode='r')
-            array_path = file_path
-            logger.info(f"[ZarrReader] Loaded direct array: {file_path}")
+            z_arr = zarr.open_array(str(root_path), mode="r")
+            array_path = root_path
+            logger.info("[ZarrReader] Loaded direct array: %s", root_path)
         except Exception:
-            store = zarr.open_group(file_path, mode='r')
-            multiscales = store.attrs.get("multiscales", [])
+            store = zarr.open_group(str(root_path), mode="r")
+            multiscales = store.attrs.get("multiscales", []) or []
             dataset_path = "0"
             if multiscales:
                 datasets = multiscales[0].get("datasets", [])
                 if datasets:
                     dataset_path = datasets[0].get("path", "0")
-            array_path = os.path.join(file_path, dataset_path)
             z_arr = store[dataset_path]
-            logger.info(f"[ZarrReader] Loaded array from group, dataset={dataset_path}: {file_path}")
+            array_path = root_path / dataset_path
+            logger.info("[ZarrReader] Loaded array from group dataset=%s: %s", dataset_path, root_path)
 
-        shape = z_arr.shape
-        ndim = z_arr.ndim
-        total_gb = np.prod(shape) * z_arr.dtype.itemsize / (1024**3)
-        logger.info(f"[ZarrReader] Loaded: shape={shape}, dtype={z_arr.dtype}, size={total_gb:.2f}GB")
+        shape = tuple(int(x) for x in z_arr.shape)
+        ndim = int(z_arr.ndim)
+        original_chunks = tuple(int(x) for x in (z_arr.chunks or ()))
+        axes = None
+        voxel_size = [1.0] * ndim
 
-        if ndim == 3:
-            config_str = f"{chunk_z},{chunk_y},{chunk_x}"
-        elif ndim == 4:
-            config_str = f"-1,{chunk_z},{chunk_y},{chunk_x}"
-        else:
-            config_str = f"{chunk_z},{chunk_y},{chunk_x}"
-
-        target_chunks = self._parse_chunk_config(
-            config_str, shape, ndim, 512, keep_first_dim
-        )
-        logger.info(f"[ZarrReader] Target chunks: {target_chunks}")
-
-        dask_arr = da.from_zarr(array_path, chunks=target_chunks)
-        logger.info(f"[ZarrReader] Dask array: shape={dask_arr.shape}, chunks={dask_arr.chunksize}, npartitions={dask_arr.npartitions}")
-
-        voxel_size = voxel_size or [1.0] * ndim
-        axes = axes or self._get_dimension_names(ndim)
         if multiscales:
-            datasets = multiscales[0].get("datasets", [])
+            first_scale = multiscales[0]
+            axes = _axis_names_from_ngff_axes(first_scale.get("axes"), ndim)
+            datasets = first_scale.get("datasets", [])
             if datasets:
-                for t in datasets[0].get("coordinateTransformations", []):
-                    if t.get("type") == "scale":
-                        voxel_size = t.get("scale", voxel_size)
-                axes = multiscales[0].get("axes", axes)
-                if isinstance(axes, list) and len(axes) == ndim:
-                    axes = [a.get("name", a) if isinstance(a, dict) else str(a) for a in axes]
+                for transform in datasets[0].get("coordinateTransformations", []):
+                    if transform.get("type") == "scale":
+                        scale = transform.get("scale")
+                        if isinstance(scale, list) and len(scale) == ndim:
+                            voxel_size = scale
 
+        axes = axes or _default_axes(ndim)
+        target_chunks = _target_chunks_by_axes(
+            shape=shape,
+            original_chunks=original_chunks,
+            axes=axes,
+            chunk_z=chunk_z,
+            chunk_y=chunk_y,
+            chunk_x=chunk_x,
+            keep_first_dim=bool(keep_first_dim),
+        )
+
+        total_gb = np.prod(shape) * z_arr.dtype.itemsize / (1024**3)
+        logger.info(
+            "[ZarrReader] shape=%s dtype=%s size=%.2fGB axes=%s target_chunks=%s",
+            shape,
+            z_arr.dtype,
+            total_gb,
+            axes,
+            target_chunks,
+        )
+
+        dask_arr = da.from_zarr(str(array_path), chunks=target_chunks)
         metadata = {
-            "source_path": file_path,
+            "source_path": str(root_path),
             "shape": dask_arr.shape,
             "dtype": str(dask_arr.dtype),
             "chunks": dask_arr.chunksize,
@@ -106,33 +194,6 @@ class OMEZarrReader:
             "npartitions": dask_arr.npartitions,
             "voxel_size": voxel_size,
             "axes": axes,
-            "original_chunks": z_arr.chunks,
+            "original_chunks": original_chunks,
         }
-
         return (dask_arr, metadata)
-
-    @staticmethod
-    def _get_dimension_names(ndim):
-        names = {2: ["Y", "X"], 3: ["Z", "Y", "X"], 4: ["C", "Z", "Y", "X"], 5: ["T", "C", "Z", "Y", "X"]}
-        return names.get(ndim, [f"dim_{i}" for i in range(ndim)])
-
-    @staticmethod
-    def _parse_chunk_config(config_str, array_shape, ndim, chunk_size, keep_first_dim):
-        if not config_str or not config_str.strip():
-            return tuple(
-                array_shape[i] if i == 0 and keep_first_dim else min(chunk_size, array_shape[i])
-                for i in range(ndim)
-            )
-
-        parts = [p.strip().lower() for p in config_str.split(",")]
-        new_chunks = []
-        for i, part in enumerate(parts[:ndim]):
-            if part in ("auto", "-1"):
-                new_chunks.append(array_shape[i] if i == 0 and keep_first_dim else min(chunk_size, array_shape[i]))
-            else:
-                new_chunks.append(int(part))
-
-        while len(new_chunks) < ndim:
-            new_chunks.append(min(chunk_size, array_shape[len(new_chunks)]))
-
-        return tuple(new_chunks)

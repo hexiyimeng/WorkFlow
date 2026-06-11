@@ -1,0 +1,46 @@
+name: Backend Cross Platform
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend-smoke:
+    name: ${{ matrix.os }} Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.12"]
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      PYTHONPATH: .
+      WorkFlow_CUDA_MODE: disabled
+      WorkFlow_WORKERS: "1"
+      WorkFlow_DASHBOARD_HOST: http://localhost
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+
+      - name: Install backend dependencies
+        run: uv sync --frozen
+
+      - name: Compile backend
+        run: uv run python -m py_compile main.py core/platform.py core/config.py services/dask_service.py services/plugin_loader.py core/model_registry.py
+
+      - name: Run cross-platform smoke tests
+        run: uv run python -m pytest tests/test_cross_platform_startup.py tests/test_dask_service_cross_platform.py tests/test_backend_architecture.py tests/test_node_contracts.py -q

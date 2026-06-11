@@ -6,12 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 
-# 确保在最开始初始化 mimetypes，强制修正 Windows 可能的注册表错误
-mimetypes.init()
-mimetypes.add_type('application/javascript', '.js')
-mimetypes.add_type('application/javascript', '.mjs')
-mimetypes.add_type('text/css', '.css')
-
 # 引入项目核心组件
 from services.dask_service import dask_service
 from services.plugin_loader import load_all_plugins

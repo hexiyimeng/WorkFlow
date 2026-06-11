@@ -6,6 +6,7 @@ import { useFlow } from '../hooks/useFlowContext';
 import { createPortal } from 'react-dom';
 import { Pill } from './ui/Pill';
 import { parsePortType, resolveNodeOutputTypes } from '../utils/portTypes';
+import { inputMeta, isInputVisible, valuesWithInputDefaults } from '../utils/inputVisibility';
 
 // === Handle type color registry ===
 const TYPE_COLORS: Record<string, string> = {
@@ -342,6 +343,10 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
   const [collapsed, setCollapsed] = useState(false);
   const valuesRef = useRef(values);
   useLayoutEffect(() => { valuesRef.current = values; }, [values]);
+  const effectiveValues = useMemo(
+    () => valuesWithInputDefaults(nodeSpec, values),
+    [nodeSpec, values],
+  );
 
   const handleUpdate = useCallback((key: string, v: unknown) => {
     updateNodeData(id, { values: { ...valuesRef.current, [key]: v } });
@@ -375,6 +380,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
     Object.entries(allInputs).forEach(([name, config]) => {
       if (!config) return;
       const [rawType, rawOptions] = config as [string | string[], Record<string, unknown>?];
+      if (!isInputVisible(inputMeta(config), effectiveValues)) return;
       const isDropdown = Array.isArray(rawType);
       const isPrimitive = typeof rawType === 'string' && ['INT', 'FLOAT', 'STRING', 'BOOLEAN', 'LONG'].includes(rawType);
       // Widgets: primitives (INT/FLOAT/STRING/BOOLEAN/LONG) or explicit dropdowns
@@ -386,7 +392,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
       }
     });
 
-    const outputTypes = resolveNodeOutputTypes(nodeSpec, values);
+    const outputTypes = resolveNodeOutputTypes(nodeSpec, effectiveValues);
     if (outputTypes.length > 0) {
       outputTypes.forEach((outType: string, idx: number) => {
         outs.push({
@@ -397,7 +403,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
       });
     }
     return { linkInputs: links, outputs: outs, widgets: wids };
-  }, [nodeSpec, values]);
+  }, [nodeSpec, values, effectiveValues]);
 
   const hasIO = linkInputs.length > 0 || outputs.length > 0;
   const hasWidgets = widgets.length > 0;
