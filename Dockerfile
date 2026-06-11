@@ -20,7 +20,6 @@ ENV PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     VIRTUAL_ENV=/app/backend/.venv \
-    WorkFlow_MODELS_DIR=/models \
     WorkFlow_DASK_LOCAL_DIR=/tmp/workflow_dask_spill
 
 WORKDIR /app/backend

@@ -350,7 +350,7 @@ array = [
 ]
 
 [[package]]
-name = "datastream-backend"
+name = "workflow-backend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

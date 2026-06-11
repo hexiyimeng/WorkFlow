@@ -16,8 +16,6 @@ frontend/dist
 backend/dist
 
 backend/models
-models/*
-!models/.gitkeep
 
 *.egg-info
 build
