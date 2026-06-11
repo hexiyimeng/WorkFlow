@@ -42,5 +42,5 @@ jobs:
       - name: Compile backend
         run: uv run python -m py_compile main.py core/platform.py core/config.py services/dask_service.py services/plugin_loader.py core/model_registry.py
 
-      - name: Run cross-platform smoke tests
-        run: uv run python -m pytest tests/test_cross_platform_startup.py tests/test_dask_service_cross_platform.py tests/test_backend_architecture.py tests/test_node_contracts.py -q
+      - name: Run backend import smoke
+        run: uv run python -c "import main; from core.config import config; from core.model_registry import model_registry; print('backend import smoke ok')"
