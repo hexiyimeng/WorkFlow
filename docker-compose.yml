@@ -1,0 +1,23 @@
+services:
+  workflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: datastream-demo07:latest
+    ports:
+      - "8000:8000"
+      - "8787:8787"
+    environment:
+      WorkFlow_CUDA_MODE: "disabled"
+      WorkFlow_MODELS_DIR: "/models"
+      WorkFlow_DASK_LOCAL_DIR: "/tmp/workflow_dask_spill"
+      WorkFlow_DASHBOARD_HOST: "localhost:8787"
+      WorkFlow_WORKERS: "1"
+      WorkFlow_WORKER_MEMORY_LIMIT_GB: "4"
+    volumes:
+      - ./models:/models
+      - workflow-dask:/tmp/workflow_dask_spill
+    restart: unless-stopped
+
+volumes:
+  workflow-dask:

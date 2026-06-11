@@ -24,7 +24,14 @@ build/
 
 # Local model artifacts
 backend/models/
+models/*
+!models/.gitkeep
 
 # Claude Code artifacts
 .codex/
 .claude/
+
+
+
+backend/tests/
+backend/examples/

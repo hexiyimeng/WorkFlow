@@ -1,0 +1,5 @@
+services:
+  workflow:
+    environment:
+      WorkFlow_CUDA_MODE: "auto"
+    gpus: all
