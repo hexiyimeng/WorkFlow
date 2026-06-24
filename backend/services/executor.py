@@ -13,8 +13,7 @@ from core.invocation_builder import (
     get_node_input_defs,
     prepare_node_inputs,
 )
-from core.config import config
-from core.registry import NODE_CLASS_MAPPINGS
+from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
 from core.type_system import can_connect_types
 from core.worker_cache import force_clear_worker_cache
@@ -149,6 +148,15 @@ def validate_graph_types(graph: dict):
         target_cls = NODE_CLASS_MAPPINGS.get(target_type_name)
         if target_cls is None:
             continue
+        try:
+            validate_node_port_types(
+                _get_node_input_defs(target_cls),
+                getattr(target_cls, "RETURN_TYPES", ()),
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Node type '{target_type_name}' has an unsupported port declaration: {exc}"
+            ) from exc
 
         for input_name, input_value in target_data.get("inputs", {}).items():
             if not (isinstance(input_value, list) and len(input_value) == 2):
@@ -198,16 +206,12 @@ def validate_graph_types(graph: dict):
                 if source_output_index < len(source_names)
                 else f"output_{source_output_index}"
             )
-            if str(source_declared_type).startswith("MODEL[") or str(target_declared_type).startswith("MODEL["):
-                suggestion = "Connect a compatible ModelLoader node for this model provider."
-            else:
-                suggestion = "Please insert DaskTypeCast between them for explicit dtype conversion."
             raise ValueError(
                 "Connection type mismatch:\n"
                 f"{source_type_name}({source_id}).{source_output_name} outputs {source_declared_type},\n"
                 f"but {target_type_name}({target_id}).{input_name} requires {target_declared_type}.\n"
                 f"Reason: {reason}.\n"
-                f"{suggestion}"
+                "Please insert DaskTypeCast between Dask arrays or use compatible node ports."
             )
 
 
@@ -267,15 +271,6 @@ def _extract_compute_collection(item):
             return collection
 
     return None
-
-
-def _should_clear_worker_cache(execution_failed_or_cancelled: bool) -> bool:
-    policy = str(getattr(config, "WORKER_CACHE_POLICY", "on_failure") or "on_failure").lower()
-    if policy == "always":
-        return True
-    if policy == "never":
-        return False
-    return execution_failed_or_cancelled
 
 
 def _cancel_sink_futures(client, sink_futures) -> None:
@@ -725,7 +720,7 @@ async def execute_graph(graph: dict, execution_id: str = None):
                     except Exception as exc:
                         logger.warning(f"[Cleanup] cleanup() failed for {nid}: {exc}")
 
-        if client and _should_clear_worker_cache(should_cancel_dask_objects):
+        if client:
             try:
                 stats = client.run(force_clear_worker_cache)
                 logger.info(f"[Cleanup] Worker cache cleared: {stats}")

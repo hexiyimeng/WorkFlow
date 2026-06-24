@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from core.config import config
 from core.platform import rewrite_dashboard_url
+from core.plugin_diagnostics import get_plugin_diagnostics
 from core.registry import get_node_info
 from services.dask_service import dask_service
 
@@ -12,6 +13,11 @@ router = APIRouter()
 @router.get("/object_info")
 async def get_node_definitions():
     return get_node_info()
+
+
+@router.get("/plugin_status")
+async def get_plugin_status():
+    return get_plugin_diagnostics()
 
 
 @router.get("/dashboard_url")

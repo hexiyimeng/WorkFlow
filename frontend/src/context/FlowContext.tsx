@@ -61,6 +61,8 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const {
     websocketStatus,
     nodeDefs,
+    pluginDiagnostics,
+    pluginStatusError,
     executionState,
     runFlow,
     stopFlow,
@@ -261,7 +263,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 10. Context memoization
   // ===========================================
   const contextValue = useMemo(() => ({
-    nodes, edges, nodeDefs, isConnected: isConnected, logs, workflows, activeWorkflowId,
+    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, isConnected: isConnected, logs, workflows, activeWorkflowId,
     executionState,
     websocketStatus,
     currentExecutionId: executionState.executionId,
@@ -277,7 +279,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     onConnectStart, onConnectEnd, connectingType,
     handleCopy, handlePaste, handleDelete,
   }), [
-    nodes, edges, nodeDefs, isConnected, logs, workflows, activeWorkflowId,
+    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, isConnected, logs, workflows, activeWorkflowId,
     theme, isConsoleOpen, connectingType,
     executionState, websocketStatus, isExecuting, isCancelling, isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,

@@ -18,7 +18,6 @@ const TYPE_COLORS: Record<string, string> = {
   DATA_STREAM: '#a78bfa',
   METADATA: '#fb7185',
   DASK_ARRAY: '#22d3ee',
-  MODEL: '#f59e0b',
   default: '#6b7280',
 };
 
@@ -577,7 +576,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
               <ControlWidget
                 key={w.name}
                 {...w}
-                value={values[w.name]}
+                value={effectiveValues[w.name]}
                 onChange={handleUpdate}
                 disabled={locked}
               />

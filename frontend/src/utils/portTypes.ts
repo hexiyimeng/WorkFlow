@@ -6,20 +6,43 @@ export type ParsedPortType = {
   dtype?: string | null;
 };
 
+const SUPPORTED_SIMPLE_PORT_TYPES = new Set([
+  '*',
+  'BOOLEAN',
+  'DATA_STREAM',
+  'DICT',
+  'FLOAT',
+  'IMAGE',
+  'INT',
+  'LONG',
+  'METADATA',
+  'STRING',
+  'ZARR_HANDLE',
+]);
+
 export function parsePortType(type: string): ParsedPortType {
   const raw = String(type || '').trim();
-  const match = raw.match(/^([A-Za-z0-9_]+)\[([A-Za-z0-9_]+)\]$/);
+  const match = raw.match(/^DASK_ARRAY\[([A-Za-z0-9_]+)\]$/);
   if (!match) return { raw, container: raw, dtype: null };
-  return { raw, container: match[1], dtype: match[2].toLowerCase() };
+  return { raw, container: 'DASK_ARRAY', dtype: match[1].toLowerCase() };
+}
+
+function unsupportedPortReason(type: string): string | undefined {
+  const parsed = parsePortType(type);
+  if (parsed.container === 'DASK_ARRAY') return undefined;
+  if (parsed.raw.includes('[') || parsed.raw.includes(']')) {
+    return `Unsupported structured port type ${parsed.raw}. Only DASK_ARRAY[dtype] ports are supported.`;
+  }
+  if (!SUPPORTED_SIMPLE_PORT_TYPES.has(parsed.raw)) {
+    return `Unsupported port type ${parsed.raw}.`;
+  }
+  return undefined;
 }
 
 export function formatPortType(type: string): string {
   const parsed = parsePortType(type);
   if (parsed.container === 'DASK_ARRAY') {
     return parsed.dtype ? `Dask Array - ${parsed.dtype}` : 'Dask Array';
-  }
-  if (parsed.container === 'MODEL') {
-    return parsed.dtype ? `Model - ${parsed.dtype}` : 'Model';
   }
   return parsed.raw;
 }
@@ -34,13 +57,8 @@ export function canConnectPorts(sourceType: string, targetType: string): {
 } {
   const source = parsePortType(sourceType);
   const target = parsePortType(targetType);
-
-  if (source.container === 'MODEL' || target.container === 'MODEL') {
-    return {
-      ok: false,
-      reason: 'MODEL graph ports are deprecated and no longer supported. Use model_name/model_path inputs on DaskCellpose instead.'
-    };
-  }
+  const unsupported = unsupportedPortReason(sourceType) ?? unsupportedPortReason(targetType);
+  if (unsupported) return { ok: false, reason: unsupported };
 
   if (source.container !== target.container) {
     return { ok: false, reason: mismatchMessage(sourceType, targetType) };

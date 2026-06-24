@@ -1,12 +1,14 @@
 import React from 'react';
 import type { Node, Edge, OnNodesChange, OnEdgesChange, OnConnectStart, OnConnectEnd, Connection } from '@xyflow/react';
-import type { NodeSpec, Workflow, LogEntry, NodeData, ExecutionRuntimeState, WebSocketStatus } from '../types';
+import type { NodeSpec, Workflow, LogEntry, NodeData, ExecutionRuntimeState, WebSocketStatus, PluginDiagnostics } from '../types';
 
 export interface FlowContextType {
   // === State ===
   nodes: Node<NodeData>[];
   edges: Edge[];
   nodeDefs: Record<string, NodeSpec>;
+  pluginDiagnostics: PluginDiagnostics | null;
+  pluginStatusError: string | null;
   theme: 'light' | 'dark';
   isConsoleOpen: boolean;
   workflows: Workflow[];

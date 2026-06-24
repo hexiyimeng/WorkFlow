@@ -1,0 +1,15 @@
+{
+  "venvPath": "backend",
+  "venv": ".venv",
+  "typeCheckingMode": "off",
+  "include": ["backend"],
+  "exclude": [
+    "backend/.venv",
+    "backend/dist",
+    "frontend",
+    "**/__pycache__"
+  ],
+  "extraPaths": ["backend"],
+  "useLibraryCodeForTypes": true,
+  "reportMissingTypeStubs": "none"
+}

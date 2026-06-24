@@ -1,8 +1,8 @@
 """
 Lightweight worker-local cache for block functions.
 
-This module provides a generic process-local cache that persists across
-multiple block executions on the same Dask worker.
+This module provides a generic process-local cache reused by block executions
+within the same workflow run on the same Dask worker.
 
 Node authors should use BlockContext.cached() or BlockContext.model() to
 access cached objects from block functions. Framework code may call
@@ -18,8 +18,9 @@ Usage for node authors::
         model = ctx.model("my_provider", model_name, create_my_model)
         return model.predict(block)
 
-The framework handles worker-local caching, cache key construction,
-and cleanup automatically.
+The framework handles worker-local caching, cache key construction, and cleanup
+automatically. Executor cleanup clears this cache after every run, including
+successful runs, so model objects do not remain resident in worker processes.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from typing import Any, Callable
 logger = __import__("logging").getLogger("WorkFlow.WorkerCache")
 
 
-# Process-local cache: persists across blocks on the same worker.
+# Process-local cache: reused across blocks on the same worker during a run.
 # Key: (namespace, key) -> (value, dispose_fn | None, clear_cuda: bool)
 _CACHE: dict[tuple, tuple] = {}
 _CACHE_LOCK = threading.RLock()

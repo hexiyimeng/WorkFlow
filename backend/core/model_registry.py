@@ -58,10 +58,14 @@ class ModelRegistry:
         for item in directory.iterdir():
             if item.name.startswith("."):
                 continue
-            if item.is_file() or item.is_dir():
+            if item.is_dir():
                 names.add(item.name)
-            if item.is_file() and item.suffix.lower() in KNOWN_MODEL_EXTENSIONS:
-                names.add(item.stem)
+            elif item.is_file():
+                names.add(
+                    item.stem
+                    if item.suffix.lower() in KNOWN_MODEL_EXTENSIONS
+                    else item.name
+                )
         return sorted(names)
 
     def resolve_model_path(self, provider: str, name: str) -> str | None:

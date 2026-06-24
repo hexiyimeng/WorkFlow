@@ -53,7 +53,6 @@ class DaskROI:
 
     RETURN_TYPES = ("DASK_ARRAY[any]",)
     RETURN_NAMES = ("cropped_dask",)
-    FUNCTION = "execute"
 
     @classmethod
     def RESOLVE_RETURN_TYPES(cls, node_inputs: dict, input_types: dict | None = None):

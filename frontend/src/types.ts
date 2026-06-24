@@ -49,6 +49,53 @@ export interface NodeSpec {
   output_node?: boolean;
 }
 
+export interface PluginLoadedEntry {
+  module: string;
+  file?: string | null;
+  timestamp?: string;
+}
+
+export interface PluginImportFailure {
+  stage: 'import';
+  module: string;
+  file?: string | null;
+  error_type: string;
+  message: string;
+  traceback?: string;
+  timestamp?: string;
+}
+
+export interface PluginNodeInfoError {
+  stage: 'object_info';
+  node: string;
+  class_name: string;
+  module?: string | null;
+  file?: string | null;
+  error_type: string;
+  message: string;
+  traceback?: string;
+  timestamp?: string;
+}
+
+export interface PluginWarningEntry {
+  stage?: string;
+  module?: string | null;
+  file?: string | null;
+  message: string;
+  timestamp?: string;
+}
+
+export interface PluginDiagnostics {
+  ok: boolean;
+  loaded_count: number;
+  failed_count: number;
+  node_info_error_count?: number;
+  loaded: PluginLoadedEntry[];
+  failed_imports: PluginImportFailure[];
+  warnings: PluginWarningEntry[];
+  node_info_errors?: PluginNodeInfoError[];
+}
+
 export interface NodeData extends Record<string, unknown> {
   opType: string;
   nodeSpec: NodeSpec;

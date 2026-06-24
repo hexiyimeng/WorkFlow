@@ -10,6 +10,7 @@ PORT_DTYPE_TO_NUMPY = {
     "uint8": np.uint8,
     "uint16": np.uint16,
     "uint32": np.uint32,
+    "uint64": np.uint64,
     "int16": np.int16,
     "int32": np.int32,
     "float32": np.float32,
@@ -18,8 +19,19 @@ PORT_DTYPE_TO_NUMPY = {
 }
 
 SPECIAL_DASK_DTYPES = {"any", "same"}
-# MODEL port parsing remains only so old saved graphs fail with a clear
-# validation error. User graphs must use scalar model_name/model_path inputs.
+SUPPORTED_SIMPLE_PORT_TYPES = frozenset({
+    "*",
+    "BOOLEAN",
+    "DATA_STREAM",
+    "DICT",
+    "FLOAT",
+    "IMAGE",
+    "INT",
+    "LONG",
+    "METADATA",
+    "STRING",
+    "ZARR_HANDLE",
+})
 
 
 @dataclass(frozen=True)
@@ -31,20 +43,34 @@ class ParsedPortType:
 
 def parse_port_type(port_type: str | object) -> ParsedPortType:
     raw = str(port_type or "").strip()
-    if "[" not in raw or not raw.endswith("]"):
+    prefix = "DASK_ARRAY["
+    if not raw.startswith(prefix) or not raw.endswith("]"):
         return ParsedPortType(raw=raw, container=raw, dtype=None)
 
-    container, dtype_part = raw.split("[", 1)
-    dtype = dtype_part[:-1].strip().lower() or None
-    return ParsedPortType(raw=raw, container=container.strip(), dtype=dtype)
+    dtype = raw[len(prefix):-1].strip().lower() or None
+    return ParsedPortType(raw=raw, container="DASK_ARRAY", dtype=dtype)
 
 
 def is_dask_array_type(port_type: str | object) -> bool:
     return parse_port_type(port_type).container == "DASK_ARRAY"
 
 
-def is_model_type(port_type: str | object) -> bool:
-    return parse_port_type(port_type).container == "MODEL"
+def validate_port_type(port_type: str | object) -> ParsedPortType:
+    parsed = parse_port_type(port_type)
+    if parsed.container == "DASK_ARRAY":
+        if parsed.dtype is None:
+            raise ValueError("DASK_ARRAY port type must declare a dtype.")
+        if parsed.dtype not in SPECIAL_DASK_DTYPES and parsed.dtype not in PORT_DTYPE_TO_NUMPY:
+            raise ValueError(f"Unsupported DASK_ARRAY dtype '{parsed.dtype}'.")
+        return parsed
+    if "[" in parsed.raw or "]" in parsed.raw:
+        raise ValueError(
+            f"Unsupported structured port type '{parsed.raw}'. "
+            "Only DASK_ARRAY[dtype] ports are supported."
+        )
+    if parsed.raw not in SUPPORTED_SIMPLE_PORT_TYPES:
+        raise ValueError(f"Unsupported port type '{parsed.raw}'.")
+    return parsed
 
 
 def dtype_name_to_numpy(dtype_name: str | None, input_dtype=None):
@@ -65,14 +91,14 @@ def dtype_name_for_numpy(dtype) -> str:
 
 
 def can_connect_types(source_type: str, target_type: str) -> Tuple[bool, Optional[str]]:
-    source = parse_port_type(source_type)
-    target = parse_port_type(target_type)
+    try:
+        source = validate_port_type(source_type)
+        target = validate_port_type(target_type)
+    except ValueError as exc:
+        return False, str(exc)
 
     if source.container != target.container:
         return False, f"source container {source.container} does not match target container {target.container}"
-
-    if source.container == "MODEL" or target.container == "MODEL":
-        return False, "MODEL graph ports are deprecated and no longer supported"
 
     if source.container != "DASK_ARRAY":
         if source.raw == target.raw or source.raw == "*" or target.raw == "*":

@@ -17,6 +17,8 @@ services:
       WorkFlow_WORKER_MEMORY_LIMIT_GB: "4"
     volumes:
       - ./backend/models:/app/backend/models
+      - ./backend/demo_data:/app/backend/demo_data
+      - ./backend/demo_output:/app/backend/demo_output
       - workflow-dask:/tmp/workflow_dask_spill
     restart: unless-stopped
 

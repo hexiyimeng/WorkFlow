@@ -4,7 +4,7 @@ import logging
 from typing import Any, Mapping
 
 from core.node_invocation import NodeInvocation, NodeRuntime
-from core.type_system import is_dask_array_type, parse_port_type
+from core.type_system import is_dask_array_type, validate_port_type
 
 
 logger = logging.getLogger("WorkFlow.InvocationBuilder")
@@ -64,7 +64,7 @@ TYPE_VALIDATORS = {
 def validate_input_value(name: str, declared_type: Any, value: Any) -> None:
     if value is None or not isinstance(declared_type, str):
         return
-    parsed = parse_port_type(declared_type)
+    parsed = validate_port_type(declared_type)
     validator = TYPE_VALIDATORS.get(parsed.container)
     if validator is not None:
         validator(name, value)

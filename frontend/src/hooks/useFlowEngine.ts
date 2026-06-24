@@ -1,6 +1,6 @@
 ﻿import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
 import type { Node, Edge } from '@xyflow/react';
-import type { NodeData, WSMessage, NodeSpec, LogEntry, ExecutionRuntimeState, ExecutionPhase, WebSocketStatus, RunState } from '../types';
+import type { NodeData, WSMessage, NodeSpec, LogEntry, ExecutionRuntimeState, ExecutionPhase, WebSocketStatus, RunState, PluginDiagnostics } from '../types';
 
 // === Reset helper ===
 const resetRuntimeNodeState = (
@@ -84,6 +84,8 @@ export const useFlowEngine = (
   // --- Connection state ---
   const [websocketStatus, setWebsocketStatus] = useState<WebSocketStatus>('disconnected');
   const [nodeDefs, setNodeDefs] = useState<Record<string, NodeSpec>>({});
+  const [pluginDiagnostics, setPluginDiagnostics] = useState<PluginDiagnostics | null>(null);
+  const [pluginStatusError, setPluginStatusError] = useState<string | null>(null);
 
   // --- Execution state (reducer) ---
   const [executionState, dispatchExecution] = useReducer(executionReducer, initialExecutionState);
@@ -105,34 +107,58 @@ export const useFlowEngine = (
   // 1. Fetch node definitions once on mount
   // ============================================================
   useEffect(() => {
-    fetch(`${API_BASE}/object_info`)
-      .then(async res => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status} from ${API_BASE}/object_info`);
+    const fetchJson = async <T,>(path: string): Promise<T> => {
+      const url = `${API_BASE}${path}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} from ${url}`);
+      }
+      const text = await res.text();
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        if (text.trim().startsWith('<') || text.trim().startsWith('<!DOCTYPE')) {
+          throw new Error(
+            `Received HTML instead of JSON from ${url}. ` +
+            `In dev mode, ensure the backend is running on http://localhost:8000 ` +
+            `or set VITE_API_BASE_URL to the correct backend address.`
+          );
         }
-        const text = await res.text();
-        try {
-          return JSON.parse(text);
-        } catch {
-          if (text.trim().startsWith('<') || text.trim().startsWith('<!DOCTYPE')) {
-            throw new Error(
-              `Received HTML instead of JSON from ${API_BASE}/object_info. ` +
-              `In dev mode, ensure the backend is running on http://localhost:8000 ` +
-              `or set VITE_API_BASE_URL to the correct backend address.`
-            );
-          }
-          throw new Error(`Invalid JSON from ${API_BASE}/object_info`);
-        }
-      })
-      .then(data => {
+        throw new Error(`Invalid JSON from ${url}`);
+      }
+    };
+
+    const loadStartupData = async () => {
+      try {
+        const data = await fetchJson<Record<string, NodeSpec>>('/object_info');
         setNodeDefs(data);
         if (Object.keys(data).length === 0) {
           addLog('Node definitions loaded but empty. Ensure the backend is running.', 'warning');
         }
-      })
-      .catch(err => addLog(`Failed to load node definitions: ${err.message}`, 'error'));
+      } catch (err) {
+        addLog(`Failed to load node definitions: ${(err as Error).message}`, 'error');
+      }
+
+      try {
+        const status = await fetchJson<PluginDiagnostics>('/plugin_status');
+        setPluginDiagnostics(status);
+        setPluginStatusError(null);
+        const nodeInfoErrors = status.node_info_errors?.length ?? status.node_info_error_count ?? 0;
+        if (!status.ok) {
+          addLog(
+            `Some nodes failed to load: ${status.failed_count} import failure(s), ${nodeInfoErrors} object_info error(s).`,
+            'warning',
+          );
+        }
+      } catch (err) {
+        setPluginStatusError((err as Error).message);
+        addLog('Could not fetch plugin status from backend.', 'warning');
+      }
+    };
+
+    loadStartupData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // intentionally empty — addLog is only called on error path, stable identity
+  }, []); // intentionally empty — startup fetch runs once
 
   // ============================================================
   // 2. Stop edge animation when disconnected
@@ -535,6 +561,8 @@ export const useFlowEngine = (
   return {
     websocketStatus,
     nodeDefs,
+    pluginDiagnostics,
+    pluginStatusError,
     executionState,
     runFlow,
     stopFlow,

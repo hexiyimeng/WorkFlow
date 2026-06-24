@@ -462,7 +462,7 @@ class BaseNode:
     def INPUT_TYPES(cls):
         return {"required": {}, "optional": {}}
 
-    def preprocess(self, dask_arr=None, params: dict | None = None, runtime: dict | None = None):
+    def preprocess(self, dask_arr=None, params: dict | None = None, runtime: dict | None = None) -> dict[str, Any] | None:
         return None
 
     def postprocess(self, outputs=None, state=None, runtime: dict | None = None, **kwargs):
@@ -669,16 +669,38 @@ class BlockwiseInputPlanner:
         invocation: NodeInvocation,
     ) -> dict[str, tuple[str, ...] | None]:
         axes_decl = getattr(type(node), "ARRAY_AXES", None)
-        result: dict[str, tuple[str, ...] | None] = {name: None for name in ordered_names}
+        axes_by_ndim_decl = getattr(type(node), "ARRAY_AXES_BY_NDIM", None)
+        existing_axes = getattr(node, "_axes_by_name", {}) or {}
+        result: dict[str, tuple[str, ...] | None] = {}
+
+        for name in ordered_names:
+            axes = ChunkPlanner.normalize_axes(existing_axes.get(name))
+            if axes is None:
+                axes_resolver = getattr(node, f"_axes_for_{name}", None)
+                if callable(axes_resolver):
+                    axes = ChunkPlanner.normalize_axes(axes_resolver(invocation.inputs[name]))
+            arr = invocation.inputs.get(name)
+            ndim = int(arr.ndim) if arr is not None and hasattr(arr, "ndim") else None
+            ndim_mapping = axes_by_ndim_decl
+            if isinstance(axes_by_ndim_decl, Mapping) and name in axes_by_ndim_decl:
+                ndim_mapping = axes_by_ndim_decl.get(name)
+            if axes is None and isinstance(ndim_mapping, Mapping) and ndim is not None:
+                axes = ChunkPlanner.normalize_axes(ndim_mapping.get(ndim))
+            result[name] = axes
+
         if isinstance(axes_decl, dict):
             for name in ordered_names:
-                result[name] = ChunkPlanner.normalize_axes(axes_decl.get(name))
+                declared_axes = ChunkPlanner.normalize_axes(axes_decl.get(name))
+                if declared_axes is not None:
+                    result[name] = declared_axes
         elif axes_decl is not None:
             axes = ChunkPlanner.normalize_axes(axes_decl)
             for name in ordered_names:
                 result[name] = axes
 
         for name in ordered_names:
+            arr = invocation.inputs.get(name)
+            ndim = int(arr.ndim) if arr is not None and hasattr(arr, "ndim") else None
             meta = (
                 invocation.inputs.get(f"{name}_metadata")
                 or invocation.inputs.get(f"{name}_meta")
@@ -691,6 +713,19 @@ class BlockwiseInputPlanner:
                 axes = meta.get("axes")
             if axes is not None:
                 result[name] = ChunkPlanner.normalize_axes(axes)
+
+            explicit_axes = invocation.inputs.get(f"{name}_axes")
+            if explicit_axes in (None, "") and len(ordered_names) == 1:
+                explicit_axes = invocation.inputs.get("axes")
+            if explicit_axes not in (None, ""):
+                result[name] = ChunkPlanner.normalize_axes(explicit_axes)
+
+            resolved_axes = result[name]
+            if resolved_axes is not None and ndim is not None and len(resolved_axes) != ndim:
+                raise ValueError(
+                    f"Axes for input '{name}' has length {len(resolved_axes)}, "
+                    f"but array ndim is {ndim}."
+                )
         return result
 
 
@@ -737,9 +772,25 @@ class MapBlocksOutputSpecResolver:
             primary = array_inputs[primary_name]
             dtype = np.dtype(spec.dtype)
             chunks_spec = "same_as_primary" if spec.chunks is None else spec.chunks
-            chunks = self.resolve_chunks(chunks_spec, array_inputs, params, primary_name)
-            drop_axis = self.normalize_axis_tuple(spec.drop_axis)
-            new_axis = self.normalize_axis_tuple(spec.new_axis)
+            drop_axis = self.resolve_drop_axis(
+                spec.drop_axis,
+                node=node,
+                primary=primary,
+                primary_name=primary_name,
+            )
+            new_axis = self.resolve_new_axis(
+                spec.new_axis,
+                node=node,
+                primary=primary,
+                primary_name=primary_name,
+            )
+            chunks = self.resolve_chunks(
+                chunks_spec,
+                array_inputs,
+                params,
+                primary_name,
+                drop_axis=drop_axis,
+            )
             return MapBlocksOutputSpec(
                 dtype=dtype,
                 chunks=chunks,
@@ -758,11 +809,34 @@ class MapBlocksOutputSpecResolver:
                 "chunks, new_axis, and drop_axis. Do not set it manually."
             )
         primary = array_inputs[primary_name]
-        dtype = self.resolve_dtype(node, spec.get("dtype", "same"), primary.dtype, params)
+        dtype = self.resolve_dtype(
+            node,
+            spec.get("dtype", "same"),
+            primary.dtype,
+            params,
+            array_inputs=array_inputs,
+            primary_name=primary_name,
+        )
         chunks_spec = spec.get("chunks", "same_as_primary")
-        chunks = self.resolve_chunks(chunks_spec, array_inputs, params, primary_name)
-        drop_axis = self.normalize_axis_tuple(spec.get("drop_axis"))
-        new_axis = self.normalize_axis_tuple(spec.get("new_axis"))
+        drop_axis = self.resolve_drop_axis(
+            spec.get("drop_axis"),
+            node=node,
+            primary=primary,
+            primary_name=primary_name,
+        )
+        new_axis = self.resolve_new_axis(
+            spec.get("new_axis"),
+            node=node,
+            primary=primary,
+            primary_name=primary_name,
+        )
+        chunks = self.resolve_chunks(
+            chunks_spec,
+            array_inputs,
+            params,
+            primary_name,
+            drop_axis=drop_axis,
+        )
         meta = spec.get("meta")
         if meta is None:
             meta = np.array((), dtype=dtype)
@@ -785,7 +859,37 @@ class MapBlocksOutputSpecResolver:
     ) -> bool:
         return chunks_spec in (None, "same_as_primary") and drop_axis is None and new_axis is None
 
-    def resolve_dtype(self, node: "BaseDaskArrayMapNode", dtype_spec: Any, primary_dtype: Any, params: Mapping[str, Any]) -> np.dtype:
+    def resolve_dtype(
+        self,
+        node: "BaseDaskArrayMapNode",
+        dtype_spec: Any,
+        primary_dtype: Any,
+        params: Mapping[str, Any],
+        *,
+        array_inputs: Mapping[str, Any] | None = None,
+        primary_name: str | None = None,
+    ) -> np.dtype:
+        if callable(dtype_spec):
+            dtype_spec = dtype_spec(
+                array_inputs=array_inputs or {},
+                params=params,
+                primary_name=primary_name,
+            )
+        elif isinstance(dtype_spec, Mapping):
+            if set(dtype_spec) != {"param"}:
+                raise ValueError(
+                    "MAP_BLOCKS_OUTPUT_SPEC.dtype mapping must contain only "
+                    f"{{'param': '<parameter name>'}}, got {dtype_spec!r}."
+                )
+            param_name = str(dtype_spec["param"] or "").strip()
+            if not param_name:
+                raise ValueError("MAP_BLOCKS_OUTPUT_SPEC.dtype param name cannot be empty.")
+            if param_name not in params or params[param_name] in (None, ""):
+                raise ValueError(
+                    f"MAP_BLOCKS_OUTPUT_SPEC.dtype references missing parameter {param_name!r}."
+                )
+            dtype_spec = params[param_name]
+
         if node.OUTPUT_DTYPE is not None and dtype_spec in (None, "same"):
             return np.dtype(node.OUTPUT_DTYPE)
         if dtype_spec in (None, "same", "any"):
@@ -813,34 +917,126 @@ class MapBlocksOutputSpecResolver:
         array_inputs: Mapping[str, Any],
         params: Mapping[str, Any],
         primary_name: str,
+        *,
+        drop_axis: tuple[int, ...] | None = None,
     ) -> Any:
         primary = array_inputs[primary_name]
         if chunks_spec in (None, "same_as_primary"):
             return primary.chunks
+        if chunks_spec == "drop_axis_from_primary":
+            if not drop_axis:
+                raise ValueError(
+                    "MAP_BLOCKS_OUTPUT_SPEC.chunks='drop_axis_from_primary' requires "
+                    "MAP_BLOCKS_OUTPUT_SPEC.drop_axis."
+                )
+            dropped = set(drop_axis)
+            return tuple(
+                axis_chunks
+                for axis, axis_chunks in enumerate(primary.chunks)
+                if axis not in dropped
+            )
+        if chunks_spec == "token_chunks_from_primary":
+            return tuple((1,) * int(numblocks) for numblocks in primary.numblocks)
         if callable(chunks_spec):
             return chunks_spec(array_inputs=array_inputs, params=params, primary_name=primary_name)
         if isinstance(chunks_spec, str):
-            if chunks_spec == "same_as_primary":
-                return primary.chunks
             return ChunkPlanner.parse_explicit_chunks(chunks_spec)
         if isinstance(chunks_spec, (tuple, list)):
             return tuple(chunks_spec)
         raise ValueError(f"Unsupported output chunks {chunks_spec!r}.")
 
-    @staticmethod
-    def normalize_axis_tuple(value: Any) -> tuple[int, ...] | None:
+    def resolve_drop_axis(
+        self,
+        value: Any,
+        *,
+        node: "BaseDaskArrayMapNode",
+        primary: Any,
+        primary_name: str,
+    ) -> tuple[int, ...] | None:
+        return self.resolve_axis_tuple(
+            value,
+            field_name="drop_axis",
+            node=node,
+            primary=primary,
+            primary_name=primary_name,
+        )
+
+    def resolve_new_axis(
+        self,
+        value: Any,
+        *,
+        node: "BaseDaskArrayMapNode",
+        primary: Any,
+        primary_name: str,
+    ) -> tuple[int, ...] | None:
+        return self.resolve_axis_tuple(
+            value,
+            field_name="new_axis",
+            node=node,
+            primary=primary,
+            primary_name=primary_name,
+        )
+
+    def resolve_axis_tuple(
+        self,
+        value: Any,
+        *,
+        field_name: str,
+        node: "BaseDaskArrayMapNode",
+        primary: Any,
+        primary_name: str,
+    ) -> tuple[int, ...] | None:
         if value is None:
             return None
         if isinstance(value, int):
-            return (value,)
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
+            raw_axes = (value,)
+        elif isinstance(value, str):
+            raw_axes = tuple(part.strip() for part in value.split(",") if part.strip())
+            if not raw_axes:
                 return None
-            return tuple(int(part.strip()) for part in value.split(",") if part.strip())
-        if isinstance(value, (tuple, list)):
-            return tuple(int(x) for x in value)
-        raise ValueError(f"Unsupported axis tuple value {value!r}.")
+        elif isinstance(value, (tuple, list)):
+            raw_axes = tuple(value)
+        elif not isinstance(value, int):
+            raise ValueError(f"Unsupported {field_name} value {value!r}.")
+
+        axes = (getattr(node, "_axes_by_name", {}) or {}).get(primary_name)
+        axis_lookup = {
+            str(axis_name).strip().lower(): index
+            for index, axis_name in enumerate(axes or ())
+        }
+        result: list[int] = []
+        for raw_axis in raw_axes:
+            if isinstance(raw_axis, int) or (
+                isinstance(raw_axis, str) and raw_axis.strip().lstrip("-").isdigit()
+            ):
+                axis = int(raw_axis)
+                if field_name == "drop_axis":
+                    if axis < 0:
+                        axis += int(primary.ndim)
+                    if axis < 0 or axis >= int(primary.ndim):
+                        raise ValueError(
+                            f"MAP_BLOCKS_OUTPUT_SPEC.drop_axis={raw_axis!r} is out of bounds "
+                            f"for primary input '{primary_name}' ndim={primary.ndim}."
+                        )
+                result.append(axis)
+                continue
+
+            if not axes:
+                raise ValueError(
+                    f"MAP_BLOCKS_OUTPUT_SPEC.{field_name} uses axis name {raw_axis!r}, "
+                    f"but no axes metadata is available for primary input '{primary_name}'."
+                )
+            axis_name = str(raw_axis).strip().lower()
+            if axis_name not in axis_lookup:
+                raise ValueError(
+                    f"MAP_BLOCKS_OUTPUT_SPEC.{field_name} uses axis name {raw_axis!r}, "
+                    f"but it is not present in axes {tuple(axes)!r} for primary input '{primary_name}'."
+                )
+            result.append(axis_lookup[axis_name])
+
+        if len(set(result)) != len(result):
+            raise ValueError(f"MAP_BLOCKS_OUTPUT_SPEC.{field_name} contains duplicate axes: {value!r}.")
+        return tuple(result) or None
 
 
 class MapBlocksOutputSpecPreflightValidator:
@@ -1371,6 +1567,7 @@ class BaseDaskArrayMapNode(BaseDaskNode):
         "enforce_ndim": True,
     }
     ARRAY_AXES: dict[str, Any] | tuple[str, ...] | str | None = None
+    ARRAY_AXES_BY_NDIM: Mapping[int, Any] | Mapping[str, Mapping[int, Any]] | None = None
 
     SKIP_EMPTY_BLOCKS = True
     SKIP_ALL_ZERO_BLOCKS = False
@@ -1422,6 +1619,11 @@ class BaseDaskArrayMapNode(BaseDaskNode):
                 f"{type(self).__name__}.preprocess() must return dict or None, "
                 f"got {type(preprocess_state).__name__}."
             )
+        preprocess_state = dict(preprocess_state)
+        preprocess_state.setdefault("axes_by_name", dict(input_plan.axes_by_name))
+        primary_axes = input_plan.axes_by_name.get(input_plan.primary_name)
+        if primary_axes is not None:
+            preprocess_state.setdefault("axes", primary_axes)
         self._preprocess_state = dict(preprocess_state)
 
         output_spec = output_resolver.resolve(
@@ -1552,14 +1754,12 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
     """
     Thin adapter from the shared array-map template to dask.array.map_overlap.
 
-    BaseMapOverlapNode supports same-shape neighborhood/stencil algorithms by
-    default. PROCESS_BLOCK may receive halo-expanded blocks, so shape-changing
-    outputs require explicit opt-in via OVERLAP_OUTPUT_MODE="map_blocks_kwargs".
+    MAP_OVERLAP_SPEC declares halo behavior. MAP_BLOCKS_OUTPUT_SPEC declares
+    the output array structure and is forwarded to Dask automatically.
     """
 
     DASK_API = "map_overlap"
     DISPLAY_NAME = "Map Overlap Node"
-    OVERLAP_OUTPUT_MODE = "same_shape"
     MAP_OVERLAP_SPEC = {
         "depth": 0,
         "boundary": "none",
@@ -1567,34 +1767,7 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         "align_arrays": True,
         "allow_rechunk": True,
     }
-    _ALLOW_EXPERIMENTAL_SHAPE_CHANGING_OUTPUT = False
     ALLOW_UNTRIMMED_OVERLAP_OUTPUT = False
-
-    def validate_output_spec_for_api(self, output_spec: MapBlocksOutputSpec) -> None:
-        mode = self._overlap_output_mode()
-        if mode == "map_blocks_kwargs":
-            return
-        if mode != "same_shape":
-            raise ValueError(
-                f"{type(self).__name__} OVERLAP_OUTPUT_MODE must be 'same_shape' "
-                "or 'map_blocks_kwargs'."
-            )
-        if output_spec.new_axis is not None:
-            raise ValueError(
-                f"{type(self).__name__} supports same-shape map_overlap outputs only; "
-                "new_axis requires OVERLAP_OUTPUT_MODE='map_blocks_kwargs'."
-            )
-        if output_spec.drop_axis is not None:
-            raise ValueError(
-                f"{type(self).__name__} supports same-shape map_overlap outputs only; "
-                "drop_axis requires OVERLAP_OUTPUT_MODE='map_blocks_kwargs'."
-            )
-        if not output_spec.same_as_primary:
-            raise ValueError(
-                f"{type(self).__name__} supports same-shape map_overlap outputs only. "
-                "MAP_BLOCKS_OUTPUT_SPEC chunks must be None or 'same_as_primary'. "
-                "Use OVERLAP_OUTPUT_MODE='map_blocks_kwargs' for advanced shape-changing overlap outputs."
-            )
 
     def build_dask_collection(
         self,
@@ -1616,7 +1789,7 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
             params=params,
             runtime=runtime,
         )
-        self.validate_overlap_spec_for_api(overlap_spec)
+        self.validate_overlap_spec_for_api(overlap_spec, output_spec)
         overlap_kwargs = {
             "depth": overlap_spec.depth,
             "boundary": overlap_spec.boundary,
@@ -1626,21 +1799,18 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
             "dtype": output_spec.dtype,
             "meta": output_spec.meta if output_spec.meta is not None else np.array((), dtype=output_spec.dtype),
             "name": self.make_task_name(runtime),
+            "drop_axis": output_spec.drop_axis,
+            "new_axis": output_spec.new_axis,
+            "enforce_ndim": output_spec.enforce_ndim,
         }
-        if self._overlap_output_mode() == "map_blocks_kwargs":
-            overlap_kwargs.update({
-                "chunks": output_spec.chunks,
-                "drop_axis": output_spec.drop_axis,
-                "new_axis": output_spec.new_axis,
-                "enforce_ndim": output_spec.enforce_ndim,
-            })
+        # With trim=True, Dask interprets ``chunks`` as pre-trim map_blocks
+        # chunks. MAP_BLOCKS_OUTPUT_SPEC describes final chunks, so forwarding
+        # them would make trim_internal shrink the collection metadata twice.
+        # Dask can derive the halo-expanded chunks, including drop/new axes.
+        if not overlap_spec.trim:
+            overlap_kwargs["chunks"] = output_spec.chunks
         overlap_kwargs = {key: value for key, value in overlap_kwargs.items() if value is not None}
         return da.map_overlap(wrapped_fn, *ordered_arrays, **overlap_kwargs)
-
-    def _overlap_output_mode(self) -> str:
-        if self._ALLOW_EXPERIMENTAL_SHAPE_CHANGING_OUTPUT:
-            return "map_blocks_kwargs"
-        return str(getattr(type(self), "OVERLAP_OUTPUT_MODE", "same_shape") or "same_shape")
 
     def resolve_overlap_spec(self, array_inputs, ordered_names, primary_name, params, runtime) -> OverlapSpec:
         override = getattr(self, "infer_overlap_spec", None)
@@ -1752,15 +1922,16 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         if not depth:
             return {}
         if self.mapping_uses_axis_indices(depth):
-            return {
-                self.normalize_depth_axis(axis, arr, input_name): self.normalize_depth_value(value, input_name)
-                for axis, value in depth.items()
-            }
+            resolved = {}
+            for raw_axis, raw_value in depth.items():
+                axis = self.normalize_depth_axis(raw_axis, arr, input_name)
+                resolved[axis] = self.normalize_depth_value(raw_value, input_name)
+            return resolved
         axes_by_name = getattr(self, "_axes_by_name", {}) or {}
         axes = axes_by_name.get(input_name)
         if not axes:
             raise ValueError(
-                f"MAP_OVERLAP_SPEC.depth_by_input[{input_name!r}] uses axis-name depth, "
+                "MAP_OVERLAP_SPEC.depth uses axis names, "
                 f"but no axes metadata is available for input '{input_name}'."
             )
         if len(axes) != int(arr.ndim):
@@ -1774,7 +1945,8 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
             axis_name = str(raw_axis).strip().lower()
             if axis_name not in axis_lookup:
                 raise ValueError(f"Axis name {raw_axis!r} is not present in axes {axes} for input '{input_name}'.")
-            resolved[axis_lookup[axis_name]] = self.normalize_depth_value(raw_value, input_name)
+            axis = axis_lookup[axis_name]
+            resolved[axis] = self.normalize_depth_value(raw_value, input_name)
         return resolved
 
     def resolve_axis_sequence_depth(self, depth: tuple | list, arr: Any, input_name: str) -> tuple:
@@ -1834,15 +2006,19 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
             return any(self.depth_has_asymmetric_value(item) for item in depth)
         return False
 
-    def validate_overlap_spec_for_api(self, overlap_spec: OverlapSpec) -> None:
-        if self._overlap_output_mode() != "same_shape":
-            return
+    def validate_overlap_spec_for_api(
+        self,
+        overlap_spec: OverlapSpec,
+        output_spec: MapBlocksOutputSpec,
+    ) -> None:
         if overlap_spec.trim:
+            return
+        if not output_spec.same_as_primary:
             return
         if getattr(type(self), "ALLOW_UNTRIMMED_OVERLAP_OUTPUT", False) is True:
             return
         raise ValueError(
-            f"{type(self).__name__} uses MAP_OVERLAP_SPEC.trim=False in same-shape mode. "
+            f"{type(self).__name__} uses MAP_OVERLAP_SPEC.trim=False with a same-shape output. "
             "This is unsafe unless the block function trims or otherwise controls halo output shape. "
             "Set ALLOW_UNTRIMMED_OVERLAP_OUTPUT=True to opt in explicitly."
         )

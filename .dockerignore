@@ -13,10 +13,8 @@
 
 frontend/node_modules
 frontend/dist
-backend/dist
 
 backend/models
 
 *.egg-info
 build
-dist

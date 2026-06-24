@@ -45,9 +45,13 @@ class DaskTypeCast(BaseMapBlocksNode):
 
     RETURN_TYPES = ("DASK_ARRAY[any]",)
     RETURN_NAMES = ("dask_arr",)
-    FUNCTION = "execute"
 
     PROCESS_BLOCK = type_cast_block
+    MAP_BLOCKS_OUTPUT_SPEC = {
+        "dtype": {"param": "target_dtype"},
+        "chunks": "same_as_primary",
+        "enforce_ndim": True,
+    }
 
     @classmethod
     def RESOLVE_RETURN_TYPES(cls, node_inputs: dict, input_types: dict | None = None):
@@ -55,9 +59,3 @@ class DaskTypeCast(BaseMapBlocksNode):
         if target_dtype not in PORT_DTYPE_TO_NUMPY:
             return cls.RETURN_TYPES
         return (f"DASK_ARRAY[{target_dtype}]",)
-
-    def infer_output_dtype(self, input_dtype, params):
-        target_dtype = params.get("target_dtype") or "float32"
-        if target_dtype not in PORT_DTYPE_TO_NUMPY:
-            raise ValueError(f"Unsupported target_dtype {target_dtype!r}.")
-        return np.dtype(PORT_DTYPE_TO_NUMPY[target_dtype])

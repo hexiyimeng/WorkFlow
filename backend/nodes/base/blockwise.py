@@ -12,7 +12,6 @@ from core.node_invocation import NodeInvocation, NodeRuntime
 from core.type_system import dtype_name_to_numpy, parse_port_type
 from nodes.base.block_map import (
     BaseDaskNode,
-    BlockContextFactory,
     BlockResources,
     ChunkPlanner,
     split_dask_array_inputs,

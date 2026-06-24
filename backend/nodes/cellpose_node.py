@@ -1,191 +1,290 @@
-import logging
+from __future__ import annotations
+
+import inspect
+import itertools
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-logger = logging.getLogger("WorkFlow.Cellpose")
+from core.model_registry import list_models
+from core.registry import register_node
+from nodes.base import BaseMapOverlapNode
 
 
+def create_cellpose_model(model_ref: str, device: str):
+    """Create a worker-local Cellpose model without importing torch at plugin load."""
 
-def create_cellpose_model(model_path: str, device: str):
-    """
-    Create a Cellpose model for ctx.model().
-
-    ``model_path`` is expected to be an absolute local path resolved by
-    WorkFlow's model_registry. ``device`` is WorkFlow's worker device hint.
-    Heavy Cellpose/torch imports stay inside this factory to keep plugin
-    loading lightweight.
-    """
     from cellpose import models
     import torch
 
-    if not Path(model_path).exists():
-        raise RuntimeError(
-            f"Cellpose model path {model_path!r} does not exist. "
-            "WorkFlow requires models to be installed locally before execution."
-        )
-
     device_obj = torch.device(device if device else "cpu")
+    kwargs = {
+        "gpu": device_obj.type == "cuda",
+        "device": device_obj,
+    }
 
-    return models.CellposeModel(
-        gpu=(device_obj.type == "cuda"),
-        pretrained_model=model_path,
-        device=device_obj,
-    )
+    ref = str(model_ref)
+    if Path(ref).exists():
+        kwargs["pretrained_model"] = ref
+    else:
+        try:
+            signature = inspect.signature(models.CellposeModel)
+        except (TypeError, ValueError):
+            signature = None
+        parameters = signature.parameters if signature is not None else {}
+        if "model_type" in parameters:
+            kwargs["model_type"] = ref
+        else:
+            kwargs["pretrained_model"] = ref
+
+    return models.CellposeModel(**kwargs)
+
+
+def validate_cellpose_model(model_ref: str, requested_name: str) -> None:
+    if not Path(model_ref).exists():
+        raise FileNotFoundError(
+            f"Cellpose model {requested_name!r} is not installed under "
+            "backend/models/cellpose."
+        )
 
 
 def cellpose_block(
-    block,
-    model_name="cpsam",
-    diameter=0.0,
-    flow_threshold=0.4,
-    cellprob_threshold=0.0,
-    gpu_batch_size=8,
+    image: np.ndarray,
+    primary_channel: int = 0,
+    secondary_channel: int = -1,
+    model_name: str = "",
+    diameter: float = 0.0,
+    flow_threshold: float = 0.4,
+    cellprob_threshold: float = 0.0,
+    gpu_batch_size: int = 8,
+    do_3d: str = "auto",
+    normalize: bool = True,
     ctx=None,
-):
-    """
-    Block function for Cellpose segmentation.
-
-    Uses ctx.model(...) to get a worker-local cached Cellpose model.
-    Node authors do not manage caching or cleanup here.
-    """
+) -> np.ndarray:
     if ctx is None:
         raise RuntimeError("Cellpose block requires a BlockContext.")
-    if block.ndim not in (2, 3):
+
+    model_name = str(model_name or "").strip()
+    if not model_name:
         raise ValueError(
-            "DaskCellpose supports 2D YX blocks or 3D ZYX blocks only. "
-            f"Received block ndim={block.ndim}, shape={block.shape}."
+            "Cellpose requires a model selected from backend/models/cellpose."
         )
 
-    model_spec = ctx.resources.get("model_spec") if ctx.resources else None
-    if not isinstance(model_spec, dict):
-        fallback_name = model_name or "cpsam"
-        model_spec = {
-            "provider": "cellpose",
-            "requested_name": fallback_name,
-            "load_name": fallback_name,
-            "clear_cuda": True,
-        }
+    resources = ctx.resources or {}
+    axes_by_name = resources.get("axes_by_name") or {}
+    axes = resources.get("axes") or axes_by_name.get(ctx.primary_input_name)
+    if not axes:
+        raise ValueError(
+            "Cellpose requires axes metadata in BlockContext.resources. "
+            "Declare ARRAY_AXES_BY_NDIM or provide image_metadata.axes."
+        )
+    axes = tuple(str(axis).upper() for axis in axes)
+    if len(axes) != image.ndim:
+        raise ValueError(f"Cellpose axes {axes!r} length does not match image ndim={image.ndim}.")
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"Cellpose axes contains duplicate entries: {axes!r}.")
 
-    provider = model_spec.get("provider")
-    model_name_or_path = (
-        model_spec.get("load_name")
-        or model_spec.get("requested_name")
-        or model_name
-        or "cpsam"
-    )
+    output_axes = tuple(axis for axis in axes if axis != "C")
+    spatial_axes = tuple(axis for axis in ("Z", "Y", "X") if axis in output_axes)
+    if "Y" not in spatial_axes or "X" not in spatial_axes:
+        raise ValueError(f"Cellpose requires Y and X axes, got output axes {output_axes!r}.")
+    if len(spatial_axes) not in (2, 3):
+        raise ValueError(f"Cellpose supports 2D YX or 3D ZYX spatial blocks, got {output_axes!r}.")
+
+    do_3d_mode = str(do_3d or "auto").strip().lower()
+    if do_3d_mode not in {"auto", "true", "false"}:
+        raise ValueError(f"do_3d must be one of 'auto', 'true', or 'false', got {do_3d!r}.")
+
+    channel_axis = axes.index("C") if "C" in axes else None
+    if channel_axis is None:
+        work_image = image
+        has_channels = False
+    else:
+        channel_count = int(image.shape[channel_axis])
+        primary_channel = int(primary_channel)
+        secondary_channel = int(secondary_channel)
+        if primary_channel < 0 or primary_channel >= channel_count:
+            raise ValueError(
+                f"primary_channel={primary_channel} is out of bounds "
+                f"for channel count {channel_count}."
+            )
+        if secondary_channel >= channel_count:
+            raise ValueError(
+                f"secondary_channel={secondary_channel} is out of bounds "
+                f"for channel count {channel_count}."
+            )
+
+        primary = np.take(image, primary_channel, axis=channel_axis)
+        if secondary_channel >= 0:
+            secondary = np.take(image, secondary_channel, axis=channel_axis)
+            work_image = np.stack([primary, secondary], axis=-1)
+            has_channels = True
+        else:
+            work_image = primary
+            has_channels = False
 
     model = ctx.model(
-        provider=provider,
-        name=model_name_or_path,
+        provider="cellpose",
+        name=model_name,
         factory=create_cellpose_model,
-        clear_cuda=bool(model_spec.get("clear_cuda", True)),
+        clear_cuda=True,
+        validate=validate_cellpose_model,
     )
 
-    masks = None
-    flows = None
-    styles = None
-    try:
-        eval_kwargs: dict = {
-            "batch_size": gpu_batch_size,
+    output = np.zeros(
+        work_image.shape[:-1] if has_channels else work_image.shape,
+        dtype=np.uint32,
+    )
+    batch_axes = [
+        index
+        for index, axis in enumerate(output_axes)
+        if axis not in ("Z", "Y", "X")
+    ]
+    batch_axis_set = set(batch_axes)
+    batch_shape = tuple(int(output.shape[index]) for index in batch_axes)
+    batch_indices = (
+        itertools.product(*(range(size) for size in batch_shape))
+        if batch_axes
+        else [()]
+    )
+
+    for batch_index in batch_indices:
+        output_selection: list[Any] = [slice(None)] * output.ndim
+        for axis_index, value in zip(batch_axes, batch_index):
+            output_selection[axis_index] = value
+
+        segment_index = tuple(output_selection + ([slice(None)] if has_channels else []))
+        segment = work_image[segment_index]
+        remaining_axes = tuple(
+            axis
+            for index, axis in enumerate(output_axes)
+            if index not in batch_axis_set
+        )
+        segment_spatial_axes = tuple(
+            axis for axis in ("Z", "Y", "X") if axis in remaining_axes
+        )
+        transpose_order = [
+            remaining_axes.index(axis)
+            for axis in segment_spatial_axes
+        ]
+        if has_channels:
+            transpose_order.append(segment.ndim - 1)
+        segment_for_model = (
+            np.transpose(segment, transpose_order)
+            if transpose_order != list(range(segment.ndim))
+            else segment
+        )
+
+        eval_kwargs: dict[str, Any] = {
+            "batch_size": int(gpu_batch_size),
             "progress": None,
             "bsize": 256,
             "tile_overlap": 0.1,
             "resample": False,
+            "normalize": bool(normalize),
+            "flow_threshold": float(flow_threshold),
+            "cellprob_threshold": float(cellprob_threshold),
         }
+        if float(diameter or 0.0) > 0:
+            eval_kwargs["diameter"] = float(diameter)
+        if has_channels:
+            eval_kwargs["channel_axis"] = -1
 
-        if diameter and diameter > 0:
-            eval_kwargs["diameter"] = diameter
+        has_z = "Z" in segment_spatial_axes
+        use_3d = do_3d_mode == "true" or (
+            do_3d_mode == "auto"
+            and has_z
+            and len(segment_spatial_axes) == 3
+        )
+        if do_3d_mode == "false":
+            use_3d = False
 
-        if block.ndim == 3:
-            eval_kwargs["do_3D"] = True
-            eval_kwargs["z_axis"] = 0
+        if not has_z or use_3d:
+            eval_kwargs["do_3D"] = use_3d
+            if use_3d:
+                eval_kwargs["z_axis"] = 0
+            result = model.eval(np.asarray(segment_for_model), **eval_kwargs)
+            mask = np.asarray(result[0] if isinstance(result, tuple) else result)
         else:
             eval_kwargs["do_3D"] = False
-            eval_kwargs["flow_threshold"] = flow_threshold
-            eval_kwargs["cellprob_threshold"] = cellprob_threshold
+            mask = np.zeros(segment_for_model.shape[:3], dtype=np.uint32)
+            for z_index in range(int(segment_for_model.shape[0])):
+                result = model.eval(
+                    np.asarray(segment_for_model[z_index]),
+                    **eval_kwargs,
+                )
+                plane_mask = result[0] if isinstance(result, tuple) else result
+                mask[z_index] = np.asarray(plane_mask, dtype=np.uint32)
 
-        masks, flows, styles = model.eval(block, **eval_kwargs)
-        return masks.astype(np.uint16, copy=False)
-    finally:
-        if masks is not None:
-            del masks
-        if flows is not None:
-            del flows
-        if styles is not None:
-            del styles
+        inverse_order = [
+            segment_spatial_axes.index(axis)
+            for axis in remaining_axes
+        ]
+        if inverse_order != list(range(mask.ndim)):
+            mask = np.transpose(mask, inverse_order)
+        output[tuple(output_selection)] = mask.astype(np.uint32, copy=False)
 
-from core.model_registry import list_models, resolve_model_path
-from core.registry import register_node
-from nodes.base import BaseBlockMapNode
+    return output.astype(np.uint32, copy=False)
 
 
-@register_node("DaskCellpose")
-class DaskCellpose(BaseBlockMapNode):
-    """
-    Blockwise Cellpose segmentation.
-
-    Supported block shapes are 2D YX and 3D ZYX. Higher-dimensional arrays must
-    be sliced or reshaped upstream because channel/time axis semantics are not
-    implemented here. Model loading is worker-local and lazy through ctx.model().
-    """
+@register_node("Cellpose")
+class Cellpose(BaseMapOverlapNode):
     CATEGORY = "WorkFlow/Segmentation"
-    DISPLAY_NAME = "Cellpose Segmentation"
+    DISPLAY_NAME = "Cellpose"
     FAILURE_POLICY = "raise"
-
     SKIP_EMPTY_BLOCKS = True
     SKIP_ALL_ZERO_BLOCKS = False
-    OUTPUT_DTYPE = np.uint16
+
+    MAP_INPUTS = ["image"]
+    PRIMARY_INPUT = "image"
+    PROCESS_BLOCK = cellpose_block
+    ARRAY_AXES_BY_NDIM = {
+        "image": {
+            2: ("Y", "X"),
+            3: ("Z", "Y", "X"),
+            4: ("C", "Z", "Y", "X"),
+            5: ("T", "C", "Z", "Y", "X"),
+        }
+    }
+
+    MAP_OVERLAP_SPEC = {
+        "depth": {"Z": 8, "Y": 64, "X": 64},
+        "boundary": "reflect",
+        "trim": True,
+        "align_arrays": True,
+        "allow_rechunk": True,
+    }
+    MAP_BLOCKS_OUTPUT_SPEC = {
+        "dtype": "uint32",
+        "drop_axis": "C",
+        "chunks": "drop_axis_from_primary",
+        "enforce_ndim": True,
+    }
 
     @classmethod
     def INPUT_TYPES(cls):
-        local_models = list_models("cellpose")
-        models = sorted(set(local_models))
-        default_model = models[0] if models else "cpsam"
+        model_names = list_models("cellpose")
         return {
             "required": {
-                "dask_arr": ("DASK_ARRAY[any]",),
-                "model_name": ("STRING", {"default": default_model, "multiline": False}),
+                "image": ("DASK_ARRAY[any]",),
+                "primary_channel": ("INT", {"default": 0, "min": 0, "max": 255}),
+                "secondary_channel": ("INT", {"default": -1, "min": -1, "max": 255}),
+                "model_name": (
+                    model_names,
+                    {"default": model_names[0] if model_names else ""},
+                ),
                 "diameter": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 500.0}),
                 "flow_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0}),
                 "cellprob_threshold": ("FLOAT", {"default": 0.0, "min": -6.0, "max": 6.0}),
-                "gpu_batch_size": ("INT", {"default": 8, "min": 1, "max": 64}),
+                "gpu_batch_size": ("INT", {"default": 8, "min": 1, "max": 256}),
+                "do_3d": (["auto", "true", "false"], {"default": "auto"}),
+                "normalize": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "image_metadata": ("DICT",),
             },
         }
 
-    RETURN_TYPES = ("DASK_ARRAY[uint16]",)
-    RETURN_NAMES = ("mask_dask",)
-    FUNCTION = "execute"
-    PROCESS_BLOCK = cellpose_block
-    
-
-    def preprocess(self, dask_arr, params: dict, runtime: dict) -> dict:
-        if int(getattr(dask_arr, "ndim", 0)) not in (2, 3):
-            raise ValueError(
-                "DaskCellpose supports 2D YX arrays or 3D ZYX arrays only. "
-                f"Received ndim={getattr(dask_arr, 'ndim', None)}, shape={getattr(dask_arr, 'shape', None)}."
-            )
-        requested_name = params.get("model_name") or "cpsam"
-        load_name = resolve_model_path("cellpose", requested_name)
-        if not load_name:
-            raise RuntimeError(
-                f"Cellpose model {requested_name!r} is not installed locally. "
-                "Install it under backend/models/cellpose/ or set WorkFlow_MODELS_DIR."
-            )
-
-        logger.info(
-            "[Cellpose] requested_model=%r resolved_load_name=%r",
-            requested_name,
-            load_name,
-        )
-
-        # Serializable only. The CellposeModel object is created lazily inside
-        # the Dask worker via ctx.model(), so GraphBuilding never loads the
-        # heavy cellpose/torch model.
-        model_spec = {
-            "provider": "cellpose",
-            "requested_name": requested_name,
-            "load_name": load_name,
-            "clear_cuda": True,
-        }
-        return {"model_spec": model_spec}
+    RETURN_TYPES = ("DASK_ARRAY[uint32]",)
+    RETURN_NAMES = ("mask",)

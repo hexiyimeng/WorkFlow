@@ -1,17 +1,5 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:22-bookworm-slim AS frontend-builder
-
-WORKDIR /app
-
-COPY frontend/package*.json ./frontend/
-WORKDIR /app/frontend
-RUN --mount=type=cache,target=/root/.npm npm ci
-
-COPY frontend/ ./
-RUN npm run build
-
-
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
@@ -34,7 +22,6 @@ COPY backend/pyproject.toml backend/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project
 
 COPY backend/ ./
-COPY --from=frontend-builder /app/backend/dist ./dist
 
 ENV PATH="/app/backend/.venv/bin:$PATH"
 
