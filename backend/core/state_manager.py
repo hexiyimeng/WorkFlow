@@ -30,11 +30,6 @@ class ExecutionStatus:
     def is_finished(cls, status: str) -> bool:
         return status in (cls.CANCELLED, cls.FAILED, cls.SUCCEEDED)
 
-    @classmethod
-    def can_transition(cls, from_status: str, to_status: str) -> bool:
-        allowed = cls.VALID_TRANSITIONS.get(from_status, [])
-        return to_status in allowed
-
 
 @dataclass
 class ExecutionSession:

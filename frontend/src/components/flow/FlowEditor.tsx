@@ -8,14 +8,17 @@ import {
   useViewport,
   BackgroundVariant,
   ConnectionMode,
+  type Node,
+  type NodeProps,
   type NodeTypes
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useFlow } from '../../hooks/useFlowContext';
 import DynamicNode from '../DynamicNode';
 import ContextMenu from './ContextMenu';
+import type { NodeData } from '../../types';
 
-const nodeTypes: NodeTypes = { dynamic: DynamicNode as ComponentType<any> };
+const nodeTypes: NodeTypes = { dynamic: DynamicNode as ComponentType<NodeProps<Node<NodeData>>> };
 
 // === Toolbar icons ===
 const FitIcon = () => (

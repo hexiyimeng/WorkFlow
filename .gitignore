@@ -31,5 +31,7 @@ backend/models/
 
 
 
-backend/tests/
+backend/tests/*
+!backend/tests/
+!backend/tests/test_*.py
 backend/examples/

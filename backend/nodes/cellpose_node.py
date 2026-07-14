@@ -9,7 +9,7 @@ import numpy as np
 
 from core.model_registry import list_models
 from core.registry import register_node
-from nodes.base import BaseMapOverlapNode
+from nodes.base import BaseMapOverlapNode, ChunkPlanner
 
 
 def create_cellpose_model(model_ref: str, device: str):
@@ -76,8 +76,8 @@ def cellpose_block(
     axes = resources.get("axes") or axes_by_name.get(ctx.primary_input_name)
     if not axes:
         raise ValueError(
-            "Cellpose requires axes metadata in BlockContext.resources. "
-            "Declare ARRAY_AXES_BY_NDIM or provide image_metadata.axes."
+            "Cellpose requires axes in BlockContext.resources. "
+            "Declare ARRAY_AXES_BY_NDIM or provide the explicit axes input."
         )
     axes = tuple(str(axis).upper() for axis in axes)
     if len(axes) != image.ndim:
@@ -231,10 +231,7 @@ def cellpose_block(
 @register_node("Cellpose")
 class Cellpose(BaseMapOverlapNode):
     CATEGORY = "WorkFlow/Segmentation"
-    DISPLAY_NAME = "Cellpose"
-    FAILURE_POLICY = "raise"
-    SKIP_EMPTY_BLOCKS = True
-    SKIP_ALL_ZERO_BLOCKS = False
+    DISPLAY_NAME = "Cellpose1111111"
 
     MAP_INPUTS = ["image"]
     PRIMARY_INPUT = "image"
@@ -282,9 +279,32 @@ class Cellpose(BaseMapOverlapNode):
                 "normalize": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "axes": ("STRING", {"default": "", "multiline": False}),
                 "image_metadata": ("DICT",),
             },
         }
 
     RETURN_TYPES = ("DASK_ARRAY[uint32]",)
     RETURN_NAMES = ("mask",)
+
+    def preprocess(
+        self,
+        dask_arr=None,
+        array_inputs: dict | None = None,
+        params: dict | None = None,
+        runtime: dict | None = None,
+    ) -> dict[str, Any] | None:
+        image = (array_inputs or {}).get("image", dask_arr)
+        params = params or {}
+        axes = ChunkPlanner.normalize_axes(params.get("axes"))
+        metadata = params.get("image_metadata")
+        if axes is None and isinstance(metadata, dict):
+            axes = ChunkPlanner.normalize_axes(metadata.get("axes"))
+        if axes is None:
+            return None
+        axes = tuple(str(axis).upper() for axis in axes)
+        if image is not None and len(axes) != int(image.ndim):
+            raise ValueError(f"Cellpose axes {axes!r} length does not match image ndim={image.ndim}.")
+        axes_by_name = {**(getattr(self, "_axes_by_name", {}) or {}), "image": axes}
+        self._axes_by_name = axes_by_name
+        return {"axes": axes, "axes_by_name": dict(axes_by_name)}

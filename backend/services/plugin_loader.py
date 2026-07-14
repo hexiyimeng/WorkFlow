@@ -17,6 +17,8 @@ from core.platform import BACKEND_ROOT, nodes_dir
 
 import logging
 
+from core.registry import clear_node_registry
+
 
 logger = logging.getLogger("WorkFlow.Plugins")
 
@@ -68,6 +70,25 @@ def _iter_plugin_files(path: Path) -> list[Path]:
             and not file_path.resolve().is_relative_to(base_dir)
         )
     )
+
+
+def _remove_plugin_modules(plugin_dir: Path, import_root: Path) -> list[str]:
+    root_package = plugin_dir.resolve().relative_to(import_root.resolve()).parts[0]
+    removed: list[str] = []
+
+    for module_name in sorted(list(sys.modules), key=len, reverse=True):
+        if not (module_name == root_package or module_name.startswith(f"{root_package}.")):
+            continue
+        if module_name == root_package:
+            continue
+        if module_name == f"{root_package}.base" or module_name.startswith(f"{root_package}.base."):
+            continue
+        sys.modules.pop(module_name, None)
+        removed.append(module_name)
+    if removed:
+        logger.info("[PluginLoader] Removed %s plugin module(s) from sys.modules.", len(removed))
+        logger.debug("[PluginLoader] Removed plugin modules: %s", removed)
+    return removed
 
 
 def _handle_missing_nodes(path: Path, critical_plugins: set[str]) -> Tuple[bool, List[str], List[str]]:
@@ -185,3 +206,19 @@ def load_all_plugins() -> Tuple[bool, List[str], List[str]]:
         logger.warning("[PluginLoader] %s", message)
 
     return len(failed_list) == 0, success_list, failed_list
+
+
+def reload_all_plugins() -> Tuple[bool, List[str], List[str]]:
+    plugin_dir = nodes_dir().resolve()
+    import_root = _import_root_for_nodes(plugin_dir)
+
+    for path in (BACKEND_ROOT, import_root):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+    clear_node_registry()
+    importlib.invalidate_caches()
+    _remove_plugin_modules(plugin_dir, import_root)
+    importlib.invalidate_caches()
+    return load_all_plugins()

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { AlertTriangle, X } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 import type { PluginImportFailure, PluginNodeInfoError } from '../../types';
@@ -12,7 +12,7 @@ const hasTraceback = (failure: DisplayFailure) =>
 
 export default function PluginDiagnosticsBanner() {
   const { pluginDiagnostics, pluginStatusError } = useFlow();
-  const [dismissed, setDismissed] = useState(false);
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null);
 
   const failures = useMemo<DisplayFailure[]>(() => {
     if (!pluginDiagnostics) return [];
@@ -30,12 +30,10 @@ export default function PluginDiagnosticsBanner() {
   }, [pluginDiagnostics]);
 
   const issueCount = failures.length;
-
-  useEffect(() => {
-    if (issueCount > 0 || pluginStatusError) {
-      setDismissed(false);
-    }
-  }, [issueCount, pluginStatusError]);
+  const issueKey = pluginStatusError
+    ? `status:${pluginStatusError}`
+    : failures.map(failure => `${failure.kind}:${failure.title}:${failure.error_type}:${failure.message}`).join('|');
+  const dismissed = dismissedKey === issueKey;
 
   if (!pluginStatusError && issueCount === 0) return null;
 
@@ -43,7 +41,7 @@ export default function PluginDiagnosticsBanner() {
     return (
       <button
         type="button"
-        onClick={() => setDismissed(false)}
+        onClick={() => setDismissedKey(null)}
         className="fixed right-3 top-14 z-50 inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border px-2.5 py-1.5 text-[11px] font-semibold shadow-[var(--shadow-floating)]"
         style={{
           backgroundColor: 'var(--color-warning-soft)',
@@ -77,7 +75,7 @@ export default function PluginDiagnosticsBanner() {
           </div>
           <button
             type="button"
-            onClick={() => setDismissed(true)}
+            onClick={() => setDismissedKey(issueKey)}
             className="rounded-[var(--radius-sm)] p-1 transition-colors hover:bg-black/10"
             title="Dismiss"
           >
@@ -160,7 +158,7 @@ export default function PluginDiagnosticsBanner() {
         </div>
         <button
           type="button"
-          onClick={() => setDismissed(true)}
+          onClick={() => setDismissedKey(issueKey)}
           className="rounded-[var(--radius-sm)] p-1 transition-colors hover:bg-black/10"
           title="Dismiss"
         >

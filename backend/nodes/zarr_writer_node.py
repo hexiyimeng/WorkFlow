@@ -237,8 +237,6 @@ class ZarrWriter(BaseMapBlocksNode):
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr Writer"
     OUTPUT_NODE = True
-    FAILURE_POLICY = "raise"
-    SKIP_EMPTY_BLOCKS = False
 
     MAP_INPUTS = ["array"]
     PRIMARY_INPUT = "array"

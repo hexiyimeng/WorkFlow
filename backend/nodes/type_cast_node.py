@@ -29,10 +29,6 @@ class DaskTypeCast(BaseMapBlocksNode):
     CATEGORY = "WorkFlow/Utility"
     DISPLAY_NAME = "Type Cast"
 
-    SKIP_EMPTY_BLOCKS = True
-    SKIP_ALL_ZERO_BLOCKS = False
-    FAILURE_POLICY = "raise"
-
     @classmethod
     def INPUT_TYPES(cls):
         return {

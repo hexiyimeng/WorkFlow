@@ -147,10 +147,6 @@ class MultiGPUDevicePlugin(WorkerPlugin):
             logger.debug(f"Failed to bind GPU for worker {worker.name}, assigned={worker.assigned_gpu}: {e}")
 
 
-# Backward-compatible alias for external code that may import the old name.
-WindowsMultiGPUPlugin = MultiGPUDevicePlugin
-
-
 _memory_thresholds = _get_dask_memory_thresholds()
 _worker_ttl = os.getenv("WorkFlow_DASK_WORKER_TTL", "2h")
 dask.config.set({
@@ -177,8 +173,6 @@ class DaskService:
     client = None
     cluster = None
     _cluster_lock = threading.RLock()
-
-    recommended_chunk_multiple = 1
 
     def __new__(cls):
         if cls._instance is None:
@@ -319,6 +313,18 @@ class DaskService:
 
             except Exception as e:
                 logger.error(f"[Dask] Start failed: {e}")
+                if self.client:
+                    try:
+                        self.client.close()
+                    except Exception:
+                        pass
+                if self.cluster:
+                    try:
+                        self.cluster.close()
+                    except Exception:
+                        pass
+                self.client = None
+                self.cluster = None
                 return None
 
     def stop_cluster(self):

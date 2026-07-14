@@ -1,6 +1,7 @@
 // src/components/layout/Header.tsx
-import { useRef, useState, useEffect, type ChangeEvent } from 'react';
+import { useRef, type ChangeEvent } from 'react';
 import { useReactFlow, getNodesBounds, getViewportForBounds } from '@xyflow/react';
+import { RefreshCw } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 import { Button } from '../ui/Button';
 import { IconButton } from '../ui/IconButton';
@@ -84,29 +85,16 @@ export default function Header() {
     theme, toggleTheme,
     workflows, activeWorkflowId,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow,
-    runFlow, stopFlow, setNodes, setEdges, isConnected,
+    runFlow, stopFlow, reloadNodes, setNodes, setEdges,
     nodeDefs,
+    dashboardUrl,
+    isReloadingNodes,
     executionState,
     isExecuting, isExecutionLocked, addLog,
   } = useFlow();
 
   const reactFlowInstance = useReactFlow();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [dashboardUrl, setDashboardUrl] = useState<string>('');
-
-  useEffect(() => {
-    if (!isConnected) return;
-    const apiBase = import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:8000' : window.location.origin);
-    fetch(`${apiBase}/dashboard_url`)
-      .then(r => r.json())
-      .then(d => {
-        if (d.dashboard_url) {
-          const url = d.dashboard_url.endsWith('/status') ? d.dashboard_url : `${d.dashboard_url}/status`;
-          setDashboardUrl(url);
-        }
-      })
-      .catch(() => {});
-  }, [isConnected]);
 
   // === Save (export stripped/serialized workflow JSON) ===
   const handleSave = () => {
@@ -178,7 +166,11 @@ export default function Header() {
       }
 
       if (parsed.workflow_name && activeWorkflowId) {
-        try { renameWorkflow(activeWorkflowId, String(parsed.workflow_name)); } catch {}
+        try {
+          renameWorkflow(activeWorkflowId, String(parsed.workflow_name));
+        } catch (err) {
+          console.warn('Failed to rename loaded workflow', err);
+        }
       }
 
       const bounds = getNodesBounds(result.nodes);
@@ -296,6 +288,14 @@ export default function Header() {
           title="Dask Dashboard"
         >
           <DaskIcon />
+        </IconButton>
+
+        <IconButton
+          onClick={() => { void reloadNodes(); }}
+          disabled={isExecutionLocked || isReloadingNodes}
+          title="Reload Nodes"
+        >
+          <RefreshCw className={isReloadingNodes ? 'w-4 h-4 animate-spin' : 'w-4 h-4'} />
         </IconButton>
 
         {/* Theme */}

@@ -416,8 +416,6 @@ class WriteParquetCellTable(BaseMapBlocksNode):
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Write Parquet Cell Table"
     OUTPUT_NODE = True
-    FAILURE_POLICY = "raise"
-    SKIP_EMPTY_BLOCKS = False
     CHUNK_POLICY = {"mode": "rechunk_to_primary"}
 
     MAP_INPUTS = ["mask"]

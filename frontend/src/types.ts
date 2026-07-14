@@ -96,6 +96,19 @@ export interface PluginDiagnostics {
   node_info_errors?: PluginNodeInfoError[];
 }
 
+export interface ReloadNodesResponse {
+  ok: boolean;
+  code?: string;
+  message?: string;
+  error_type?: string;
+  error_message?: string;
+  loaded?: string[];
+  failed?: string[];
+  plugin_status?: PluginDiagnostics;
+  object_info?: Record<string, NodeSpec>;
+  dashboard_url?: string | null;
+}
+
 export interface NodeData extends Record<string, unknown> {
   opType: string;
   nodeSpec: NodeSpec;

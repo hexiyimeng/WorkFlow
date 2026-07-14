@@ -9,6 +9,8 @@ export interface FlowContextType {
   nodeDefs: Record<string, NodeSpec>;
   pluginDiagnostics: PluginDiagnostics | null;
   pluginStatusError: string | null;
+  dashboardUrl: string;
+  isReloadingNodes: boolean;
   theme: 'light' | 'dark';
   isConsoleOpen: boolean;
   workflows: Workflow[];
@@ -49,6 +51,7 @@ export interface FlowContextType {
   // === Execution ===
   runFlow: () => void;
   stopFlow: () => void;
+  reloadNodes: () => Promise<void>;
   clearLogs: () => void;
   addLog: (message: string, level?: 'info' | 'warning' | 'error' | 'success') => void;
 

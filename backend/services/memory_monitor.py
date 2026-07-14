@@ -37,17 +37,6 @@ class MemoryMonitor:
         self._has_psutil = self._check_psutil()
         self._has_torch = self._check_torch()
 
-    def reset_for_execution(self, execution_id: str):
-        """
-        Clear process-global snapshots before a new execution starts.
-
-        This singleton depends on the single-active-execution gate in
-        state_manager. If multiple active executions are restored later,
-        snapshots must become per-execution instead of process-global.
-        """
-        logger.debug(f"[MemoryMonitor] Reset snapshots for execution {execution_id}")
-        self.snapshots.clear()
-
     def _check_psutil(self) -> bool:
         """检查 psutil 是否可用"""
         try:
@@ -233,28 +222,6 @@ class MemoryMonitor:
         logger.info(f"[Memory] Delta {name1} -> {name2}: {' | '.join(parts)}")
 
         return delta
-
-    def log_summary(self, execution_id: str = None) -> str:
-        """
-        生成内存变化摘要字符串。
-
-        Returns:
-            摘要字符串，适合记录到日志或返回给前端
-        """
-        if not self.snapshots:
-            return "No memory snapshots recorded"
-
-        # 获取所有快照名称（按时间排序）
-        sorted_names = sorted(self.snapshots.keys(), key=lambda n: self.snapshots[n]["timestamp"])
-
-        summary_parts = []
-        for name in sorted_names:
-            s = self.snapshots[name]
-            if s["process_mb"]:
-                summary_parts.append(f"{name}:{s['process_mb']:.0f}MB")
-
-        return " -> ".join(summary_parts) if summary_parts else "No process memory data"
-
 
 # Process-global singleton. This is valid only while state_manager enforces one
 # active execution at a time. Multi-active execution would need per-execution

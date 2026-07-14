@@ -14,7 +14,6 @@ router = APIRouter()
 @router.websocket("/ws/run")
 async def websocket_endpoint(websocket: WebSocket):
     client_ip = websocket.client.host if websocket.client else "unknown"
-    current_execution_id = None  # 当前客户端订阅的 execution_id
 
     # ========== accept 连接 ==========
     try:
@@ -38,7 +37,6 @@ async def websocket_endpoint(websocket: WebSocket):
     heartbeat_task = asyncio.create_task(heartbeat())
 
     # 1. 连接初始化
-    initialized = False
     try:
         # 发送 Dask 服务状态
         client = dask_service.get_client()
@@ -47,7 +45,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "type": "log",
                 "message": f"[System] Dask Cluster Connected: {client.dashboard_link}"
             })
-        initialized = True
     except Exception as e:
         logger.warning(f"WebSocket initialization failed for {client_ip}: {e}")
         state_manager.unsubscribe_client(websocket)
@@ -56,7 +53,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # 2. 消息监听主循环
     try:
-        while initialized:
+        while True:
             try:
                 timeout = 30
                 data = await asyncio.wait_for(websocket.receive_json(), timeout=timeout)
@@ -75,7 +72,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     existing_session = state_manager.get_execution(execution_id)
                     if existing_session and not ExecutionStatus.is_finished(existing_session.status):
                         state_manager.subscribe_client(execution_id, websocket)
-                        current_execution_id = execution_id
                         logger.info(f"[WebSocket] execution_id={execution_id} already active, subscribing client")
                         await state_manager.sync_history_to_client(websocket, execution_id)
                         await websocket.send_json({
@@ -87,7 +83,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # --- Active execution guard: historical executions are kept, but only
                     # one RUNNING/CANCELLING execution may own the active slot.
                     try:
-                        session = state_manager.start_execution(execution_id)
+                        state_manager.start_execution(execution_id)
                     except RuntimeError as exc:
                         logger.warning(f"[WebSocket] execution rejected: active execution already running, "
                                        f"client={client_ip}, requested_execution_id={execution_id}")
@@ -101,7 +97,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # Create execution session and subscribe client
                     state_manager.subscribe_client(execution_id, websocket)
-                    current_execution_id = execution_id
 
                     logger.info(f"Executing graph for {client_ip}, execution_id={execution_id}")
 
@@ -161,7 +156,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         session = state_manager.get_execution(execution_id)
                         if session:
                             state_manager.subscribe_client(execution_id, websocket)
-                            current_execution_id = execution_id
                             # 同步历史状态
                             await state_manager.sync_history_to_client(websocket, execution_id)
                             await websocket.send_json({

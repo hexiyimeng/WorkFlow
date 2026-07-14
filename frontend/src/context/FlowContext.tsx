@@ -63,9 +63,12 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     nodeDefs,
     pluginDiagnostics,
     pluginStatusError,
+    dashboardUrl,
+    isReloadingNodes,
     executionState,
     runFlow,
     stopFlow,
+    reloadNodes,
   } = useFlowEngine(nodes, edges, setNodes, setEdges, addLog);
 
   // ===========================================
@@ -263,7 +266,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 10. Context memoization
   // ===========================================
   const contextValue = useMemo(() => ({
-    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, isConnected: isConnected, logs, workflows, activeWorkflowId,
+    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected: isConnected, logs, workflows, activeWorkflowId,
     executionState,
     websocketStatus,
     currentExecutionId: executionState.executionId,
@@ -272,18 +275,18 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
     addNode, addNodeAt, updateNodeData,
-    runFlow, stopFlow, clearLogs, addLog,
+    runFlow, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
     theme, toggleTheme, isConsoleOpen, toggleConsole,
     isValidConnection, undo, redo,
     onConnectStart, onConnectEnd, connectingType,
     handleCopy, handlePaste, handleDelete,
   }), [
-    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, isConnected, logs, workflows, activeWorkflowId,
+    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected, logs, workflows, activeWorkflowId,
     theme, isConsoleOpen, connectingType,
     executionState, websocketStatus, isExecuting, isCancelling, isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
-    addNode, addNodeAt, updateNodeData, runFlow, stopFlow, clearLogs, addLog,
+    addNode, addNodeAt, updateNodeData, runFlow, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
     toggleTheme, toggleConsole, isValidConnection, undo, redo,
     onConnectStart, onConnectEnd, handleCopy, handlePaste, handleDelete,

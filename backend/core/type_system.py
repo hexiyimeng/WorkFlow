@@ -83,13 +83,6 @@ def dtype_name_to_numpy(dtype_name: str | None, input_dtype=None):
     return np.dtype(PORT_DTYPE_TO_NUMPY[dtype_name])
 
 
-def dtype_name_for_numpy(dtype) -> str:
-    np_dtype = np.dtype(dtype)
-    if np_dtype == np.dtype(np.bool_):
-        return "bool"
-    return np_dtype.name
-
-
 def can_connect_types(source_type: str, target_type: str) -> Tuple[bool, Optional[str]]:
     try:
         source = validate_port_type(source_type)

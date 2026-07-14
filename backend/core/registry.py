@@ -1,6 +1,6 @@
 # registry.py
 import logging
-from typing import Dict, Type, Literal
+from typing import Dict, Type
 
 from core.logger import logger
 from core.plugin_diagnostics import clear_node_info_errors, record_node_info_error
@@ -10,7 +10,10 @@ from core.type_system import validate_port_type
 diagnostics_logger = logging.getLogger("WorkFlow.PluginDiagnostics")
 
 NODE_CLASS_MAPPINGS: Dict[str, Type] = {}
-NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {}
+
+
+def clear_node_registry() -> None:
+    NODE_CLASS_MAPPINGS.clear()
 
 
 def validate_node_port_types(input_config: dict, return_types) -> None:
@@ -41,11 +44,9 @@ def register_node(name: str):
             logger.warning(
                 f"[Registry] Duplicate node name '{name}': "
                 f"{existing.__name__} will be overridden by {cls.__name__}"
-            )
+        )
         NODE_CLASS_MAPPINGS[name] = cls
         cls.NODE_TYPE_NAME = name
-        if hasattr(cls, "DISPLAY_NAME"):
-            NODE_DISPLAY_NAME_MAPPINGS[name] = cls.DISPLAY_NAME
         return cls
 
     return decorator

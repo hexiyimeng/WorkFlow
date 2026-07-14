@@ -121,13 +121,6 @@ def build_node_invocation(
     execution_id: str,
 ) -> NodeInvocation:
     input_defs = get_node_input_defs(node_cls)
-    for section in ("required", "optional"):
-        for name, config in input_defs.get(section, {}).items():
-            if name not in prepared_inputs:
-                continue
-            declared, _ = declared_type_and_meta(config)
-            validate_input_value(name, declared, prepared_inputs.get(name))
-
     return NodeInvocation(
         runtime=NodeRuntime(node_id=node_id, execution_id=execution_id),
         input_defs=input_defs,

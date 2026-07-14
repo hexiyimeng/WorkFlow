@@ -1,6 +1,7 @@
 ﻿import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
 import type { Node, Edge } from '@xyflow/react';
-import type { NodeData, WSMessage, NodeSpec, LogEntry, ExecutionRuntimeState, ExecutionPhase, WebSocketStatus, RunState, PluginDiagnostics } from '../types';
+import type { NodeData, WSMessage, NodeSpec, LogEntry, ExecutionRuntimeState, ExecutionPhase, WebSocketStatus, RunState, PluginDiagnostics, ReloadNodesResponse } from '../types';
+import { hydrateNodesWithLatestSpecs, serializeNodesForStorage } from '../utils/workflowPersistence';
 
 // === Reset helper ===
 const resetRuntimeNodeState = (
@@ -18,6 +19,35 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || (isDev ? 'http://localhost
 const WS_BASE = import.meta.env.VITE_WS_URL || (isDev
   ? 'ws://localhost:8000'
   : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`);
+
+const normalizeDashboardUrl = (url?: string | null): string => {
+  if (!url) return '';
+  return url.endsWith('/status') ? url : `${url}/status`;
+};
+
+const fetchJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, init);
+  const text = await res.text();
+  let data: T;
+  try {
+    data = JSON.parse(text) as T;
+  } catch {
+    if (text.trim().startsWith('<') || text.trim().startsWith('<!DOCTYPE')) {
+      throw new Error(
+        `Received HTML instead of JSON from ${url}. ` +
+        `In dev mode, ensure the backend is running on http://localhost:8000 ` +
+        `or set VITE_API_BASE_URL to the correct backend address.`
+      );
+    }
+    throw new Error(`Invalid JSON from ${url}`);
+  }
+  if (!res.ok) {
+    const payload = data as Record<string, unknown>;
+    throw new Error(String(payload.message || payload.error_message || `HTTP ${res.status} from ${url}`));
+  }
+  return data;
+};
 
 // === Execution state reducer ===
 type ExecutionAction =
@@ -86,6 +116,8 @@ export const useFlowEngine = (
   const [nodeDefs, setNodeDefs] = useState<Record<string, NodeSpec>>({});
   const [pluginDiagnostics, setPluginDiagnostics] = useState<PluginDiagnostics | null>(null);
   const [pluginStatusError, setPluginStatusError] = useState<string | null>(null);
+  const [dashboardUrl, setDashboardUrl] = useState<string>('');
+  const [isReloadingNodes, setIsReloadingNodes] = useState(false);
 
   // --- Execution state (reducer) ---
   const [executionState, dispatchExecution] = useReducer(executionReducer, initialExecutionState);
@@ -107,27 +139,6 @@ export const useFlowEngine = (
   // 1. Fetch node definitions once on mount
   // ============================================================
   useEffect(() => {
-    const fetchJson = async <T,>(path: string): Promise<T> => {
-      const url = `${API_BASE}${path}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} from ${url}`);
-      }
-      const text = await res.text();
-      try {
-        return JSON.parse(text) as T;
-      } catch {
-        if (text.trim().startsWith('<') || text.trim().startsWith('<!DOCTYPE')) {
-          throw new Error(
-            `Received HTML instead of JSON from ${url}. ` +
-            `In dev mode, ensure the backend is running on http://localhost:8000 ` +
-            `or set VITE_API_BASE_URL to the correct backend address.`
-          );
-        }
-        throw new Error(`Invalid JSON from ${url}`);
-      }
-    };
-
     const loadStartupData = async () => {
       try {
         const data = await fetchJson<Record<string, NodeSpec>>('/object_info');
@@ -154,11 +165,74 @@ export const useFlowEngine = (
         setPluginStatusError((err as Error).message);
         addLog('Could not fetch plugin status from backend.', 'warning');
       }
+
+      try {
+        const dashboard = await fetchJson<{ dashboard_url?: string | null }>('/dashboard_url');
+        setDashboardUrl(normalizeDashboardUrl(dashboard.dashboard_url));
+      } catch {
+        setDashboardUrl('');
+      }
     };
 
     loadStartupData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // intentionally empty — startup fetch runs once
+
+  const reloadNodes = useCallback(async () => {
+    if (isReloadingNodes) return;
+    if (['graph_building', 'submitted', 'running', 'cancelling'].includes(executionStateRef.current.phase)) {
+      addLog('Cannot reload nodes while execution is running.', 'warning');
+      return;
+    }
+
+    setIsReloadingNodes(true);
+    try {
+      const res = await fetch(`${API_BASE}/reload_nodes`, { method: 'POST' });
+      const text = await res.text();
+      let payload: ReloadNodesResponse;
+      try {
+        payload = JSON.parse(text) as ReloadNodesResponse;
+      } catch {
+        throw new Error('Invalid JSON from /reload_nodes');
+      }
+
+      if (payload.plugin_status) {
+        setPluginDiagnostics(payload.plugin_status);
+        setPluginStatusError(null);
+      }
+      if (payload.dashboard_url !== undefined) {
+        setDashboardUrl(normalizeDashboardUrl(payload.dashboard_url));
+      }
+
+      const freshNodeDefs = payload.object_info
+        ?? (res.ok ? await fetchJson<Record<string, NodeSpec>>('/object_info') : null);
+      if (freshNodeDefs) {
+        setNodeDefs(freshNodeDefs);
+        setNodes(hydrateNodesWithLatestSpecs(serializeNodesForStorage(nodes), freshNodeDefs));
+      }
+
+      if (!res.ok || !payload.ok) {
+        addLog(payload.message || payload.error_message || 'Node reload failed.', 'error');
+        return;
+      }
+
+      const invalidCount = freshNodeDefs
+        ? hydrateNodesWithLatestSpecs(serializeNodesForStorage(nodes), freshNodeDefs)
+            .filter(node => node.data._invalid).length
+        : 0;
+      const loadedCount = payload.loaded?.length ?? 0;
+      addLog(
+        invalidCount > 0
+          ? `Reloaded ${loadedCount} plugin module(s); ${invalidCount} existing node(s) are unavailable.`
+          : `Reloaded ${loadedCount} plugin module(s).`,
+        invalidCount > 0 ? 'warning' : 'success',
+      );
+    } catch (err) {
+      addLog(`Node reload failed: ${(err as Error).message}`, 'error');
+    } finally {
+      setIsReloadingNodes(false);
+    }
+  }, [addLog, isReloadingNodes, nodes, setNodes]);
 
   // ============================================================
   // 2. Stop edge animation when disconnected
@@ -563,8 +637,11 @@ export const useFlowEngine = (
     nodeDefs,
     pluginDiagnostics,
     pluginStatusError,
+    dashboardUrl,
+    isReloadingNodes,
     executionState,
     runFlow,
     stopFlow,
+    reloadNodes,
   };
 };

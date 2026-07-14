@@ -86,7 +86,6 @@ class AppConfig:
     _instance = None
 
     N_WORKERS = 1
-    CHUNK_MULTIPLE = 1
     DASHBOARD_ADDRESS = ":8787"
     DASHBOARD_HOST = None
 
@@ -111,11 +110,7 @@ class AppConfig:
         logger.debug("[Config] CUDA detection is deferred to DaskService.start_cluster().")
 
         self.N_WORKERS = max(1, cpu_count - 2)
-        self.CHUNK_MULTIPLE = 1
-        logger.debug(
-            f"[Config] CPU fallback defaults: Workers={self.N_WORKERS}, "
-            f"ChunkMult={self.CHUNK_MULTIPLE}"
-        )
+        logger.debug(f"[Config] CPU fallback defaults: Workers={self.N_WORKERS}")
 
         if sys_mem_gb and self.N_WORKERS > 0:
             auto_memory_per_worker = (sys_mem_gb / self.N_WORKERS) * 0.7
@@ -128,10 +123,6 @@ class AppConfig:
         if os.getenv("WorkFlow_WORKERS"):
             self.N_WORKERS = int(os.getenv("WorkFlow_WORKERS"))
             _log_override(f"   -> [Override] WorkFlow_WORKERS={self.N_WORKERS}")
-
-        if os.getenv("WorkFlow_CHUNK"):
-            self.CHUNK_MULTIPLE = int(os.getenv("WorkFlow_CHUNK"))
-            _log_override(f"   -> [Override] WorkFlow_CHUNK={self.CHUNK_MULTIPLE}")
 
         if os.getenv("WorkFlow_WORKER_MEMORY_LIMIT_GB"):
             self.WORKER_MEMORY_LIMIT_GB = float(os.getenv("WorkFlow_WORKER_MEMORY_LIMIT_GB"))
@@ -150,8 +141,7 @@ class AppConfig:
         mem_limit_str = f"{self.WORKER_MEMORY_LIMIT_GB:.1f}GB" if self.WORKER_MEMORY_LIMIT_GB else "auto"
         spill_str = self.DASK_LOCAL_DIR or "auto"
         logger.debug(
-            f"[Config] Final base config: Workers={self.N_WORKERS}, "
-            f"ChunkMult={self.CHUNK_MULTIPLE}, WorkerMemLimit={mem_limit_str}, "
+            f"[Config] Final base config: Workers={self.N_WORKERS}, WorkerMemLimit={mem_limit_str}, "
             f"SpillDir={spill_str}; "
             "GPU worker settings are finalized by DaskService."
         )

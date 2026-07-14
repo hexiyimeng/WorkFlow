@@ -106,7 +106,7 @@ def _resolve_source_return_types(node_cls, node_inputs: dict, graph: dict | None
     resolver = getattr(node_cls, "RESOLVE_RETURN_TYPES", None)
     if resolver is not None:
         try:
-            input_types = _resolve_connected_input_types(node_cls, node_inputs or {}, graph)
+            input_types = _resolve_connected_input_types(node_inputs or {}, graph)
             try:
                 resolved = resolver(node_inputs or {}, input_types=input_types)
             except TypeError:
@@ -118,7 +118,7 @@ def _resolve_source_return_types(node_cls, node_inputs: dict, graph: dict | None
     return tuple(getattr(node_cls, "RETURN_TYPES", ()))
 
 
-def _resolve_connected_input_types(node_cls, node_inputs: dict, graph: dict | None = None) -> dict:
+def _resolve_connected_input_types(node_inputs: dict, graph: dict | None = None) -> dict:
     if not graph:
         return {}
     input_types = {}
@@ -215,15 +215,26 @@ def validate_graph_types(graph: dict):
             )
 
 
-# =============================================================================
-# 2. Input preparation
-# =============================================================================
-def validate_and_prepare_inputs(node_cls, raw_inputs, node_id="Unknown"):
-    return prepare_node_inputs(node_cls, raw_inputs, node_id)
+def find_execution_roots(graph: dict) -> list[str]:
+    """Return nodes that are output-capable and terminal in the workflow graph."""
+    referenced_as_source = set()
+    for node_data in graph.values():
+        for value in node_data.get("inputs", {}).values():
+            if isinstance(value, list) and len(value) == 2:
+                referenced_as_source.add(value[0])
+
+    return [
+        node_id
+        for node_id, node_data in graph.items()
+        if (
+            getattr(NODE_CLASS_MAPPINGS.get(node_data["type"]), "OUTPUT_NODE", False)
+            and node_id not in referenced_as_source
+        )
+    ]
 
 
 # =============================================================================
-# 3. Dask collection helpers
+# 2. Dask collection helpers
 # =============================================================================
 def _is_dask_collection(obj) -> bool:
     try:
@@ -259,17 +270,6 @@ def _extract_compute_collection(item):
     if _is_dask_collection(item):
         return item
 
-    # Optional: wrapper with .collection attribute (not a required protocol)
-    collection = getattr(item, "collection", None)
-    if collection is not None and _is_dask_collection(collection):
-        return collection
-
-    # Optional: dict with "collection" key (not a required protocol)
-    if isinstance(item, dict):
-        collection = item.get("collection")
-        if collection is not None and _is_dask_collection(collection):
-            return collection
-
     return None
 
 
@@ -284,19 +284,20 @@ def _cancel_sink_futures(client, sink_futures) -> None:
 
 
 # =============================================================================
-# 4. Core executor
+# 3. Core executor
 # =============================================================================
 async def execute_graph(graph: dict, execution_id: str = None):
     """
     Two-phase executor:
 
-    Phase 1 (GraphBuilding): recursively executes all OUTPUT_NODE dependencies,
-    building a lazy Dask graph. No Dask compute happens here.
+    Phase 1 (GraphBuilding): recursively executes dependencies of execution
+    roots, building a lazy Dask graph. An execution root is a node whose class
+    declares OUTPUT_NODE=True and whose graph out-degree is zero.
 
-    Phase 2 (Compute): discovers Dask collections from OUTPUT_NODE return values.
+    Phase 2 (Compute): discovers Dask collections from execution-root return values.
     If any are found, submits them in a single client.compute([...]) call.
     After futures complete (or if no collections were found), calls postprocess()
-    on each OUTPUT_NODE instance once.
+    on each execution-root instance once.
     """
     tasks = {}
     sink_futures = []
@@ -311,7 +312,7 @@ async def execute_graph(graph: dict, execution_id: str = None):
     mem_monitor = get_memory_monitor()
     mem_monitor.snapshots.clear()
 
-    session = state_manager.create_execution(execution_id)
+    state_manager.create_execution(execution_id)
 
     try:
         client = dask_service.ensure_client()
@@ -328,20 +329,20 @@ async def execute_graph(graph: dict, execution_id: str = None):
         })
         state_manager.add_log("Engine Started...", "info", execution_id=execution_id)
 
-        # Identify all OUTPUT_NODE nodes from registry (not from graph data)
-        output_nodes = [
-            nid for nid, d in graph.items()
-            if getattr(NODE_CLASS_MAPPINGS.get(d["type"]), "OUTPUT_NODE", False)
-        ]
-        if not output_nodes:
+        execution_roots = find_execution_roots(graph)
+        execution_root_set = set(execution_roots)
+        if not execution_roots:
             state_manager.set_execution_status(execution_id, ExecutionStatus.FAILED)
             await state_manager.broadcast(execution_id, {
                 "type": "execution_finished",
                 "executionId": execution_id,
                 "status": "failed",
-                "message": "No output node found. Please connect a Writer/Output node to execute the workflow.",
+                "message": (
+                    "No terminal output node found. A workflow execution root must declare "
+                    "OUTPUT_NODE=True and have no outgoing graph connections."
+                ),
             })
-            state_manager.add_log("No output node found. Cannot execute.", "error", execution_id=execution_id)
+            state_manager.add_log("No terminal output node found. Cannot execute.", "error", execution_id=execution_id)
             return execution_id
 
         loop = asyncio.get_running_loop()
@@ -361,8 +362,7 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 if pt:
                     pt_value = pt.value if hasattr(pt, "value") else str(pt)
                 device = getattr(NodeCls, "DEVICE_HINT", None)
-            is_output = getattr(NodeCls, "OUTPUT_NODE", False) if NodeCls else False
-            progress_role = "output" if is_output else "state"
+            progress_role = "output" if node_id in execution_root_set else "state"
 
             state_manager.update_node_status(
                 node_id, message,
@@ -467,11 +467,6 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 method_name = getattr(NodeCls, "FUNCTION", "execute")
                 method = getattr(instance, method_name)
 
-                if "callback" in inspect.signature(method).parameters:
-                    func_args.pop("callback", None)
-                if "global_progress_callback" in inspect.signature(method).parameters:
-                    func_args.pop("global_progress_callback", None)
-
                 # Filter _node_id / _execution_id for methods that don't accept **kwargs
                 sig = inspect.signature(method)
                 accepts_kwargs = any(
@@ -539,16 +534,16 @@ async def execute_graph(graph: dict, execution_id: str = None):
         # =========================================================================
         await state_manager.broadcast(execution_id, {"type": "log", "message": "GraphBuilding..."})
         state_manager.add_log("GraphBuilding...", "info", execution_id=execution_id)
-        await asyncio.gather(*(schedule_node(nid) for nid in output_nodes))
+        await asyncio.gather(*(schedule_node(nid) for nid in execution_roots))
 
         # =========================================================================
-        # Phase 2: Collect OUTPUT collections and compute
+        # Phase 2: collect execution-root collections and compute
         # =========================================================================
         output_sinks = []
-        for nid in output_nodes:
+        for nid in execution_roots:
             node_result = results.get(nid)
             found_for_node = False
-            for idx, item in enumerate(_iter_output_items(node_result)):
+            for item in _iter_output_items(node_result):
                 collection = _extract_compute_collection(item)
                 if collection is not None:
                     if not _is_delayed(collection):
@@ -560,8 +555,6 @@ async def execute_graph(graph: dict, execution_id: str = None):
                             nid,
                         )
                     output_sinks.append({
-                        "node_id": nid,
-                        "item_index": idx,
                         "collection": collection,
                         "is_delayed": _is_delayed(collection),
                     })
@@ -578,8 +571,8 @@ async def execute_graph(graph: dict, execution_id: str = None):
         if output_sinks:
             client = dask_service.ensure_client()
 
-            # Send submitted state for all output nodes
-            for nid in output_nodes:
+            # Send submitted state for all execution roots.
+            for nid in execution_roots:
                 await progress_callback(nid, None, "Submitted", "submitted")
 
             collections = [s["collection"] for s in output_sinks]
@@ -598,8 +591,8 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 execution_id=execution_id,
             )
 
-            # Send running state for all output nodes
-            for nid in output_nodes:
+            # Send running state for all execution roots.
+            for nid in execution_roots:
                 await progress_callback(nid, None, "Running", "running")
 
             # Wait for all futures; this does NOT pull large results back to driver
@@ -620,8 +613,8 @@ async def execute_graph(graph: dict, execution_id: str = None):
                     if exc is not None:
                         raise exc
 
-            # All futures succeeded — postprocess each OUTPUT node once
-        for nid in output_nodes:
+            # All futures succeeded; postprocess each execution root once.
+        for nid in execution_roots:
             instance = node_instances.get(nid)
             postprocess = getattr(instance, "postprocess", None)
             if callable(postprocess):
@@ -635,8 +628,8 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 if post_value is not None:
                     results[nid] = post_value
 
-        # Send done state for all output nodes
-        for nid in output_nodes:
+        # Send done state for all execution roots.
+        for nid in execution_roots:
             await progress_callback(nid, 100, "Done", "done")
 
         # Success
@@ -736,9 +729,7 @@ async def execute_graph(graph: dict, execution_id: str = None):
         mem_monitor.log_snapshot("execution_end_after_cleanup", client=client)
         mem_monitor.log_delta("execution_start", "execution_end_before_cleanup")
 
-        cleanup_result = mem_monitor.log_delta(
-            "execution_end_before_cleanup", "execution_end_after_cleanup"
-        )
+        mem_monitor.log_delta("execution_end_before_cleanup", "execution_end_after_cleanup")
 
         start_snapshot = mem_monitor.snapshots.get("execution_start")
         end_before = mem_monitor.snapshots.get("execution_end_before_cleanup")

@@ -20,17 +20,6 @@ RUNTIME_KEYS = {"_node_id", "_execution_id", "_params", "_runtime", "_invocation
 
 
 @dataclass(frozen=True)
-class ArrayMeta:
-    name: str
-    shape: tuple
-    chunks: tuple
-    dtype: np.dtype
-    axes: tuple[str, ...] | None = None
-    voxel_size: tuple[float, ...] | None = None
-    source: dict | None = None
-
-
-@dataclass(frozen=True)
 class MapBlocksOutputSpec:
     dtype: np.dtype
     chunks: Any = None
@@ -39,7 +28,6 @@ class MapBlocksOutputSpec:
     enforce_ndim: bool = True
     meta: Any = None
     same_as_primary: bool = False
-    chunks_source: Any = None
 
 
 @dataclass(frozen=True)
@@ -132,32 +120,6 @@ class BlockContext:
         )
 
 
-class BlockResources:
-    def __init__(self, owner: "BaseDaskArrayMapNode", ctx: BlockContext, specs: dict | None = None):
-        self._owner = owner
-        self._ctx = ctx
-        self._specs = dict(specs or {})
-
-    @property
-    def specs(self) -> dict:
-        return dict(self._specs)
-
-    def get(self, name, default=None):
-        return self._specs.get(name, default)
-
-    def keys(self):
-        return self._specs.keys()
-
-    def items(self):
-        return self._specs.items()
-
-    def __contains__(self, name):
-        return name in self._specs
-
-    def release_all(self) -> None:
-        return None
-
-
 class ChunkPlanner:
     """Reusable lazy rechunk and chunk-alignment helper for Dask Array nodes."""
 
@@ -170,7 +132,7 @@ class ChunkPlanner:
         elif isinstance(axes, (list, tuple)):
             axes = tuple(str(x).strip() for x in axes if str(x).strip())
         else:
-            raise ValueError(f"Unsupported axes metadata {axes!r}.")
+            raise ValueError(f"Unsupported axes value {axes!r}.")
         return axes or None
 
     @classmethod
@@ -406,11 +368,11 @@ class ChunkPlanner:
     ) -> dict[int, int]:
         if not axes:
             raise ValueError(
-                f"Axis-name {value_name} requested for input '{input_name}', but no axes metadata was provided."
+                f"Axis-name {value_name} requested for input '{input_name}', but no axes were provided."
             )
         if len(axes) != int(arr.ndim):
             raise ValueError(
-                f"Axes metadata for input '{input_name}' has length {len(axes)}, "
+                f"Axes for input '{input_name}' has length {len(axes)}, "
                 f"but array ndim is {arr.ndim}."
             )
         axis_lookup = {axis.lower(): idx for idx, axis in enumerate(axes)}
@@ -427,30 +389,6 @@ class ChunkPlanner:
                 raise ValueError(f"{value_name.title()} size for axis {raw_name!r} cannot be -1.")
             result[idx] = value
         return result
-
-    @staticmethod
-    def axis_index_mapping_to_indices(
-        *,
-        arr: Any,
-        mapping: Mapping[Any, Any],
-        value_name: str,
-    ) -> dict[int, int]:
-        result: dict[int, int] = {}
-        for raw_axis, raw_value in mapping.items():
-            try:
-                axis = int(raw_axis)
-            except Exception as exc:
-                raise ValueError(f"Axis-index {value_name} key {raw_axis!r} is not an integer.") from exc
-            if axis < 0:
-                axis = int(arr.ndim) + axis
-            if axis < 0 or axis >= int(arr.ndim):
-                raise ValueError(f"Axis index {raw_axis!r} is out of bounds for ndim {arr.ndim}.")
-            value = ChunkPlanner._parse_chunk_int(raw_value)
-            if value == -1:
-                raise ValueError(f"{value_name.title()} size for axis {raw_axis!r} cannot be -1.")
-            result[axis] = value
-        return result
-
 
 class BaseNode:
     FUNCTION = "execute"
@@ -594,11 +532,6 @@ def split_dask_array_inputs(invocation: NodeInvocation) -> tuple[dict[str, Any],
     return array_inputs, params
 
 
-# Compatibility alias for older internal imports. This helper is not specific
-# to Dask blockwise; new code should use split_dask_array_inputs.
-split_blockwise_inputs = split_dask_array_inputs
-
-
 class BlockwiseInputPlanner:
     def build(self, node: "BaseDaskArrayMapNode", invocation: NodeInvocation) -> BlockwiseInputPlan:
         raw_array_inputs, params = split_dask_array_inputs(invocation)
@@ -701,19 +634,6 @@ class BlockwiseInputPlanner:
         for name in ordered_names:
             arr = invocation.inputs.get(name)
             ndim = int(arr.ndim) if arr is not None and hasattr(arr, "ndim") else None
-            meta = (
-                invocation.inputs.get(f"{name}_metadata")
-                or invocation.inputs.get(f"{name}_meta")
-                or (invocation.inputs.get("metadata") if len(ordered_names) == 1 else None)
-            )
-            axes = None
-            if isinstance(meta, ArrayMeta):
-                axes = meta.axes
-            elif isinstance(meta, dict):
-                axes = meta.get("axes")
-            if axes is not None:
-                result[name] = ChunkPlanner.normalize_axes(axes)
-
             explicit_axes = invocation.inputs.get(f"{name}_axes")
             if explicit_axes in (None, "") and len(ordered_names) == 1:
                 explicit_axes = invocation.inputs.get("axes")
@@ -799,7 +719,6 @@ class MapBlocksOutputSpecResolver:
                 enforce_ndim=bool(spec.enforce_ndim),
                 meta=spec.meta if spec.meta is not None else np.array((), dtype=dtype),
                 same_as_primary=self.derive_same_as_primary(chunks_spec, drop_axis, new_axis),
-                chunks_source=chunks_spec,
             )
         if not isinstance(spec, Mapping):
             raise ValueError(f"Unsupported output spec {spec!r}.")
@@ -848,7 +767,6 @@ class MapBlocksOutputSpecResolver:
             enforce_ndim=bool(spec.get("enforce_ndim", True)),
             meta=meta,
             same_as_primary=self.derive_same_as_primary(chunks_spec, drop_axis, new_axis),
-            chunks_source=chunks_spec,
         )
 
     @staticmethod
@@ -1024,7 +942,7 @@ class MapBlocksOutputSpecResolver:
             if not axes:
                 raise ValueError(
                     f"MAP_BLOCKS_OUTPUT_SPEC.{field_name} uses axis name {raw_axis!r}, "
-                    f"but no axes metadata is available for primary input '{primary_name}'."
+                    f"but no axes are available for primary input '{primary_name}'."
                 )
             axis_name = str(raw_axis).strip().lower()
             if axis_name not in axis_lookup:
@@ -1039,137 +957,19 @@ class MapBlocksOutputSpecResolver:
         return tuple(result) or None
 
 
-class MapBlocksOutputSpecPreflightValidator:
-    """Validate map output specs before Dask graph construction."""
-
-    def validate(
-        self,
-        node: "BaseDaskArrayMapNode",
-        output_spec: MapBlocksOutputSpec,
-        *,
-        primary: Any,
-    ) -> None:
-        input_ndim = int(primary.ndim)
-        drop_axis = self.normalize_drop_axis(node, output_spec.drop_axis, input_ndim)
-        new_axis, output_ndim = self.normalize_new_axis(node, output_spec.new_axis, input_ndim, len(drop_axis))
-        shape_changing = bool(drop_axis or new_axis)
-
-        if output_spec.same_as_primary:
-            if shape_changing or output_ndim != input_ndim:
-                raise ValueError(
-                    f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.same_as_primary requires no drop_axis/new_axis "
-                    f"and output ndim={input_ndim}; got output ndim={output_ndim}."
-                )
-            return
-
-        if shape_changing and output_spec.chunks_source in (None, "same_as_primary"):
-            raise ValueError(
-                f"{type(node).__name__} shape-changing output requires explicit MAP_BLOCKS_OUTPUT_SPEC['chunks']; "
-                "got same_as_primary."
-            )
-
-        self.validate_chunks(node, output_spec.chunks, output_ndim)
-
-    def normalize_drop_axis(self, node: "BaseDaskArrayMapNode", axes: tuple[int, ...] | None, input_ndim: int) -> tuple[int, ...]:
-        result = []
-        for raw_axis in axes or ():
-            axis = int(raw_axis)
-            if axis < 0:
-                axis += input_ndim
-            if axis < 0 or axis >= input_ndim:
-                raise ValueError(
-                    f"{type(node).__name__} drop_axis={raw_axis} is out of bounds for input ndim={input_ndim}."
-                )
-            result.append(axis)
-        if len(set(result)) != len(result):
-            raise ValueError(f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.drop_axis contains duplicate axes: {axes!r}.")
-        return tuple(result)
-
-    def normalize_new_axis(
-        self,
-        node: "BaseDaskArrayMapNode",
-        axes: tuple[int, ...] | None,
-        input_ndim: int,
-        drop_count: int,
-    ) -> tuple[tuple[int, ...], int]:
-        output_ndim = input_ndim - drop_count + len(axes or ())
-        result = []
-        for raw_axis in axes or ():
-            axis = int(raw_axis)
-            if axis < 0:
-                axis += output_ndim
-            if axis < 0 or axis >= output_ndim:
-                raise ValueError(
-                    f"{type(node).__name__} new_axis={raw_axis} is out of bounds for output ndim={output_ndim}."
-                )
-            result.append(axis)
-        if len(set(result)) != len(result):
-            raise ValueError(f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.new_axis contains duplicate axes: {axes!r}.")
-        return tuple(result), output_ndim
-
-    def validate_chunks(self, node: "BaseDaskArrayMapNode", chunks: Any, output_ndim: int) -> None:
-        if chunks in (None, "auto"):
-            return
-        if isinstance(chunks, str):
-            if chunks == "same_as_primary":
-                raise ValueError(
-                    f"{type(node).__name__} shape-changing output requires explicit MAP_BLOCKS_OUTPUT_SPEC['chunks']; "
-                    "got same_as_primary."
-                )
-            parts = tuple(part.strip() for part in chunks.split(",") if part.strip())
-            if len(parts) != output_ndim:
-                raise ValueError(
-                    f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.chunks rank={len(parts)} "
-                    f"but expected output ndim={output_ndim} after drop_axis/new_axis."
-                )
-            for part in parts:
-                self.validate_chunk_item(node, part)
-            return
-        if isinstance(chunks, (tuple, list)):
-            if len(chunks) != output_ndim:
-                raise ValueError(
-                    f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.chunks rank={len(chunks)} "
-                    f"but expected output ndim={output_ndim} after drop_axis/new_axis."
-                )
-            for item in chunks:
-                self.validate_chunk_item(node, item)
-            return
-        raise ValueError(f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.chunks has unsupported value {chunks!r}.")
-
-    def validate_chunk_item(self, node: "BaseDaskArrayMapNode", item: Any) -> None:
-        if item == "auto":
-            return
-        if isinstance(item, (tuple, list)):
-            if not item:
-                raise ValueError(f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.chunks contains an empty chunk tuple.")
-            for sub_item in item:
-                self.validate_positive_int(node, sub_item)
-            return
-        self.validate_positive_int(node, item)
-
-    def validate_positive_int(self, node: "BaseDaskArrayMapNode", value: Any) -> None:
-        try:
-            parsed = int(value)
-        except Exception as exc:
-            raise ValueError(f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.chunks item {value!r} is not an integer.") from exc
-        if parsed <= 0:
-            raise ValueError(f"{type(node).__name__} MAP_BLOCKS_OUTPUT_SPEC.chunks item {value!r} must be a positive integer.")
-
 class BlockContextFactory:
     def build(
         self,
-        node: "BaseDaskArrayMapNode",
-        *,
         named_blocks: Mapping[str, np.ndarray],
+        *,
         ordered_names: list[str],
         primary_name: str,
-        output_chunk_shape: tuple | None,
         block_info: dict,
         runtime: dict,
     ) -> BlockContext:
         primary_block = named_blocks[primary_name]
         output_block_info = self.extract_output_block_info(block_info)
-        resolved_output_chunk_shape = output_chunk_shape or self.extract_output_chunk_shape(output_block_info)
+        resolved_output_chunk_shape = self.extract_output_chunk_shape(output_block_info)
         array_locations = self.extract_array_locations(block_info, len(ordered_names))
         ctx = BlockContext(
             node_id=runtime.get("node_id"),
@@ -1187,9 +987,8 @@ class BlockContextFactory:
             primary_input_name=primary_name,
             primary_block_shape=tuple(primary_block.shape),
             output_chunk_shape=resolved_output_chunk_shape,
-            resources=None,
+            resources=dict(runtime.get("resources") or {}),
         )
-        object.__setattr__(ctx, "resources", BlockResources(node, ctx, runtime.get("resources") or {}))
         return ctx
 
     def resolve_device_hint(self) -> str:
@@ -1291,102 +1090,6 @@ class BlockContextFactory:
         return tuple(normalized)
 
 
-class BlockOutputValidator:
-    def expected_output_chunk_shape(self, output_spec: MapBlocksOutputSpec, primary_block: np.ndarray, block_info: Any) -> tuple | None:
-        entry = block_info.get(None) if isinstance(block_info, dict) else None
-        if isinstance(entry, dict):
-            chunk_shape = entry.get("chunk-shape")
-            if chunk_shape is not None:
-                return tuple(int(x) for x in chunk_shape)
-        if output_spec.same_as_primary:
-            return tuple(primary_block.shape)
-        return None
-
-    def expected_shape_for_validation(
-        self,
-        node: "BaseDaskArrayMapNode",
-        *,
-        block_info: Any,
-        output_spec: MapBlocksOutputSpec,
-        primary_block: np.ndarray,
-        output_chunk_shape: tuple | None,
-    ) -> tuple | None:
-        return node.expected_output_shape_for_validation(
-            block_info=block_info,
-            output_spec=output_spec,
-            primary_block=primary_block,
-            output_chunk_shape=output_chunk_shape,
-        )
-
-    def validate(
-        self,
-        node: "BaseDaskArrayMapNode",
-        result: np.ndarray,
-        primary_block: np.ndarray,
-        *,
-        expected_dtype: np.dtype,
-        expected_shape: tuple | None,
-        output_spec: MapBlocksOutputSpec,
-        node_id: Optional[str],
-    ) -> None:
-        validator = getattr(node, "validate_block_output", None)
-        if validator is not None:
-            validator(result, primary_block)
-            return
-        if not isinstance(result, np.ndarray):
-            raise ValueError(f"{type(node).__name__} PROCESS_BLOCK must return np.ndarray, got {type(result).__name__}.")
-        if np.dtype(result.dtype) != np.dtype(expected_dtype):
-            raise TypeError(
-                f"{type(node).__name__}[{node_id}] declared output dtype {expected_dtype}, "
-                f"but PROCESS_BLOCK returned {result.dtype}. BaseDaskArrayMapNode does not auto-cast."
-            )
-        if expected_shape is not None and tuple(result.shape) != tuple(expected_shape):
-            raise ValueError(
-                f"{type(node).__name__}[{node_id}] PROCESS_BLOCK returned shape {tuple(result.shape)}, "
-                f"but expected output block shape is {tuple(expected_shape)}."
-            )
-        if expected_shape is None and output_spec.same_as_primary and tuple(result.shape) != tuple(primary_block.shape):
-            raise ValueError(
-                f"{type(node).__name__}[{node_id}] PROCESS_BLOCK returned shape {tuple(result.shape)}, "
-                f"but same_as_primary output requires {tuple(primary_block.shape)}."
-            )
-
-    def fallback_block(
-        self,
-        node: "BaseDaskArrayMapNode",
-        primary_block: np.ndarray,
-        output_spec: MapBlocksOutputSpec,
-        ctx: BlockContext,
-        output_dtype: np.dtype,
-    ) -> np.ndarray:
-        shape = ctx.output_chunk_shape
-        if shape is None and output_spec.same_as_primary:
-            shape = tuple(primary_block.shape)
-        if shape is None:
-            custom = getattr(node, "fallback_output_shape", None)
-            if custom is not None:
-                shape = custom(primary_block, output_spec, ctx)
-        if shape is None:
-            raise ValueError(
-                f"{type(node).__name__} cannot build fallback block because output shape is unknown. "
-                "Use same_as_primary output chunks or implement fallback_output_shape(primary_block, output_spec, ctx)."
-            )
-        return np.zeros(tuple(shape), dtype=output_dtype)
-
-
-class BlockwiseRuntimePolicy:
-    def should_skip(
-        self,
-        node: "BaseDaskArrayMapNode",
-        primary_block: np.ndarray,
-    ) -> bool:
-        if node.SKIP_EMPTY_BLOCKS and primary_block.size == 0:
-            return True
-        if node.SKIP_ALL_ZERO_BLOCKS and np.all(primary_block == 0):
-            return True
-        return False
-
-
 class ProcessBlockBinder:
     def build_wrapped_function(
         self,
@@ -1395,26 +1098,12 @@ class ProcessBlockBinder:
         input_plan: BlockwiseInputPlan,
         params: dict,
         runtime: NodeRuntime,
-        output_spec: MapBlocksOutputSpec,
         preprocess_state: dict,
         context_factory: BlockContextFactory,
-        output_validator: BlockOutputValidator,
-        runtime_policy: BlockwiseRuntimePolicy,
     ):
-        output_dtype = np.dtype(output_spec.dtype)
-
         def wrapped(*blocks, block_info=None):
             block_info = block_info or {}
             named_blocks = dict(zip(input_plan.ordered_names, blocks))
-            primary_block = named_blocks[input_plan.primary_name]
-            output_chunk_shape = output_validator.expected_output_chunk_shape(output_spec, primary_block, block_info)
-            validation_shape = output_validator.expected_shape_for_validation(
-                node,
-                block_info=block_info,
-                output_spec=output_spec,
-                primary_block=primary_block,
-                output_chunk_shape=output_chunk_shape,
-            )
             runtime_dict = {
                 "node_id": runtime.node_id,
                 "execution_id": runtime.execution_id,
@@ -1422,48 +1111,13 @@ class ProcessBlockBinder:
                 "resources": preprocess_state or {},
             }
             ctx = context_factory.build(
-                node,
                 named_blocks=named_blocks,
                 ordered_names=input_plan.ordered_names,
                 primary_name=input_plan.primary_name,
-                output_chunk_shape=output_chunk_shape,
                 block_info=block_info,
                 runtime=runtime_dict,
             )
-
-            try:
-                if runtime_policy.should_skip(
-                    node,
-                    primary_block,
-                ):
-                    return output_validator.fallback_block(node, primary_block, output_spec, ctx, output_dtype)
-
-                result = self.call_process_block(node, named_blocks, input_plan.primary_name, params, ctx)
-                output_validator.validate(
-                    node,
-                    result,
-                    primary_block,
-                    expected_dtype=output_dtype,
-                    expected_shape=validation_shape,
-                    output_spec=output_spec,
-                    node_id=runtime.node_id,
-                )
-                return result
-            except Exception as exc:
-                if node.FAILURE_POLICY != "zeros_like":
-                    raise
-                logger.error(
-                    "%s error in %s[%s]: %s",
-                    node.DASK_API or "array_map",
-                    type(node).__name__,
-                    runtime.node_id or "",
-                    exc,
-                )
-                return output_validator.fallback_block(node, primary_block, output_spec, ctx, output_dtype)
-            finally:
-                resources = getattr(ctx, "resources", None)
-                if resources is not None:
-                    resources.release_all()
+            return self.call_process_block(node, named_blocks, input_plan.primary_name, params, ctx)
 
         wrapped._is_dask_array_map_wrapped = True
         wrapped.__name__ = (
@@ -1483,15 +1137,6 @@ class ProcessBlockBinder:
         fn = self.get_process_block_callable(node)
         sig = inspect.signature(fn)
         parameters = list(sig.parameters.values())
-        if self.is_legacy_process_signature(parameters):
-            runtime = {
-                "node_id": ctx.node_id,
-                "execution_id": ctx.execution_id,
-                "device_hint": ctx.device_hint,
-                "device": ctx.device_hint,
-            }
-            return fn(named_blocks[primary_name], ctx.block_info, params, runtime)
-
         pool = {**named_blocks, **params}
         call_args = []
         call_kwargs: dict[str, Any] = {}
@@ -1542,12 +1187,6 @@ class ProcessBlockBinder:
             return raw
         return node.process_block
 
-    @staticmethod
-    def is_legacy_process_signature(parameters) -> bool:
-        names = [p.name for p in parameters[:4]]
-        return names == ["block", "block_info", "params", "runtime"]
-
-
 class BaseDaskArrayMapNode(BaseDaskNode):
     """Shared base for Dask Array nodes backed by map_blocks or map_overlap."""
 
@@ -1569,26 +1208,14 @@ class BaseDaskArrayMapNode(BaseDaskNode):
     ARRAY_AXES: dict[str, Any] | tuple[str, ...] | str | None = None
     ARRAY_AXES_BY_NDIM: Mapping[int, Any] | Mapping[str, Mapping[int, Any]] | None = None
 
-    SKIP_EMPTY_BLOCKS = True
-    SKIP_ALL_ZERO_BLOCKS = False
-    FAILURE_POLICY = "raise"
     OUTPUT_DTYPE = None
 
     INPUT_PLANNER = BlockwiseInputPlanner
     OUTPUT_SPEC_RESOLVER = MapBlocksOutputSpecResolver
-    OUTPUT_SPEC_PREFLIGHT_VALIDATOR = MapBlocksOutputSpecPreflightValidator
     PROCESS_BINDER = ProcessBlockBinder
     CONTEXT_FACTORY = BlockContextFactory
-    OUTPUT_VALIDATOR = BlockOutputValidator
-    RUNTIME_POLICY = BlockwiseRuntimePolicy
 
-    def process_block(
-        self,
-        block: np.ndarray,
-        block_info: dict,
-        params: dict,
-        runtime: dict,
-    ) -> np.ndarray:
+    def process_block(self, **kwargs) -> np.ndarray:
         raise NotImplementedError(
             f"{type(self).__name__} must define PROCESS_BLOCK or override process_block()."
         )
@@ -1598,8 +1225,6 @@ class BaseDaskArrayMapNode(BaseDaskNode):
         input_planner = self.INPUT_PLANNER()
         output_resolver = self.OUTPUT_SPEC_RESOLVER()
         context_factory = self.CONTEXT_FACTORY()
-        output_validator = self.OUTPUT_VALIDATOR()
-        runtime_policy = self.RUNTIME_POLICY()
         process_binder = self.PROCESS_BINDER()
 
         input_plan = input_planner.build(self, invocation)
@@ -1632,18 +1257,13 @@ class BaseDaskArrayMapNode(BaseDaskNode):
             input_plan.params,
             input_plan.primary_name,
         )
-        self.OUTPUT_SPEC_PREFLIGHT_VALIDATOR().validate(self, output_spec, primary=primary)
-        self.validate_output_spec_for_api(output_spec)
         wrapped_fn = process_binder.build_wrapped_function(
             self,
             input_plan=input_plan,
             params=dict(input_plan.params),
             runtime=invocation.runtime,
-            output_spec=output_spec,
             preprocess_state=preprocess_state,
             context_factory=context_factory,
-            output_validator=output_validator,
-            runtime_policy=runtime_policy,
         )
         result = self.build_dask_collection(
             wrapped_fn=wrapped_fn,
@@ -1658,9 +1278,6 @@ class BaseDaskArrayMapNode(BaseDaskNode):
         self.assert_lazy_collection(result)
         self._log_graph_debug(result, invocation.runtime)
         return (result,)
-
-    def validate_output_spec_for_api(self, output_spec: MapBlocksOutputSpec) -> None:
-        return None
 
     def build_dask_collection(
         self,
@@ -1691,16 +1308,6 @@ class BaseDaskArrayMapNode(BaseDaskNode):
         if not return_types:
             return "DASK_ARRAY"
         return str(return_types[0])
-
-    def expected_output_shape_for_validation(
-        self,
-        *,
-        block_info: Any,
-        output_spec: MapBlocksOutputSpec,
-        primary_block: np.ndarray,
-        output_chunk_shape: tuple | None,
-    ) -> tuple | None:
-        return output_chunk_shape
 
     def _log_graph_debug(self, result: Any, runtime: NodeRuntime) -> None:
         try:
@@ -1932,11 +1539,11 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         if not axes:
             raise ValueError(
                 "MAP_OVERLAP_SPEC.depth uses axis names, "
-                f"but no axes metadata is available for input '{input_name}'."
+                f"but no axes are available for input '{input_name}'."
             )
         if len(axes) != int(arr.ndim):
             raise ValueError(
-                f"Axes metadata for input '{input_name}' has length {len(axes)}, "
+                f"Axes for input '{input_name}' has length {len(axes)}, "
                 f"but array ndim is {arr.ndim}."
             )
         axis_lookup = {str(axis).lower(): idx for idx, axis in enumerate(axes)}
@@ -2022,13 +1629,3 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
             "This is unsafe unless the block function trims or otherwise controls halo output shape. "
             "Set ALLOW_UNTRIMMED_OVERLAP_OUTPUT=True to opt in explicitly."
         )
-
-    def expected_output_shape_for_validation(
-        self,
-        *,
-        block_info: Any,
-        output_spec: MapBlocksOutputSpec,
-        primary_block: np.ndarray,
-        output_chunk_shape: tuple | None,
-    ) -> tuple | None:
-        return None
