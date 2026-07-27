@@ -69,18 +69,29 @@ export default function BottomPanel() {
   const phase = executionState.phase;
   const execId = executionState.executionId;
   const errorLogs = useMemo(() => logs.filter(l => l.type === 'error'), [logs]);
+  const windowProgress = executionState.windowProgress;
+  const showWindowProgress = windowProgress !== null && (isExecuting || isCancelling);
+  const activeWindowWidth = windowProgress && windowProgress.totalWindows > 0
+    ? Math.max(100 / windowProgress.totalWindows, 0.75)
+    : 0;
+  const hasActiveWindow = Boolean(
+    windowProgress
+    && windowProgress.windowStatus === 'running'
+    && windowProgress.currentWindow === windowProgress.completedWindows + 1
+  );
 
   const mainMessage = useMemo(() => {
     if (phase === 'idle') return 'Ready';
     if (phase === 'graph_building') return 'Building graph...';
     if (phase === 'submitted') return 'Execution queued';
+    if (phase === 'running' && windowProgress) return windowProgress.message;
     if (phase === 'running') return 'Workflow running';
     if (phase === 'cancelling') return 'Stopping...';
     if (phase === 'succeeded') return 'Completed successfully';
     if (phase === 'failed') return executionState.lastError ? `Failed: ${executionState.lastError.slice(0, 80)}` : 'Execution failed';
     if (phase === 'cancelled') return 'Execution cancelled';
     return phase;
-  }, [phase, executionState.lastError]);
+  }, [phase, executionState.lastError, windowProgress]);
 
   const wsVariant = websocketStatus === 'connected' ? 'success' : websocketStatus === 'reconnecting' ? 'warning' : 'danger';
   const wsLabel = websocketStatus === 'connected' ? 'Connected' : websocketStatus === 'reconnecting' ? 'Reconnecting' : 'Offline';
@@ -141,10 +152,53 @@ export default function BottomPanel() {
           </span>
         )}
 
-        {/* Message */}
-        <span className="flex-1 truncate text-[11px] font-mono" style={{ color: 'var(--color-console-text)' }}>
-          {mainMessage}
-        </span>
+        {/* Message / Window progress */}
+        {showWindowProgress && windowProgress ? (
+          <div className="flex-1 min-w-[240px] max-w-[560px] flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-3 text-[10px] font-mono">
+              <span className="truncate" style={{ color: 'var(--color-console-text)' }}>
+                {windowProgress.windowStatus === 'finalizing'
+                  ? `Finalizing · ${windowProgress.completedWindows} / ${windowProgress.totalWindows} Windows`
+                  : windowProgress.message}
+              </span>
+              <span className="shrink-0 tabular-nums" style={{ color: 'var(--color-accent)' }}>
+                {windowProgress.progress.toFixed(1)}%
+              </span>
+            </div>
+            <div
+              role="progressbar"
+              aria-label="Window execution progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={windowProgress.progress}
+              aria-valuetext={`${windowProgress.completedWindows} of ${windowProgress.totalWindows} Windows completed`}
+              className="relative h-1.5 rounded-full overflow-hidden"
+              style={{ backgroundColor: 'var(--color-bg-field)' }}
+            >
+              <div
+                className="absolute inset-y-0 left-0 rounded-full transition-[width] duration-300"
+                style={{
+                  width: `${windowProgress.progress}%`,
+                  backgroundColor: 'var(--color-accent)',
+                }}
+              />
+              {hasActiveWindow && (
+                <div
+                  className="absolute inset-y-0 rounded-full animate-pulse"
+                  style={{
+                    left: `${windowProgress.progress}%`,
+                    width: `${activeWindowWidth}%`,
+                    backgroundColor: 'var(--color-info)',
+                  }}
+                />
+              )}
+            </div>
+          </div>
+        ) : (
+          <span className="flex-1 truncate text-[11px] font-mono" style={{ color: 'var(--color-console-text)' }}>
+            {mainMessage}
+          </span>
+        )}
 
         {/* Actions */}
         <div className="flex items-center gap-1 shrink-0" onClick={e => e.stopPropagation()}>

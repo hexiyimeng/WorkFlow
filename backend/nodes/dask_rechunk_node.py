@@ -9,6 +9,8 @@ from nodes.base import ChunkPlanner
 @register_node("DaskRechunk")
 class DaskRechunk:
     """Lazy Dask Array rechunk transform. Does not compute input data."""
+
+    PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/Dask"
     DISPLAY_NAME = "Dask Rechunk"
 

@@ -1,10 +1,11 @@
 import asyncio
 import inspect
 import logging
-import traceback
+import operator
 import uuid
 
 import dask
+import dask.array as da
 from dask.base import is_dask_collection
 from distributed import wait as dist_wait
 
@@ -15,7 +16,16 @@ from core.invocation_builder import (
 )
 from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
-from core.type_system import can_connect_types
+from core.type_system import can_connect_types, is_dask_array_type
+from core.window_execution import (
+    CHECKPOINT_SCHEMA_VERSION,
+    ExecutionConfig,
+    WindowCheckpointStore,
+    WindowGenerator,
+    compute_plan_fingerprint,
+    compute_workflow_fingerprint,
+    parse_execution_config,
+)
 from core.worker_cache import force_clear_worker_cache
 from services.dask_service import dask_service
 from services.memory_monitor import get_memory_monitor
@@ -283,43 +293,496 @@ def _cancel_sink_futures(client, sink_futures) -> None:
         logger.debug(f"[Cleanup] Future cancellation drain skipped/failed: {exc}")
 
 
+def _normalize_futures(futures) -> list:
+    if isinstance(futures, (list, tuple)):
+        return list(futures)
+    return [futures]
+
+
+def _release_futures(futures: list) -> None:
+    for future in futures:
+        release = getattr(future, "release", None)
+        if callable(release):
+            try:
+                release()
+            except Exception as exc:
+                logger.debug("[Cleanup] Future release failed: %s", exc)
+
+
+def _remove_futures(tracked_futures: list, completed_futures: list) -> None:
+    for future in completed_futures:
+        try:
+            tracked_futures.remove(future)
+        except ValueError:
+            pass
+
+
+async def _cancel_and_await_tasks(tasks: dict) -> None:
+    """Cancel unfinished graph-building tasks and wait until they have stopped."""
+    pending = [task for task in tasks.values() if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _collect_output_sinks(results: dict, execution_roots: list[str]) -> list[dict]:
+    output_sinks = []
+    for node_id in execution_roots:
+        node_result = results.get(node_id)
+        found_for_node = False
+        for item in _iter_output_items(node_result):
+            collection = _extract_compute_collection(item)
+            if collection is None:
+                continue
+            is_delayed = _is_delayed(collection)
+            if not is_delayed:
+                logger.warning(
+                    "Execution root %s returned a non-delayed Dask collection. Full Graph "
+                    "Execution may materialize a large result in Dask memory.",
+                    node_id,
+                )
+            output_sinks.append({
+                "collection": collection,
+                "is_delayed": is_delayed,
+            })
+            found_for_node = True
+        if not found_for_node:
+            logger.info(
+                "Execution root %s returned no Dask collection. No Dask compute will be "
+                "submitted for this root.",
+                node_id,
+            )
+    return output_sinks
+
+
+def _inspect_window_roots(
+    results: dict,
+    execution_roots: list[str],
+) -> tuple[list[da.Array], tuple[int, ...] | None, str | None]:
+    root_arrays: list[da.Array] = []
+    root_shapes: list[tuple[int, ...]] = []
+
+    for node_id in execution_roots:
+        items = list(_iter_output_items(results.get(node_id)))
+        if not items:
+            return [], None, "An execution root returned no result."
+        if any(not isinstance(item, da.Array) for item in items):
+            return (
+                [],
+                None,
+                "Window Execution V1 requires every execution-root result to be a Dask Array.",
+            )
+
+        for item in items:
+            try:
+                shape = tuple(int(operator.index(size)) for size in item.shape)
+            except (TypeError, ValueError, OverflowError):
+                return (
+                    [],
+                    None,
+                    "Window Execution requires final Dask Arrays with known integer shapes.",
+                )
+            if not shape:
+                return (
+                    [],
+                    None,
+                    "Window Execution V1 does not support scalar (0-dimensional) roots.",
+                )
+            if any(size < 0 for size in shape):
+                return [], None, "Window Execution requires non-negative output dimensions."
+            root_arrays.append(item)
+            root_shapes.append(shape)
+
+    if not root_arrays:
+        return [], None, "No Dask Array execution-root results were found."
+
+    output_shape = root_shapes[0]
+    if any(shape != output_shape for shape in root_shapes[1:]):
+        return (
+            [],
+            None,
+            "Execution roots have incompatible Dask Array shapes.",
+        )
+    return root_arrays, output_shape, None
+
+
+def _declared_window_root_reason(
+    graph: dict,
+    execution_roots: list[str],
+) -> str | None:
+    """Reject clearly non-array roots without invoking side-effecting execute methods."""
+    for node_id in execution_roots:
+        node_data = graph[node_id]
+        node_cls = NODE_CLASS_MAPPINGS[node_data["type"]]
+        return_types = _resolve_source_return_types(
+            node_cls,
+            node_data.get("inputs", {}),
+            graph,
+        )
+        if not return_types or any(
+            not is_dask_array_type(return_type)
+            for return_type in return_types
+        ):
+            return (
+                "Window Execution V1 requires every declared execution-root "
+                "output type to be a Dask Array."
+            )
+
+    reachable: set[str] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in reachable:
+            return
+        reachable.add(node_id)
+        for value in graph[node_id].get("inputs", {}).values():
+            if isinstance(value, list) and len(value) == 2:
+                visit(value[0])
+
+    for root_id in execution_roots:
+        visit(root_id)
+
+    for node_id in sorted(reachable):
+        node_data = graph[node_id]
+        node_cls = NODE_CLASS_MAPPINGS[node_data["type"]]
+        if not getattr(node_cls, "PREFLIGHT_SAFE", False):
+            return (
+                "Window Execution is unavailable because node type "
+                f"{node_data['type']!r} is not declared safe for lazy preflight. "
+                "Full Graph Execution remains available."
+            )
+    return None
+
+
+async def _build_lazy_execution_roots(
+    graph: dict,
+    execution_roots: list[str],
+    *,
+    execution_id: str | None,
+    progress_callback=None,
+    is_preflight: bool = False,
+    is_resuming: bool = False,
+    tasks: dict | None = None,
+    results: dict | None = None,
+    node_instances: dict | None = None,
+) -> tuple[dict, dict, dict]:
+    """Recursively build execution-root results without submitting Dask compute."""
+    tasks = tasks if tasks is not None else {}
+    results = results if results is not None else {}
+    node_instances = node_instances if node_instances is not None else {}
+    loop = asyncio.get_running_loop()
+
+    async def report(
+        node_id: str,
+        progress: int | None,
+        message: str,
+        run_state: str,
+    ) -> None:
+        if progress_callback is not None:
+            await progress_callback(node_id, progress, message, run_state)
+
+    async def compute_node(node_id: str):
+        node_cls = None
+        class_name = None
+        func_args = None
+
+        try:
+            await report(node_id, None, "Initializing...", "ready")
+            node_data = graph[node_id]
+            class_name = node_data["type"]
+
+            pending_inputs = {}
+            final_inputs = {}
+            for input_name, value in node_data.get("inputs", {}).items():
+                if isinstance(value, list) and len(value) == 2:
+                    pending_inputs[input_name] = (value[0], value[1])
+                else:
+                    final_inputs[input_name] = value
+
+            dependency_ids = list(dict.fromkeys(
+                source_id for source_id, _ in pending_inputs.values()
+            ))
+            if dependency_ids:
+                await asyncio.gather(*(schedule_node(dep_id) for dep_id in dependency_ids))
+
+            for argument_name, (dependency_id, raw_slot_index) in pending_inputs.items():
+                try:
+                    slot_index = int(raw_slot_index)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(
+                        f"Node '{node_id}': invalid output slot index {raw_slot_index!r} "
+                        f"(source '{dependency_id}'). Must be a non-negative integer."
+                    ) from exc
+                if slot_index < 0:
+                    raise ValueError(
+                        f"Node '{node_id}': negative output slot index {slot_index} "
+                        f"(source '{dependency_id}'). Must be a non-negative integer."
+                    )
+
+                source_result = results[dependency_id]
+                if isinstance(source_result, tuple):
+                    if slot_index >= len(source_result):
+                        raise ValueError(
+                            f"Node '{node_id}': output slot {slot_index} out of range "
+                            f"(source '{dependency_id}' has {len(source_result)} slots)."
+                        )
+                    value = source_result[slot_index]
+                else:
+                    if slot_index != 0:
+                        raise ValueError(
+                            f"Node '{node_id}': output slot {slot_index} out of range "
+                            f"(source '{dependency_id}' has 1 slot)."
+                        )
+                    value = source_result
+                final_inputs[argument_name] = value
+
+            node_cls = NODE_CLASS_MAPPINGS.get(class_name)
+            if node_cls is None:
+                raise ValueError(f"Node class '{class_name}' not found.")
+
+            func_args = prepare_node_inputs(node_cls, final_inputs, node_id)
+            invocation = build_node_invocation(
+                node_cls,
+                func_args,
+                node_id=node_id,
+                execution_id=execution_id,
+                is_preflight=is_preflight,
+                is_resuming=is_resuming,
+            )
+            func_args["_node_id"] = node_id
+            func_args["_execution_id"] = execution_id
+            func_args["_runtime"] = invocation.runtime
+            func_args["_invocation"] = invocation
+
+            instance = node_cls()
+            node_instances[node_id] = instance
+            method_name = getattr(node_cls, "FUNCTION", "execute")
+            method = getattr(instance, method_name)
+
+            signature = inspect.signature(method)
+            accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            if not accepts_kwargs:
+                func_args = {
+                    key: value
+                    for key, value in func_args.items()
+                    if key in signature.parameters
+                }
+
+            with dask.annotate(brainflow_node_id=node_id):
+                if asyncio.iscoroutinefunction(method):
+                    output = await method(**func_args)
+                else:
+                    output = await loop.run_in_executor(
+                        None,
+                        lambda: method(**func_args),
+                    )
+
+            output_items = list(output if isinstance(output, tuple) else (output,))
+            if any(_is_dask_collection(item) for item in output_items):
+                await report(node_id, None, "Ready", "ready")
+            else:
+                await report(node_id, 100, "Done", "done")
+
+            results[node_id] = output if isinstance(output, tuple) else (output,)
+            return results[node_id]
+
+        except Exception as exc:
+            error_context = {
+                "node_id": node_id,
+                "node_type": class_name,
+                "node_category": getattr(node_cls, "CATEGORY", "Unknown") if node_cls else "Unknown",
+                "display_name": getattr(node_cls, "DISPLAY_NAME", class_name) if node_cls else class_name,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:500],
+            }
+            if func_args:
+                error_context["inputs"] = {
+                    key: str(value)[:100]
+                    if isinstance(value, (str, int, float))
+                    else f"<{type(value).__name__}>"
+                    for key, value in func_args.items()
+                    if not key.startswith("_")
+                }
+            logger.error(
+                "Node %s (%s) failed: %s: %s",
+                node_id,
+                error_context["node_type"],
+                error_context["error_type"],
+                error_context["error_message"],
+                extra=error_context,
+            )
+            await report(
+                node_id,
+                None,
+                f"Error: {error_context['error_type']}",
+                "failed",
+            )
+            raise
+
+    async def schedule_node(node_id: str):
+        if node_id in results:
+            return results[node_id]
+        if node_id in tasks:
+            return await tasks[node_id]
+        task = asyncio.create_task(compute_node(node_id))
+        tasks[node_id] = task
+        return await task
+
+    await asyncio.gather(*(schedule_node(node_id) for node_id in execution_roots))
+    return results, node_instances, tasks
+
+
+async def preflight_graph(graph: dict) -> dict:
+    """Validate and inspect lazy terminal metadata without compute or an execution slot."""
+    validate_graph_structure(graph)
+    validate_graph_acyclic(graph)
+    validate_graph_types(graph)
+    execution_roots = find_execution_roots(graph)
+    if not execution_roots:
+        raise ValueError(
+            "No terminal output node found. A workflow execution root must declare "
+            "OUTPUT_NODE=True and have no outgoing graph connections."
+        )
+
+    declared_reason = _declared_window_root_reason(graph, execution_roots)
+    if declared_reason is not None:
+        return {
+            "windowable": False,
+            "output_shape": None,
+            "ndim": None,
+            "reason": declared_reason,
+        }
+
+    tasks: dict = {}
+    results: dict = {}
+    node_instances: dict = {}
+    try:
+        await _build_lazy_execution_roots(
+            graph,
+            execution_roots,
+            execution_id=None,
+            is_preflight=True,
+            tasks=tasks,
+            results=results,
+            node_instances=node_instances,
+        )
+        _, output_shape, reason = _inspect_window_roots(results, execution_roots)
+        if reason is not None:
+            return {
+                "windowable": False,
+                "output_shape": None,
+                "ndim": None,
+                "reason": reason,
+            }
+        return {
+            "windowable": True,
+            "output_shape": list(output_shape),
+            "ndim": len(output_shape),
+        }
+    finally:
+        await _cancel_and_await_tasks(tasks)
+        tasks.clear()
+        results.clear()
+        node_instances.clear()
+
+
+def _new_resume_state(
+    *,
+    workflow_fingerprint: str,
+    plan_fingerprint: str,
+    output_shape: tuple[int, ...],
+    window_shape: tuple[int, ...],
+    next_window_index: int,
+    total_windows: int,
+    phase: str,
+) -> dict:
+    return {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "workflow_fingerprint": workflow_fingerprint,
+        "plan_fingerprint": plan_fingerprint,
+        "output_shape": list(output_shape),
+        "window_shape": list(window_shape),
+        "next_window_index": next_window_index,
+        "total_windows": total_windows,
+        "phase": phase,
+    }
+
+
+def _validate_resume_state(
+    state: dict,
+    *,
+    output_shape: tuple[int, ...],
+    window_shape: tuple[int, ...],
+    total_windows: int,
+) -> int:
+    if state.get("output_shape") != list(output_shape):
+        raise ValueError("Window checkpoint output_shape does not match the current plan.")
+    if state.get("window_shape") != list(window_shape):
+        raise ValueError("Window checkpoint window_shape does not match the current plan.")
+    if state.get("total_windows") != total_windows:
+        raise ValueError("Window checkpoint total_windows does not match the current plan.")
+
+    next_window_index = state.get("next_window_index")
+    if isinstance(next_window_index, bool) or not isinstance(next_window_index, int):
+        raise ValueError("Window checkpoint next_window_index must be an integer.")
+    if next_window_index < 0 or next_window_index > total_windows:
+        raise ValueError("Window checkpoint next_window_index is out of range.")
+
+    phase = state.get("phase")
+    if phase not in {"windows_running", "finalizing"}:
+        raise ValueError(f"Window checkpoint has invalid phase {phase!r}.")
+    if phase == "finalizing" and next_window_index != total_windows:
+        raise ValueError("A finalizing checkpoint must have all Windows committed.")
+    if phase == "windows_running" and next_window_index == total_windows:
+        raise ValueError("A complete Window checkpoint must be in the finalizing phase.")
+    return next_window_index
+
+
 # =============================================================================
 # 3. Core executor
 # =============================================================================
-async def execute_graph(graph: dict, execution_id: str = None):
-    """
-    Two-phase executor:
-
-    Phase 1 (GraphBuilding): recursively executes dependencies of execution
-    roots, building a lazy Dask graph. An execution root is a node whose class
-    declares OUTPUT_NODE=True and whose graph out-degree is zero.
-
-    Phase 2 (Compute): discovers Dask collections from execution-root return values.
-    If any are found, submits them in a single client.compute([...]) call.
-    After futures complete (or if no collections were found), calls postprocess()
-    on each execution-root instance once.
-    """
-    tasks = {}
-    sink_futures = []
-    results = {}
-    node_instances = {}
+async def execute_graph(
+    graph: dict,
+    execution_id: str = None,
+    execution_config: ExecutionConfig | dict | None = None,
+    *,
+    checkpoint_store: WindowCheckpointStore | None = None,
+):
+    """Execute true terminal roots in Full Graph or sequential Window mode."""
+    tasks: dict = {}
+    sink_futures: list = []
+    results: dict = {}
+    node_instances: dict = {}
     client = None
     should_cancel_dask_objects = False
+
+    window_store: WindowCheckpointStore | None = None
+    workflow_fingerprint: str | None = None
+    plan_fingerprint: str | None = None
+    saved_resume_state: dict | None = None
+    window_generator: WindowGenerator | None = None
+    selected_config: ExecutionConfig | None = None
 
     if not execution_id:
         execution_id = uuid.uuid4().hex
 
     mem_monitor = get_memory_monitor()
     mem_monitor.snapshots.clear()
-
     state_manager.create_execution(execution_id)
 
     try:
-        client = dask_service.ensure_client()
+        selected_config = parse_execution_config(execution_config)
         validate_graph_structure(graph)
         validate_graph_acyclic(graph)
         validate_graph_types(graph)
-
+        # Full Graph keeps the existing eager client lifecycle.  Preflight never
+        # reaches this executor, while Window mode creates a client only when it
+        # actually has a Window to submit.
+        if selected_config.mode == "full_graph":
+            client = dask_service.ensure_client()
         mem_monitor.log_snapshot("execution_start", client=client)
 
         await state_manager.broadcast(execution_id, {
@@ -338,11 +801,15 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 "executionId": execution_id,
                 "status": "failed",
                 "message": (
-                    "No terminal output node found. A workflow execution root must declare "
-                    "OUTPUT_NODE=True and have no outgoing graph connections."
+                    "No terminal output node found. A workflow execution root must "
+                    "declare OUTPUT_NODE=True and have no outgoing graph connections."
                 ),
             })
-            state_manager.add_log("No terminal output node found. Cannot execute.", "error", execution_id=execution_id)
+            state_manager.add_log(
+                "No terminal output node found. Cannot execute.",
+                "error",
+                execution_id=execution_id,
+            )
             return execution_id
 
         loop = asyncio.get_running_loop()
@@ -352,287 +819,390 @@ async def execute_graph(graph: dict, execution_id: str = None):
             progress: int | None = None,
             message: str = "",
             run_state: str = "ready",
+            *,
+            broadcast_update: bool = True,
         ):
             node_data = graph.get(node_id)
-            NodeCls = NODE_CLASS_MAPPINGS.get(node_data.get("type")) if node_data else None
-            pt_value = "state_only"
+            node_cls = (
+                NODE_CLASS_MAPPINGS.get(node_data.get("type"))
+                if node_data
+                else None
+            )
+            progress_type = "state_only"
             device = None
-            if NodeCls:
-                pt = getattr(NodeCls, "PROGRESS_TYPE", None)
-                if pt:
-                    pt_value = pt.value if hasattr(pt, "value") else str(pt)
-                device = getattr(NodeCls, "DEVICE_HINT", None)
+            if node_cls:
+                declared_progress = getattr(node_cls, "PROGRESS_TYPE", None)
+                if declared_progress:
+                    progress_type = (
+                        declared_progress.value
+                        if hasattr(declared_progress, "value")
+                        else str(declared_progress)
+                    )
+                device = getattr(node_cls, "DEVICE_HINT", None)
             progress_role = "output" if node_id in execution_root_set else "state"
 
             state_manager.update_node_status(
-                node_id, message,
+                node_id,
+                message,
                 execution_id=execution_id,
                 run_state=run_state,
                 device=device,
                 progress=progress,
-                progress_type=pt_value,
+                progress_type=progress_type,
                 progress_role=progress_role,
             )
-
-            broadcast_msg = {
+            broadcast_message = {
                 "type": "progress",
                 "taskId": node_id,
                 "executionId": execution_id,
-                "progressType": pt_value,
+                "progressType": progress_type,
                 "progress": progress,
                 "message": message,
                 "runState": run_state,
                 "progressRole": progress_role,
             }
             if device:
-                broadcast_msg["device"] = device
-            await state_manager.broadcast(execution_id, broadcast_msg)
+                broadcast_message["device"] = device
+            if broadcast_update:
+                await state_manager.broadcast(execution_id, broadcast_message)
 
-        async def _compute_node(node_id: str):
-            NodeCls = None
-            class_name = None
-            func_args = None
+        async def window_progress_callback(
+            *,
+            current_window: int,
+            completed_windows: int,
+            total_windows: int,
+            window_status: str,
+            message: str,
+        ) -> None:
+            progress = (
+                100.0
+                if total_windows == 0
+                else min(
+                    100.0,
+                    max(0.0, completed_windows * 100.0 / total_windows),
+                )
+            )
+            payload = state_manager.update_window_progress(
+                execution_id,
+                current_window=current_window,
+                completed_windows=completed_windows,
+                total_windows=total_windows,
+                progress=progress,
+                window_status=window_status,
+                message=message,
+            )
+            if payload is not None:
+                await state_manager.broadcast(execution_id, payload)
 
+        is_resuming = False
+        expected_output_shape: tuple[int, ...] | None = None
+
+        if selected_config.mode == "window":
+            declared_reason = _declared_window_root_reason(graph, execution_roots)
+            if declared_reason is not None:
+                raise ValueError(declared_reason)
+            # This metadata pass skips preprocess, so opening the Run dialog and
+            # selecting a plan cannot initialize or overwrite writer outputs.
+            metadata_tasks: dict = {}
+            metadata_results: dict = {}
+            metadata_instances: dict = {}
             try:
-                await progress_callback(node_id, None, "Initializing...", "ready")
-                node_data = graph.get(node_id)
-                class_name = node_data["type"]
+                await _build_lazy_execution_roots(
+                    graph,
+                    execution_roots,
+                    execution_id=None,
+                    is_preflight=True,
+                    tasks=metadata_tasks,
+                    results=metadata_results,
+                    node_instances=metadata_instances,
+                )
+                _, expected_output_shape, window_reason = _inspect_window_roots(
+                    metadata_results,
+                    execution_roots,
+                )
+                if window_reason is not None:
+                    raise ValueError(window_reason)
 
-                pending_inputs = {}
-                final_inputs = {}
+                window_generator = WindowGenerator(
+                    expected_output_shape,
+                    selected_config.window_shape,
+                )
+                workflow_fingerprint = compute_workflow_fingerprint(
+                    graph,
+                    execution_roots,
+                )
+                plan_fingerprint = compute_plan_fingerprint(
+                    expected_output_shape,
+                    selected_config.window_shape,
+                )
+                window_store = checkpoint_store or WindowCheckpointStore()
+                saved_resume_state = window_store.load(
+                    workflow_fingerprint,
+                    plan_fingerprint,
+                )
+                if saved_resume_state is not None:
+                    _validate_resume_state(
+                        saved_resume_state,
+                        output_shape=expected_output_shape,
+                        window_shape=selected_config.window_shape,
+                        total_windows=window_generator.total_windows,
+                    )
+                    is_resuming = True
+            finally:
+                await _cancel_and_await_tasks(metadata_tasks)
+                metadata_tasks.clear()
+                metadata_results.clear()
+                metadata_instances.clear()
 
-                for k, v in node_data.get("inputs", {}).items():
-                    if isinstance(v, list) and len(v) == 2:
-                        pending_inputs[k] = (v[0], v[1])
-                    else:
-                        final_inputs[k] = v
+        await state_manager.broadcast(
+            execution_id,
+            {"type": "log", "message": "GraphBuilding..."},
+        )
+        state_manager.add_log("GraphBuilding...", "info", execution_id=execution_id)
+        await _build_lazy_execution_roots(
+            graph,
+            execution_roots,
+            execution_id=execution_id,
+            progress_callback=progress_callback,
+            is_resuming=is_resuming,
+            tasks=tasks,
+            results=results,
+            node_instances=node_instances,
+        )
 
-                dep_ids = list(set([x[0] for x in pending_inputs.values()]))
-                if dep_ids:
-                    await asyncio.gather(*(schedule_node(dep_id) for dep_id in dep_ids))
+        if selected_config.mode == "full_graph":
+            output_sinks = _collect_output_sinks(results, execution_roots)
+            if output_sinks:
+                client = dask_service.ensure_client()
+                for node_id in execution_roots:
+                    await progress_callback(node_id, None, "Submitted", "submitted")
 
-                for arg_name, raw_slot_idx in pending_inputs.items():
-                    dep_id, raw_idx = raw_slot_idx
-                    try:
-                        slot_idx = int(raw_idx)
-                    except (ValueError, TypeError):
-                        raise ValueError(
-                            f"Node '{node_id}': invalid output slot index {raw_idx!r} "
-                            f"(source '{dep_id}'). Must be a non-negative integer."
-                        )
-                    if slot_idx < 0:
-                        raise ValueError(
-                            f"Node '{node_id}': negative output slot index {slot_idx} "
-                            f"(source '{dep_id}'). Must be a non-negative integer."
-                        )
-
-                    src_result = results[dep_id]
-                    val = None
-                    if isinstance(src_result, tuple):
-                        if slot_idx >= len(src_result):
-                            raise ValueError(
-                                f"Node '{node_id}': output slot {slot_idx} out of range "
-                                f"(source '{dep_id}' has {len(src_result)} slots)."
-                            )
-                        val = src_result[slot_idx]
-                    else:
-                        if slot_idx != 0:
-                            raise ValueError(
-                                f"Node '{node_id}': output slot {slot_idx} out of range "
-                                f"(source '{dep_id}' has 1 slot)."
-                            )
-                        val = src_result
-                    final_inputs[arg_name] = val
-
-                NodeCls = NODE_CLASS_MAPPINGS.get(class_name)
-                if NodeCls is None:
-                    raise ValueError(f"Node class '{class_name}' not found.")
-
-                func_args = prepare_node_inputs(NodeCls, final_inputs, node_id)
-                invocation = build_node_invocation(
-                    NodeCls,
-                    func_args,
-                    node_id=node_id,
+                collections = [sink["collection"] for sink in output_sinks]
+                futures = _normalize_futures(client.compute(collections))
+                sink_futures.extend(futures)
+                await state_manager.broadcast(execution_id, {
+                    "type": "log",
+                    "message": f"Submitted {len(output_sinks)} sink(s) - Computing...",
+                })
+                state_manager.add_log(
+                    f"Submitted {len(output_sinks)} sink(s) - Computing...",
+                    "info",
                     execution_id=execution_id,
                 )
-                func_args["_node_id"] = node_id
-                func_args["_execution_id"] = execution_id
-                func_args["_runtime"] = invocation.runtime
-                func_args["_invocation"] = invocation
+                for node_id in execution_roots:
+                    await progress_callback(node_id, None, "Running", "running")
 
-                # Instantiate FIRST, then get method from the instance
-                instance = NodeCls()
-                node_instances[node_id] = instance
-
-                method_name = getattr(NodeCls, "FUNCTION", "execute")
-                method = getattr(instance, method_name)
-
-                # Filter _node_id / _execution_id for methods that don't accept **kwargs
-                sig = inspect.signature(method)
-                accepts_kwargs = any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD
-                    for p in sig.parameters.values()
-                )
-                if not accepts_kwargs:
-                    filtered = {k: v for k, v in func_args.items() if k in sig.parameters}
-                    func_args = filtered
-
-                with dask.annotate(brainflow_node_id=node_id):
-                    if asyncio.iscoroutinefunction(method):
-                        output = await method(**func_args)
+                await loop.run_in_executor(None, lambda: dist_wait(futures))
+                for sink, future in zip(output_sinks, futures):
+                    if sink["is_delayed"]:
+                        await loop.run_in_executor(None, future.result)
                     else:
-                        output = await loop.run_in_executor(None, lambda: method(**func_args))
-
-                output_list = list(output if isinstance(output, tuple) else (output,))
-
-                is_lazy = any(_is_dask_collection(item) for item in output_list)
-
-                if is_lazy:
-                    await progress_callback(node_id, None, "Ready", "ready")
-                else:
-                    await progress_callback(node_id, 100, "Done", "done")
-
-                results[node_id] = output if isinstance(output, tuple) else (output,)
-                return results[node_id]
-
-            except Exception as e:
-                error_context = {
-                    "node_id": node_id,
-                    "node_type": class_name,
-                    "node_category": getattr(NodeCls, "CATEGORY", "Unknown") if NodeCls else "Unknown",
-                    "display_name": getattr(NodeCls, "DISPLAY_NAME", class_name) if NodeCls else class_name,
-                    "error_type": type(e).__name__,
-                    "error_message": str(e)[:500],
-                }
-                if func_args:
-                    inputs_summary = {
-                        k: str(v)[:100] if isinstance(v, (str, int, float)) else f"<{type(v).__name__}>"
-                        for k, v in func_args.items() if k != "_node_id"
-                    }
-                    error_context["inputs"] = inputs_summary
-
-                logger.error(
-                    f"Node {node_id} ({error_context['node_type']}) Failed: "
-                    f"{error_context['error_type']}: {error_context['error_message']}",
-                    extra=error_context,
-                )
-                traceback.print_exc()
-                await progress_callback(node_id, None, f"Error: {error_context['error_type']}", "failed")
-                raise e
-
-        async def schedule_node(node_id: str):
-            if node_id in results:
-                return results[node_id]
-            if node_id in tasks:
-                return await tasks[node_id]
-            task = asyncio.create_task(_compute_node(node_id))
-            tasks[node_id] = task
-            return await task
-
-        # =========================================================================
-        # Phase 1: GraphBuilding
-        # =========================================================================
-        await state_manager.broadcast(execution_id, {"type": "log", "message": "GraphBuilding..."})
-        state_manager.add_log("GraphBuilding...", "info", execution_id=execution_id)
-        await asyncio.gather(*(schedule_node(nid) for nid in execution_roots))
-
-        # =========================================================================
-        # Phase 2: collect execution-root collections and compute
-        # =========================================================================
-        output_sinks = []
-        for nid in execution_roots:
-            node_result = results.get(nid)
-            found_for_node = False
-            for item in _iter_output_items(node_result):
-                collection = _extract_compute_collection(item)
-                if collection is not None:
-                    if not _is_delayed(collection):
-                        logger.warning(
-                            "Output node %s returned a Dask Array. Executor will compute it, "
-                            "which may materialize a large result in Dask memory. "
-                            "Writers should prefer delayed side-effect tasks or small token "
-                            "sink collections.",
-                            nid,
+                        # Never pull a complete large collection to the driver.
+                        exception = await loop.run_in_executor(
+                            None,
+                            future.exception,
                         )
-                    output_sinks.append({
-                        "collection": collection,
-                        "is_delayed": _is_delayed(collection),
-                    })
-                    found_for_node = True
-            if not found_for_node:
-                logger.info(
-                    "Output node %s returned no Dask collection. "
-                    "Executor will not submit Dask compute for this output. "
-                    "This is valid if the node completed its side effects during execute().",
-                    nid,
+                        if exception is not None:
+                            raise exception
+        else:
+            root_arrays, actual_output_shape, window_reason = _inspect_window_roots(
+                results,
+                execution_roots,
+            )
+            if window_reason is not None:
+                raise ValueError(window_reason)
+            if actual_output_shape != expected_output_shape:
+                raise ValueError(
+                    "Execution-root shape changed between preflight and execution "
+                    f"({expected_output_shape} != {actual_output_shape})."
+                )
+            if window_generator is None or window_store is None:
+                raise RuntimeError("Window Execution was not initialized.")
+            if workflow_fingerprint is None or plan_fingerprint is None:
+                raise RuntimeError("Window recovery identity was not initialized.")
+
+            if saved_resume_state is None:
+                start_index = 0
+                resume_state = _new_resume_state(
+                    workflow_fingerprint=workflow_fingerprint,
+                    plan_fingerprint=plan_fingerprint,
+                    output_shape=actual_output_shape,
+                    window_shape=selected_config.window_shape,
+                    next_window_index=0,
+                    total_windows=window_generator.total_windows,
+                    phase=(
+                        "finalizing"
+                        if window_generator.total_windows == 0
+                        else "windows_running"
+                    ),
+                )
+                window_store.save(resume_state)
+            else:
+                start_index = _validate_resume_state(
+                    saved_resume_state,
+                    output_shape=actual_output_shape,
+                    window_shape=selected_config.window_shape,
+                    total_windows=window_generator.total_windows,
+                )
+                resume_message = (
+                    "Resuming Window Execution at finalization."
+                    if start_index == window_generator.total_windows
+                    else (
+                        f"Resuming Window Execution at Window {start_index + 1} / "
+                        f"{window_generator.total_windows}."
+                    )
+                )
+                await state_manager.broadcast(
+                    execution_id,
+                    {"type": "log", "message": resume_message},
+                )
+                state_manager.add_log(
+                    resume_message,
+                    "info",
+                    execution_id=execution_id,
                 )
 
-        # Dask client is only required when there are collections to compute
-        if output_sinks:
-            client = dask_service.ensure_client()
+            total_windows = window_generator.total_windows
+            if start_index < total_windows:
+                client = dask_service.ensure_client()
+                for node_id in execution_roots:
+                    await progress_callback(node_id, None, "Submitted", "submitted")
+                window_summary = (
+                    f"Window Execution: {total_windows} Window(s), "
+                    f"starting at index {start_index}."
+                )
+                await state_manager.broadcast(
+                    execution_id,
+                    {"type": "log", "message": window_summary},
+                )
+                state_manager.add_log(
+                    window_summary,
+                    "info",
+                    execution_id=execution_id,
+                )
+                progress_stride = max(1, (total_windows + 999) // 1000)
 
-            # Send submitted state for all execution roots.
-            for nid in execution_roots:
-                await progress_callback(nid, None, "Submitted", "submitted")
+                for window in window_generator.iter_from(start_index):
+                    message = f"Window {window.index + 1} / {total_windows}"
+                    await window_progress_callback(
+                        current_window=window.index + 1,
+                        completed_windows=window.index,
+                        total_windows=total_windows,
+                        window_status="running",
+                        message=message,
+                    )
+                    progress_percent = min(
+                        99,
+                        int(window.index * 100 / total_windows),
+                    )
+                    should_broadcast_progress = (
+                        window.index == start_index
+                        or window.index + 1 == total_windows
+                        or (window.index - start_index) % progress_stride == 0
+                    )
+                    for node_id in execution_roots:
+                        await progress_callback(
+                            node_id,
+                            progress_percent,
+                            message,
+                            "running",
+                            broadcast_update=should_broadcast_progress,
+                        )
 
-            collections = [s["collection"] for s in output_sinks]
-            futures = client.compute(collections)
-            if not isinstance(futures, (list, tuple)):
-                futures = [futures]
-            sink_futures.extend(futures)
+                    window_collections = [
+                        root_array[window.slices]
+                        for root_array in root_arrays
+                    ]
+                    current_futures: list = []
+                    wait_completed = False
+                    try:
+                        current_futures = _normalize_futures(
+                            client.compute(window_collections)
+                        )
+                        sink_futures.extend(current_futures)
+                        await loop.run_in_executor(
+                            None,
+                            lambda futures=current_futures: dist_wait(futures),
+                        )
+                        wait_completed = True
+                        for future in current_futures:
+                            exception = await loop.run_in_executor(
+                                None,
+                                future.exception,
+                            )
+                            if exception is not None:
+                                raise exception
 
-            await state_manager.broadcast(execution_id, {
-                "type": "log",
-                "message": f"Submitted {len(output_sinks)} sink(s) — Computing...",
-            })
-            state_manager.add_log(
-                f"Submitted {len(output_sinks)} sink(s) — Computing...",
-                "info",
-                execution_id=execution_id,
+                        next_window_index = window.index + 1
+                        resume_state = _new_resume_state(
+                            workflow_fingerprint=workflow_fingerprint,
+                            plan_fingerprint=plan_fingerprint,
+                            output_shape=actual_output_shape,
+                            window_shape=selected_config.window_shape,
+                            next_window_index=next_window_index,
+                            total_windows=total_windows,
+                            phase=(
+                                "finalizing"
+                                if next_window_index == total_windows
+                                else "windows_running"
+                            ),
+                        )
+                        # Advance only after every root future succeeds.
+                        window_store.save(resume_state)
+                        await window_progress_callback(
+                            current_window=window.index + 1,
+                            completed_windows=next_window_index,
+                            total_windows=total_windows,
+                            window_status="running",
+                            message=(
+                                f"Completed Window {window.index + 1} / "
+                                f"{total_windows}"
+                            ),
+                        )
+                    finally:
+                        if wait_completed:
+                            _release_futures(current_futures)
+                            _remove_futures(sink_futures, current_futures)
+            else:
+                for node_id in execution_roots:
+                    await progress_callback(
+                        node_id,
+                        99,
+                        "Finalizing",
+                        "running",
+                    )
+
+            await window_progress_callback(
+                current_window=(total_windows if total_windows else 0),
+                completed_windows=total_windows,
+                total_windows=total_windows,
+                window_status="finalizing",
+                message="Finalizing Window Execution",
             )
 
-            # Send running state for all execution roots.
-            for nid in execution_roots:
-                await progress_callback(nid, None, "Running", "running")
-
-            # Wait for all futures; this does NOT pull large results back to driver
-            await loop.run_in_executor(None, lambda: dist_wait(futures))
-
-            # Check exceptions and optionally collect delayed results
-            for sink, future in zip(output_sinks, futures):
-                if sink["is_delayed"]:
-                    # dask.delayed: safe to call result() — returns small values
-                    # None return is valid success; exception propagates
-                    # delayed functions may return None (valid success); result() propagates exceptions
-                    _ = await loop.run_in_executor(None, future.result)
-                    # value may be None (valid) — do not confuse with failure
-                else:
-                    # Dask array or other large collection:
-                    # DO NOT call future.result() — that materializes the full array on the driver
-                    exc = await loop.run_in_executor(None, future.exception)
-                    if exc is not None:
-                        raise exc
-
-            # All futures succeeded; postprocess each execution root once.
-        for nid in execution_roots:
-            instance = node_instances.get(nid)
+        # postprocess remains a whole-workflow lifecycle hook.
+        for node_id in execution_roots:
+            instance = node_instances.get(node_id)
             postprocess = getattr(instance, "postprocess", None)
             if callable(postprocess):
                 post_value = postprocess(
-                    outputs=results.get(nid),
+                    outputs=results.get(node_id),
                     state=getattr(instance, "_preprocess_state", None),
-                    runtime={"execution_id": execution_id, "node_id": nid},
+                    runtime={"execution_id": execution_id, "node_id": node_id},
                 )
                 if inspect.isawaitable(post_value):
                     post_value = await post_value
                 if post_value is not None:
-                    results[nid] = post_value
+                    results[node_id] = post_value
 
-        # Send done state for all execution roots.
-        for nid in execution_roots:
-            await progress_callback(nid, 100, "Done", "done")
+        for node_id in execution_roots:
+            await progress_callback(node_id, 100, "Done", "done")
 
-        # Success
+        # No await is allowed between checkpoint deletion and the terminal state
+        # transition.  A cancellation during the progress update above keeps the
+        # checkpoint; once it is deleted the execution is synchronously terminal.
+        if selected_config.mode == "window":
+            window_store.delete(workflow_fingerprint, plan_fingerprint)
         state_manager.set_execution_status(execution_id, ExecutionStatus.SUCCEEDED)
         await state_manager.broadcast(execution_id, {
             "type": "execution_finished",
@@ -640,8 +1210,11 @@ async def execute_graph(graph: dict, execution_id: str = None):
             "status": "succeeded",
             "message": "Workflow Finished Successfully",
         })
-        state_manager.add_log("Workflow Finished Successfully", "success", execution_id=execution_id)
-        # Legacy compatibility
+        state_manager.add_log(
+            "Workflow Finished Successfully",
+            "success",
+            execution_id=execution_id,
+        )
         await state_manager.broadcast(execution_id, {
             "type": "done",
             "executionId": execution_id,
@@ -652,6 +1225,12 @@ async def execute_graph(graph: dict, execution_id: str = None):
     except asyncio.CancelledError:
         should_cancel_dask_objects = True
         logger.warning("Execution Cancelled.")
+        session = state_manager.get_execution(execution_id)
+        if session and session.status == ExecutionStatus.RUNNING:
+            state_manager.set_execution_status(
+                execution_id,
+                ExecutionStatus.CANCELLING,
+            )
         state_manager.set_execution_status(execution_id, ExecutionStatus.CANCELLED)
         await state_manager.broadcast(execution_id, {
             "type": "execution_finished",
@@ -659,82 +1238,105 @@ async def execute_graph(graph: dict, execution_id: str = None):
             "status": "cancelled",
             "message": "Execution Cancelled",
         })
-        state_manager.add_log("Execution Cancelled", "warning", execution_id=execution_id)
-    except Exception as e:
+        state_manager.add_log(
+            "Execution Cancelled",
+            "warning",
+            execution_id=execution_id,
+        )
+    except Exception as exc:
         should_cancel_dask_objects = True
-        traceback.print_exc()
-
+        logger.error(
+            "Execution failed: %s: %s",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         session = state_manager.get_execution(execution_id)
         if session and session.status == ExecutionStatus.CANCELLING:
-            logger.warning(f"Exception during CANCELLING, finalizing as CANCELLED: {e}")
-            state_manager.set_execution_status(execution_id, ExecutionStatus.CANCELLED)
+            state_manager.set_execution_status(
+                execution_id,
+                ExecutionStatus.CANCELLED,
+            )
             await state_manager.broadcast(execution_id, {
                 "type": "execution_finished",
                 "executionId": execution_id,
                 "status": "cancelled",
-                "message": f"Execution Cancelled (error during shutdown: {type(e).__name__})",
+                "message": (
+                    f"Execution Cancelled (error during shutdown: "
+                    f"{type(exc).__name__})"
+                ),
             })
-            state_manager.add_log(f"Cancellation error: {type(e).__name__}", "warning", execution_id=execution_id)
+            state_manager.add_log(
+                f"Cancellation error: {type(exc).__name__}",
+                "warning",
+                execution_id=execution_id,
+            )
         else:
             state_manager.set_execution_status(execution_id, ExecutionStatus.FAILED)
             await state_manager.broadcast(execution_id, {
                 "type": "execution_finished",
                 "executionId": execution_id,
                 "status": "failed",
-                "message": str(e),
+                "message": str(exc),
             })
-            state_manager.add_log(f"Global Error: {str(e)}", "error", execution_id=execution_id)
+            state_manager.add_log(
+                f"Global Error: {str(exc)}",
+                "error",
+                execution_id=execution_id,
+            )
     finally:
         mem_monitor.log_snapshot("execution_end_before_cleanup", client=client)
+        await _cancel_and_await_tasks(tasks)
 
-        # Cancel asyncio tasks
-        for t in tasks.values():
-            if not t.done():
-                t.cancel()
+        if client and sink_futures and should_cancel_dask_objects:
+            try:
+                _cancel_sink_futures(client, sink_futures)
+                logger.info(
+                    "[Cleanup] Force cancelled %s sink futures",
+                    len(sink_futures),
+                )
+            except Exception as exc:
+                logger.debug("[Cleanup] Cancel failed: %s", exc)
 
-        if client:
-            if sink_futures and should_cancel_dask_objects:
-                try:
-                    _cancel_sink_futures(client, sink_futures)
-                    logger.info(f"[Cleanup] Force cancelled {len(sink_futures)} sink futures")
-                except Exception as exc:
-                    logger.debug(f"[Cleanup] Cancel failed: {exc}")
-
-        # Node cleanup runs after Dask sink futures are cancelled/drained so
-        # writer-owned temporary resources are not deleted while workers may
-        # still be using them.
         if should_cancel_dask_objects:
-            for nid, instance in node_instances.items():
-                cleanup_fn = getattr(instance, "cleanup", None)
-                if callable(cleanup_fn):
+            for node_id, instance in node_instances.items():
+                cleanup = getattr(instance, "cleanup", None)
+                if callable(cleanup):
                     try:
-                        cleanup_fn()
-                        logger.info(f"[Cleanup] Called cleanup() on {nid}")
+                        cleanup()
+                        logger.info("[Cleanup] Called cleanup() on %s", node_id)
                     except Exception as exc:
-                        logger.warning(f"[Cleanup] cleanup() failed for {nid}: {exc}")
+                        logger.warning(
+                            "[Cleanup] cleanup() failed for %s: %s",
+                            node_id,
+                            exc,
+                        )
 
         if client:
             try:
                 stats = client.run(force_clear_worker_cache)
-                logger.info(f"[Cleanup] Worker cache cleared: {stats}")
+                logger.info("[Cleanup] Worker cache cleared: %s", stats)
             except Exception as exc:
-                logger.debug(f"[Cleanup] Worker cache clear failed: {exc}")
+                logger.debug("[Cleanup] Worker cache clear failed: %s", exc)
 
         sink_futures.clear()
         tasks.clear()
         results.clear()
-
         state_manager.cleanup_old_executions()
 
         mem_monitor.log_snapshot("execution_end_after_cleanup", client=client)
-        mem_monitor.log_delta("execution_start", "execution_end_before_cleanup")
-
-        mem_monitor.log_delta("execution_end_before_cleanup", "execution_end_after_cleanup")
+        mem_monitor.log_delta(
+            "execution_start",
+            "execution_end_before_cleanup",
+        )
+        mem_monitor.log_delta(
+            "execution_end_before_cleanup",
+            "execution_end_after_cleanup",
+        )
 
         start_snapshot = mem_monitor.snapshots.get("execution_start")
         end_before = mem_monitor.snapshots.get("execution_end_before_cleanup")
         end_after = mem_monitor.snapshots.get("execution_end_after_cleanup")
-
         if start_snapshot and end_before and end_after:
             start_mb = start_snapshot.get("process_mb", 0)
             before_mb = end_before.get("process_mb", 0)
@@ -744,13 +1346,17 @@ async def execute_graph(graph: dict, execution_id: str = None):
                 delta = after_mb - start_mb
                 if delta > 3000:
                     logger.warning(
-                        f"[Memory] +{delta:.0f}MB retained after execution "
-                        f"(cleanup released {released:.0f}MB)."
+                        "[Memory] +%.0fMB retained after execution "
+                        "(cleanup released %.0fMB).",
+                        delta,
+                        released,
                     )
                 else:
                     logger.info(
-                        f"[Memory] Execution: +{delta:.0f}MB total, "
-                        f"cleanup released {released:.0f}MB. OK."
+                        "[Memory] Execution: +%.0fMB total, "
+                        "cleanup released %.0fMB. OK.",
+                        delta,
+                        released,
                     )
 
     return execution_id

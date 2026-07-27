@@ -1,6 +1,6 @@
 import type { Node, Edge } from '@xyflow/react';
 
-// Deprecated legacy wire type. Runtime UI no longer uses progress bars.
+// Legacy node-level progress classification retained for wire compatibility.
 export type ProgressType = 'chunk_count' | 'state_only' | 'stage_based';
 
 export type RunState = 'ready' | 'submitted' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -17,6 +17,30 @@ export type ExecutionPhase =
 
 export type WebSocketStatus = 'connected' | 'reconnecting' | 'disconnected';
 
+export type ExecutionMode = 'full_graph' | 'window';
+
+export type ExecutionConfig =
+  | { mode: 'full_graph' }
+  | { mode: 'window'; windowShape: number[] };
+
+export type WindowProgressStatus = 'running' | 'finalizing';
+
+export interface WindowExecutionProgress {
+  currentWindow: number;
+  completedWindows: number;
+  totalWindows: number;
+  progress: number;
+  windowStatus: WindowProgressStatus;
+  message: string;
+}
+
+export interface ExecutionPreflightResponse {
+  windowable: boolean;
+  output_shape?: number[] | null;
+  ndim?: number | null;
+  reason?: string | null;
+}
+
 export interface NodeRuntimeData {
   runState?: RunState;
   waitingFor?: string[];
@@ -31,6 +55,7 @@ export interface ExecutionRuntimeState {
   finishedAt: number | null;
   totalNodes: number;
   lastError: string | null;
+  windowProgress: WindowExecutionProgress | null;
 }
 
 export interface NodeInputConfig {
@@ -136,6 +161,7 @@ export type WSMessageType =
   | 'execution_started'
   | 'execution_finished'
   | 'execution_snapshot'
+  | 'window_progress'
   | 'execution_control_ack'
   | 'subscribed'
   | 'ping'
@@ -151,7 +177,7 @@ export interface WSMessage {
   waitingFor?: string[];
   device?: string;
 
-  // Deprecated legacy progress-bar wire fields. Incoming values are ignored.
+  // Node-level progress fields retained for backward compatibility.
   progress?: number | null;
   progressType?: ProgressType;
   progressRole?: string;
@@ -166,6 +192,11 @@ export interface WSMessage {
   finishedAt?: number;
   nodeCount?: number;
   logCount?: number;
+  currentWindow?: number;
+  completedWindows?: number;
+  totalWindows?: number;
+  windowStatus?: WindowProgressStatus;
+  windowProgress?: WindowExecutionProgress | null;
   action?: string;
 }
 
@@ -179,7 +210,7 @@ export interface Workflow {
 
 export interface LogEntry {
   id: string;
-  timestamp: string;
+  timestamp: number;
   type: 'info' | 'success' | 'error' | 'warning';
   message: string;
 }

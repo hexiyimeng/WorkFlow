@@ -90,7 +90,7 @@ export default function Header() {
     dashboardUrl,
     isReloadingNodes,
     executionState,
-    isExecuting, isExecutionLocked, addLog,
+    isExecuting, isPreflighting, isExecutionLocked, addLog,
   } = useFlow();
 
   const reactFlowInstance = useReactFlow();
@@ -330,8 +330,15 @@ export default function Header() {
             Stop
           </Button>
         ) : (
-          <Button variant="primary" size="sm" onClick={runFlow} icon={<RunIcon />}>
-            Run
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => { void runFlow(); }}
+            icon={<RunIcon />}
+            loading={isPreflighting}
+            disabled={isExecutionLocked}
+          >
+            {isPreflighting ? 'Checking...' : 'Run'}
           </Button>
         )}
       </div>

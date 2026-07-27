@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+from itertools import islice
 import logging
 import os
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
@@ -439,9 +440,12 @@ class BaseNode:
 
         runtime = raw_inputs.get("_runtime")
         if not isinstance(runtime, NodeRuntime):
+            runtime_data = runtime if isinstance(runtime, Mapping) else {}
             runtime = NodeRuntime(
-                node_id=raw_inputs.get("_node_id"),
-                execution_id=raw_inputs.get("_execution_id"),
+                node_id=runtime_data.get("node_id", raw_inputs.get("_node_id")),
+                execution_id=runtime_data.get("execution_id", raw_inputs.get("_execution_id")),
+                is_preflight=bool(runtime_data.get("is_preflight", False)),
+                is_resuming=bool(runtime_data.get("is_resuming", False)),
             )
         undeclared_inputs = {
             key: value
@@ -603,21 +607,16 @@ class BlockwiseInputPlanner:
     ) -> dict[str, tuple[str, ...] | None]:
         axes_decl = getattr(type(node), "ARRAY_AXES", None)
         axes_by_ndim_decl = getattr(type(node), "ARRAY_AXES_BY_NDIM", None)
-        existing_axes = getattr(node, "_axes_by_name", {}) or {}
         result: dict[str, tuple[str, ...] | None] = {}
 
         for name in ordered_names:
-            axes = ChunkPlanner.normalize_axes(existing_axes.get(name))
-            if axes is None:
-                axes_resolver = getattr(node, f"_axes_for_{name}", None)
-                if callable(axes_resolver):
-                    axes = ChunkPlanner.normalize_axes(axes_resolver(invocation.inputs[name]))
             arr = invocation.inputs.get(name)
             ndim = int(arr.ndim) if arr is not None and hasattr(arr, "ndim") else None
             ndim_mapping = axes_by_ndim_decl
             if isinstance(axes_by_ndim_decl, Mapping) and name in axes_by_ndim_decl:
                 ndim_mapping = axes_by_ndim_decl.get(name)
-            if axes is None and isinstance(ndim_mapping, Mapping) and ndim is not None:
+            axes = None
+            if isinstance(ndim_mapping, Mapping) and ndim is not None:
                 axes = ChunkPlanner.normalize_axes(ndim_mapping.get(ndim))
             result[name] = axes
 
@@ -1190,6 +1189,10 @@ class ProcessBlockBinder:
 class BaseDaskArrayMapNode(BaseDaskNode):
     """Shared base for Dask Array nodes backed by map_blocks or map_overlap."""
 
+    # Framework-managed map nodes build lazy Dask collections during execute();
+    # their potentially side-effecting preprocess hook is skipped in preflight.
+    PREFLIGHT_SAFE = True
+
     CATEGORY = "WorkFlow/Dask"
     DISPLAY_NAME = "Dask Array Map Node"
 
@@ -1231,24 +1234,31 @@ class BaseDaskArrayMapNode(BaseDaskNode):
         self._axes_by_name = dict(input_plan.axes_by_name)
         primary = input_plan.array_inputs[input_plan.primary_name]
 
-        preprocess_state = self._call_preprocess(
-            primary,
-            array_inputs=input_plan.array_inputs,
-            params=dict(input_plan.params),
-            runtime=invocation.runtime,
-        )
-        if preprocess_state is None:
+        if invocation.runtime.is_preflight:
+            # Preflight only needs lazy collection metadata.  In particular,
+            # writer preprocess hooks may create or replace external outputs,
+            # so they must never run while inspecting whether a graph is
+            # windowable.
             preprocess_state = {}
-        if not isinstance(preprocess_state, dict):
-            raise TypeError(
-                f"{type(self).__name__}.preprocess() must return dict or None, "
-                f"got {type(preprocess_state).__name__}."
+        else:
+            preprocess_state = self._call_preprocess(
+                primary,
+                array_inputs=input_plan.array_inputs,
+                params=dict(input_plan.params),
+                runtime=invocation.runtime,
             )
-        preprocess_state = dict(preprocess_state)
-        preprocess_state.setdefault("axes_by_name", dict(input_plan.axes_by_name))
-        primary_axes = input_plan.axes_by_name.get(input_plan.primary_name)
-        if primary_axes is not None:
-            preprocess_state.setdefault("axes", primary_axes)
+            if preprocess_state is None:
+                preprocess_state = {}
+            if not isinstance(preprocess_state, dict):
+                raise TypeError(
+                    f"{type(self).__name__}.preprocess() must return dict or None, "
+                    f"got {type(preprocess_state).__name__}."
+                )
+            preprocess_state = dict(preprocess_state)
+            preprocess_state.setdefault("axes_by_name", dict(input_plan.axes_by_name))
+            primary_axes = input_plan.axes_by_name.get(input_plan.primary_name)
+            if primary_axes is not None:
+                preprocess_state.setdefault("axes", primary_axes)
         self._preprocess_state = dict(preprocess_state)
 
         output_spec = output_resolver.resolve(
@@ -1294,7 +1304,12 @@ class BaseDaskArrayMapNode(BaseDaskNode):
 
     def _call_preprocess(self, primary, *, array_inputs: Mapping[str, Any], params: dict, runtime: NodeRuntime):
         preprocess = getattr(self, "preprocess")
-        runtime_dict = {"node_id": runtime.node_id, "execution_id": runtime.execution_id}
+        runtime_dict = {
+            "node_id": runtime.node_id,
+            "execution_id": runtime.execution_id,
+            "is_preflight": runtime.is_preflight,
+            "is_resuming": runtime.is_resuming,
+        }
         try:
             sig = inspect.signature(preprocess)
         except (TypeError, ValueError):
@@ -1310,16 +1325,29 @@ class BaseDaskArrayMapNode(BaseDaskNode):
         return str(return_types[0])
 
     def _log_graph_debug(self, result: Any, runtime: NodeRuntime) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         try:
-            graph_keys = list(result.__dask_graph__().keys())
-            sample_keys = [str(k) for k in graph_keys[:2]]
+            graph = result.__dask_graph__()
+            layers = getattr(graph, "layers", None)
+            layer_count = len(layers) if isinstance(layers, Mapping) else None
+            layer_sample = (
+                tuple(str(name) for name in islice(layers, 2))
+                if isinstance(layers, Mapping)
+                else ()
+            )
             logger.debug(
-                "[%s] %s[%s] graph tasks: count=%s sample=%s",
+                "[%s] %s[%s] lazy graph: graph_type=%s layers=%s "
+                "layer_sample=%s shape=%s dtype=%s numblocks=%s",
                 self.DASK_API or "dask",
                 type(self).__name__,
                 runtime.node_id,
-                len(graph_keys),
-                sample_keys,
+                type(graph).__name__,
+                layer_count,
+                layer_sample,
+                tuple(result.shape),
+                result.dtype,
+                tuple(result.numblocks),
             )
         except Exception:
             pass

@@ -118,6 +118,77 @@ def _create_nested_dataset(group, dataset_path: str, *, shape, chunks, dtype, co
     )
 
 
+def _validate_existing_store(
+    *,
+    output_path: str,
+    store_kind: str,
+    dataset_path: str,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    dtype: np.dtype,
+) -> None:
+    """Open a resumed target without mutating it and verify its array contract."""
+    import zarr
+
+    path = Path(output_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot resume ZarrWriter because the output store does not exist: {path}"
+        )
+
+    if store_kind == "array":
+        try:
+            target = zarr.open(str(path), mode="r+")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot resume ZarrWriter because {path} is not a readable Zarr array."
+            ) from exc
+        if not all(hasattr(target, field) for field in ("shape", "chunks", "dtype")):
+            raise ValueError(
+                f"Cannot resume ZarrWriter: expected an array store at {path}, "
+                f"but found {type(target).__name__}."
+            )
+    elif store_kind == "ome_zarr":
+        try:
+            group = zarr.open_group(str(path), mode="r+")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot resume ZarrWriter because {path} is not a readable Zarr group."
+            ) from exc
+        try:
+            target = group[dataset_path]
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                f"Cannot resume ZarrWriter because dataset path {dataset_path!r} "
+                f"does not exist in {path}."
+            ) from exc
+        if not all(hasattr(target, field) for field in ("shape", "chunks", "dtype")):
+            raise ValueError(
+                f"Cannot resume ZarrWriter: {dataset_path!r} in {path} is not a Zarr array."
+            )
+    else:
+        raise ValueError(f"store_kind must be 'array' or 'ome_zarr', got {store_kind!r}.")
+
+    expected_shape = tuple(int(x) for x in shape)
+    expected_chunks = tuple(int(x) for x in chunks)
+    expected_dtype = np.dtype(dtype)
+    actual_shape = tuple(int(x) for x in target.shape)
+    actual_chunks = tuple(int(x) for x in target.chunks)
+    actual_dtype = np.dtype(target.dtype)
+    mismatches = []
+    if actual_shape != expected_shape:
+        mismatches.append(f"shape={actual_shape}, expected={expected_shape}")
+    if actual_chunks != expected_chunks:
+        mismatches.append(f"chunks={actual_chunks}, expected={expected_chunks}")
+    if actual_dtype != expected_dtype:
+        mismatches.append(f"dtype={actual_dtype}, expected={expected_dtype}")
+    if mismatches:
+        raise ValueError(
+            f"Cannot resume ZarrWriter because the existing target at {path} is incompatible: "
+            + "; ".join(mismatches)
+        )
+
+
 def _prepare_store(
     *,
     output_path: str,
@@ -131,10 +202,22 @@ def _prepare_store(
     compressor_name: str,
     overwrite: bool,
     write_metadata: bool,
+    is_resuming: bool = False,
 ) -> None:
     import zarr
 
     path = Path(output_path)
+    if is_resuming:
+        _validate_existing_store(
+            output_path=output_path,
+            store_kind=store_kind,
+            dataset_path=dataset_path,
+            shape=shape,
+            chunks=chunks,
+            dtype=dtype,
+        )
+        return
+
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         if not overwrite:
@@ -285,6 +368,7 @@ class ZarrWriter(BaseMapBlocksNode):
         if dask_arr is None:
             raise ValueError("ZarrWriter expects an input Dask Array, got None.")
         params = params or {}
+        runtime = runtime or {}
         output_path = _normalize_output_path(params.get("output_path", "output.zarr"))
         store_kind = str(params.get("store_kind") or "array").strip().lower()
         dataset_path = _normalize_dataset_path(params.get("dataset_path", "0"))
@@ -315,6 +399,7 @@ class ZarrWriter(BaseMapBlocksNode):
             compressor_name=str(params.get("compressor_name") or "default"),
             overwrite=bool(params.get("overwrite", True)),
             write_metadata=bool(params.get("write_metadata", True)),
+            is_resuming=bool(runtime.get("is_resuming", False)),
         )
         return {
             "output_path": output_path,

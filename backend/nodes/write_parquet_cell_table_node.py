@@ -473,11 +473,24 @@ class WriteParquetCellTable(BaseMapBlocksNode):
             raise ValueError(f"WriteParquetCellTable requires a uint32 or uint64 mask, got {mask_dtype}.")
 
         params = params or {}
+        runtime = runtime or {}
         output_dir = _normalize_path(params.get("output_dir", "cells"), name="output_dir")
         output_path = Path(output_dir)
-        if output_path.exists() and bool(params.get("overwrite", True)):
-            shutil.rmtree(output_path)
-        output_path.mkdir(parents=True, exist_ok=True)
+        if bool(runtime.get("is_resuming", False)):
+            if not output_path.exists():
+                raise FileNotFoundError(
+                    "Cannot resume WriteParquetCellTable because the output directory "
+                    f"does not exist: {output_path}"
+                )
+            if not output_path.is_dir():
+                raise NotADirectoryError(
+                    "Cannot resume WriteParquetCellTable because the output target "
+                    f"is not a directory: {output_path}"
+                )
+        else:
+            if output_path.exists() and bool(params.get("overwrite", True)):
+                shutil.rmtree(output_path)
+            output_path.mkdir(parents=True, exist_ok=True)
 
         total_blocks = int(np.prod(tuple(int(x) for x in mask.numblocks), dtype=np.int64)) if mask.numblocks else 1
         _, ordinal_bits = _local_id_config(total_blocks)

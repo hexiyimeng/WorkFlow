@@ -1,6 +1,16 @@
 import React from 'react';
 import type { Node, Edge, OnNodesChange, OnEdgesChange, OnConnectStart, OnConnectEnd, Connection } from '@xyflow/react';
-import type { NodeSpec, Workflow, LogEntry, NodeData, ExecutionRuntimeState, WebSocketStatus, PluginDiagnostics } from '../types';
+import type {
+  NodeSpec,
+  Workflow,
+  LogEntry,
+  NodeData,
+  ExecutionRuntimeState,
+  WebSocketStatus,
+  PluginDiagnostics,
+  ExecutionConfig,
+  ExecutionPreflightResponse,
+} from '../types';
 
 export interface FlowContextType {
   // === State ===
@@ -22,6 +32,8 @@ export interface FlowContextType {
   currentExecutionId: string | null;
   isExecuting: boolean;        // phase in ['graph_building','submitted','running','cancelling']
   isCancelling: boolean;       // phase === 'cancelling'
+  isPreflighting: boolean;
+  executionPreflight: ExecutionPreflightResponse | null;
   isExecutionLocked: boolean;   // 运行中是否禁止修改（值、连线、增删节点）
   // Legacy
   isConnected: boolean;        // 保持兼容，等价于 websocketStatus === 'connected'
@@ -49,7 +61,9 @@ export interface FlowContextType {
   updateNodeData: (id: string, data: Partial<NodeData>) => void;
 
   // === Execution ===
-  runFlow: () => void;
+  runFlow: () => Promise<void>;
+  confirmExecution: (config: ExecutionConfig) => void;
+  cancelExecutionDialog: () => void;
   stopFlow: () => void;
   reloadNodes: () => Promise<void>;
   clearLogs: () => void;

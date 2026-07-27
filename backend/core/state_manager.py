@@ -37,6 +37,7 @@ class ExecutionSession:
     task: Optional[asyncio.Task] = None
     status: str = ExecutionStatus.RUNNING
     node_states: Dict[str, Dict] = field(default_factory=dict)
+    window_progress: Optional[Dict] = None
     logs: deque = field(default_factory=lambda: deque(maxlen=100))
     subscribers: Set = field(default_factory=set)
     created_at: float = field(default_factory=time.time)
@@ -280,6 +281,37 @@ class GlobalStateManager:
             state["progressRole"] = progress_role
         session.node_states[node_id] = state
 
+    def update_window_progress(
+        self,
+        execution_id: str,
+        *,
+        current_window: int,
+        completed_windows: int,
+        total_windows: int,
+        progress: float,
+        window_status: str,
+        message: str,
+    ) -> dict | None:
+        """Store execution-level Window progress and return its wire payload."""
+        session = self.executions.get(execution_id)
+        if not session:
+            return None
+
+        state = {
+            "currentWindow": current_window,
+            "completedWindows": completed_windows,
+            "totalWindows": total_windows,
+            "progress": progress,
+            "windowStatus": window_status,
+            "message": message,
+        }
+        session.window_progress = state
+        return {
+            "type": "window_progress",
+            "executionId": execution_id,
+            **state,
+        }
+
     def add_log(self, message: str, level: str = "info", execution_id: str = None) -> dict:
         entry = {"type": "log", "message": message}
         if level in ["error", "success", "warning"]:
@@ -324,7 +356,7 @@ class GlobalStateManager:
         if not session:
             return None
 
-        return {
+        snapshot = {
             "type": "execution_snapshot",
             "executionId": execution_id,
             "status": session.status,
@@ -333,6 +365,9 @@ class GlobalStateManager:
             "nodeCount": len(session.node_states),
             "logCount": len(session.logs),
         }
+        if session.window_progress is not None:
+            snapshot["windowProgress"] = dict(session.window_progress)
+        return snapshot
 
     async def sync_history_to_client(self, websocket, execution_id: str):
         session = self.executions.get(execution_id)
@@ -351,6 +386,15 @@ class GlobalStateManager:
                     await websocket.send_json(log_entry)
                 else:
                     return
+
+            if session.window_progress is not None:
+                if websocket.client_state != WebSocketState.CONNECTED:
+                    return
+                await websocket.send_json({
+                    "type": "window_progress",
+                    "executionId": execution_id,
+                    **session.window_progress,
+                })
 
             for node_id, state in session.node_states.items():
                 if websocket.client_state != WebSocketState.CONNECTED:
@@ -462,6 +506,7 @@ class GlobalStateManager:
             session = self.executions.get(execution_id)
             if session:
                 session.node_states.clear()
+                session.window_progress = None
                 session.logs.clear()
             self.clear_active_execution(execution_id)
         else:

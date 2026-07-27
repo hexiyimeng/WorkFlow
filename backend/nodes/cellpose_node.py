@@ -9,7 +9,7 @@ import numpy as np
 
 from core.model_registry import list_models
 from core.registry import register_node
-from nodes.base import BaseMapOverlapNode, ChunkPlanner
+from nodes.base import BaseMapOverlapNode
 
 
 def create_cellpose_model(model_ref: str, device: str):
@@ -208,14 +208,36 @@ def cellpose_block(
             mask = np.asarray(result[0] if isinstance(result, tuple) else result)
         else:
             eval_kwargs["do_3D"] = False
-            mask = np.zeros(segment_for_model.shape[:3], dtype=np.uint32)
-            for z_index in range(int(segment_for_model.shape[0])):
-                result = model.eval(
-                    np.asarray(segment_for_model[z_index]),
-                    **eval_kwargs,
+            # With do_3D disabled, Cellpose treats a 4D array as an NHWC batch
+            # of independent 2D images.  Make the channel dimension explicit
+            # for grayscale stacks so all Z planes share one network call and
+            # ``batch_size`` can batch work across planes.  Cellpose's explicit
+            # channel_axis path is for a single image, so let its 4D batch path
+            # consume the already channels-last array.
+            eval_kwargs.pop("channel_axis", None)
+            if bool(normalize):
+                eval_kwargs["normalize"] = {
+                    "normalize": True,
+                    "norm3D": False,
+                }
+            plane_batch = (
+                segment_for_model
+                if has_channels
+                else segment_for_model[..., np.newaxis]
+            )
+            result = model.eval(np.asarray(plane_batch), **eval_kwargs)
+            mask = np.asarray(
+                result[0] if isinstance(result, tuple) else result,
+                dtype=np.uint32,
+            )
+            expected_shape = tuple(int(size) for size in segment_for_model.shape[:3])
+            if mask.ndim == 2 and expected_shape[0] == 1:
+                mask = mask[np.newaxis, ...]
+            if mask.shape != expected_shape:
+                raise ValueError(
+                    "Cellpose 2D plane batch returned mask shape "
+                    f"{mask.shape}, expected {expected_shape}."
                 )
-                plane_mask = result[0] if isinstance(result, tuple) else result
-                mask[z_index] = np.asarray(plane_mask, dtype=np.uint32)
 
         inverse_order = [
             segment_spatial_axes.index(axis)
@@ -278,33 +300,7 @@ class Cellpose(BaseMapOverlapNode):
                 "do_3d": (["auto", "true", "false"], {"default": "auto"}),
                 "normalize": ("BOOLEAN", {"default": True}),
             },
-            "optional": {
-                "axes": ("STRING", {"default": "", "multiline": False}),
-                "image_metadata": ("DICT",),
-            },
         }
 
     RETURN_TYPES = ("DASK_ARRAY[uint32]",)
     RETURN_NAMES = ("mask",)
-
-    def preprocess(
-        self,
-        dask_arr=None,
-        array_inputs: dict | None = None,
-        params: dict | None = None,
-        runtime: dict | None = None,
-    ) -> dict[str, Any] | None:
-        image = (array_inputs or {}).get("image", dask_arr)
-        params = params or {}
-        axes = ChunkPlanner.normalize_axes(params.get("axes"))
-        metadata = params.get("image_metadata")
-        if axes is None and isinstance(metadata, dict):
-            axes = ChunkPlanner.normalize_axes(metadata.get("axes"))
-        if axes is None:
-            return None
-        axes = tuple(str(axis).upper() for axis in axes)
-        if image is not None and len(axes) != int(image.ndim):
-            raise ValueError(f"Cellpose axes {axes!r} length does not match image ndim={image.ndim}.")
-        axes_by_name = {**(getattr(self, "_axes_by_name", {}) or {}), "image": axes}
-        self._axes_by_name = axes_by_name
-        return {"axes": axes, "axes_by_name": dict(axes_by_name)}

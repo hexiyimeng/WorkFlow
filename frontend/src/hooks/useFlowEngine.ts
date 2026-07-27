@@ -1,7 +1,23 @@
 ﻿import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
 import type { Node, Edge } from '@xyflow/react';
-import type { NodeData, WSMessage, NodeSpec, LogEntry, ExecutionRuntimeState, ExecutionPhase, WebSocketStatus, RunState, PluginDiagnostics, ReloadNodesResponse } from '../types';
+import type {
+  NodeData,
+  WSMessage,
+  NodeSpec,
+  LogEntry,
+  ExecutionRuntimeState,
+  ExecutionPhase,
+  WebSocketStatus,
+  RunState,
+  PluginDiagnostics,
+  ReloadNodesResponse,
+  ExecutionConfig,
+  ExecutionPreflightResponse,
+  WindowExecutionProgress,
+} from '../types';
 import { hydrateNodesWithLatestSpecs, serializeNodesForStorage } from '../utils/workflowPersistence';
+import { isValidOutputShape, isValidWindowShape } from '../utils/executionConfig';
+import { normalizeWindowProgress, parseLegacyWindowProgress } from '../utils/windowProgress';
 
 // === Reset helper ===
 const resetRuntimeNodeState = (
@@ -19,6 +35,7 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || (isDev ? 'http://localhost
 const WS_BASE = import.meta.env.VITE_WS_URL || (isDev
   ? 'ws://localhost:8000'
   : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`);
+const PREFLIGHT_TIMEOUT_MS = 60_000;
 
 const normalizeDashboardUrl = (url?: string | null): string => {
   if (!url) return '';
@@ -49,10 +66,33 @@ const fetchJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   return data;
 };
 
+type ExecutionGraph = Record<string, {
+  type: string;
+  inputs: Record<string, unknown>;
+}>;
+
+const buildExecutionGraph = (
+  nodes: Node<NodeData>[],
+  edges: Edge[],
+): ExecutionGraph => {
+  const graph: ExecutionGraph = {};
+  nodes.forEach(node => {
+    const inputs = { ...node.data.values };
+    edges.forEach(edge => {
+      if (edge.target === node.id && edge.targetHandle) {
+        inputs[edge.targetHandle] = [edge.source, parseInt(edge.sourceHandle || '0')];
+      }
+    });
+    graph[node.id] = { type: node.data.opType, inputs };
+  });
+  return graph;
+};
+
 // === Execution state reducer ===
 type ExecutionAction =
   | { type: 'START'; executionId: string }
   | { type: 'SET_PHASE'; phase: ExecutionPhase }
+  | { type: 'SET_WINDOW_PROGRESS'; progress: WindowExecutionProgress }
   | { type: 'SET_SNAPSHOT'; snapshot: Partial<ExecutionRuntimeState> }
   | { type: 'FINISH'; status: 'succeeded' | 'failed' | 'cancelled'; message?: string }
   | { type: 'RESET' };
@@ -69,6 +109,7 @@ const initialExecutionState: ExecutionRuntimeState = {
   finishedAt: null,
   totalNodes: 0,
   lastError: null,
+  windowProgress: null,
 };
 
 function executionReducer(state: ExecutionRuntimeState, action: ExecutionAction): ExecutionRuntimeState {
@@ -81,9 +122,17 @@ function executionReducer(state: ExecutionRuntimeState, action: ExecutionAction)
         startedAt: Date.now(),
         finishedAt: null,
         lastError: null,
+        windowProgress: null,
       };
     case 'SET_PHASE':
       return { ...state, phase: action.phase };
+    case 'SET_WINDOW_PROGRESS':
+      if (isTerminalStatus(state.phase)) return state;
+      return {
+        ...state,
+        phase: state.phase === 'cancelling' ? 'cancelling' : 'running',
+        windowProgress: action.progress,
+      };
     case 'SET_SNAPSHOT':
       return { ...state, ...action.snapshot };
     case 'FINISH':
@@ -118,6 +167,8 @@ export const useFlowEngine = (
   const [pluginStatusError, setPluginStatusError] = useState<string | null>(null);
   const [dashboardUrl, setDashboardUrl] = useState<string>('');
   const [isReloadingNodes, setIsReloadingNodes] = useState(false);
+  const [isPreflighting, setIsPreflighting] = useState(false);
+  const [executionPreflight, setExecutionPreflight] = useState<ExecutionPreflightResponse | null>(null);
 
   // --- Execution state (reducer) ---
   const [executionState, dispatchExecution] = useReducer(executionReducer, initialExecutionState);
@@ -130,6 +181,9 @@ export const useFlowEngine = (
   const finishedRef = useRef(false);
   const restoredExecutionRef = useRef(false); // tracks if current session was restored via subscribe
   const isSubmittingRunRef = useRef(false); // prevents double-submit
+  const pendingGraphRef = useRef<ExecutionGraph | null>(null);
+  const preflightRequestIdRef = useRef(0);
+  const preflightAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     executionStateRef.current = executionState;
@@ -356,7 +410,8 @@ export const useFlowEngine = (
           // Generic error: reset execution state and node runtime state so user can retry.
           finishedRef.current = true;
           isSubmittingRunRef.current = false;
-          dispatchExecution({ type: 'SET_PHASE', phase: 'idle' });
+          sessionStorage.removeItem('WorkFlow_execution_id');
+          dispatchExecution({ type: 'RESET' });
           addLog(msgText || 'Unknown Error', 'error');
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
           resetRuntimeNodeState(setNodes);
@@ -378,7 +433,8 @@ export const useFlowEngine = (
         if (msgType === 'execution_rejected') {
           isSubmittingRunRef.current = false;
           finishedRef.current = true;
-          dispatchExecution({ type: 'SET_PHASE', phase: 'idle' });
+          sessionStorage.removeItem('WorkFlow_execution_id');
+          dispatchExecution({ type: 'RESET' });
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
           resetRuntimeNodeState(setNodes);
           addLog(msg.message || 'Execution rejected: another workflow is already running.', 'warning');
@@ -387,6 +443,7 @@ export const useFlowEngine = (
 
         // execution_snapshot: restore execution state on reconnect
         if (msgType === 'execution_snapshot') {
+          isSubmittingRunRef.current = false;
           const snapshotPhase =
             msg.status === 'running' ? 'running'
             : msg.status === 'cancelling' ? 'cancelling'
@@ -405,6 +462,7 @@ export const useFlowEngine = (
               startedAt: msg.createdAt ?? null,
               finishedAt: msg.finishedAt ?? null,
               totalNodes: msg.nodeCount ?? 0,
+              windowProgress: normalizeWindowProgress(msg.windowProgress),
             }
           });
 
@@ -423,9 +481,27 @@ export const useFlowEngine = (
           return;
         }
 
+        if (msgType === 'window_progress') {
+          const windowProgress = normalizeWindowProgress(msg);
+          if (windowProgress) {
+            dispatchExecution({ type: 'SET_WINDOW_PROGRESS', progress: windowProgress });
+          }
+          return;
+        }
+
         // node_status messages carry simple node status updates.
-        // Also handle legacy "progress" messages as backward-compatible node_status.
+        // Legacy progress remains a node status and also restores Window progress
+        // for executions started by a backend that predates window_progress.
         if (msgType === 'node_status' || msgType === 'progress') {
+          if (msgType === 'progress') {
+            const legacyWindowProgress = parseLegacyWindowProgress(msg.message);
+            if (legacyWindowProgress) {
+              dispatchExecution({
+                type: 'SET_WINDOW_PROGRESS',
+                progress: legacyWindowProgress,
+              });
+            }
+          }
           if (!msg.taskId) return;
           setNodes(nds => nds.map(n => {
             if (n.id !== msg.taskId) return n;
@@ -551,6 +627,9 @@ export const useFlowEngine = (
     return () => {
       console.log('[useFlowEngine] connect effect cleanup (unmount)');
       mountedRef.current = false;
+      preflightRequestIdRef.current += 1;
+      preflightAbortRef.current?.abort();
+      preflightAbortRef.current = null;
       clearReconnectTimer();
       if (wsRef.current) {
         wsRef.current.close(1000, 'component unmount');
@@ -561,13 +640,10 @@ export const useFlowEngine = (
   }, []); // <-- 閸忔娊鏁敍姘涧閺堝瀵曟潪?閸楁瓕娴囩憴锕€褰傞敍灞炬￥閸忔湹绮笟婵婄
 
   // =========================================================
-  // 閹笛嗩攽 (Run)
+  // Execution preflight and confirmed Run
   // =========================================================
-  const runFlow = useCallback(() => {
-    if (isSubmittingRunRef.current) return;
-
-    // Reset finished flag so a re-run is always possible after any terminal state.
-    finishedRef.current = false;
+  const runFlow = useCallback(async () => {
+    if (isSubmittingRunRef.current || isPreflighting || executionPreflight) return;
 
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       addLog('Server not connected!', 'error');
@@ -582,44 +658,176 @@ export const useFlowEngine = (
       return;
     }
 
-    const executionId = crypto.randomUUID();
+    const graph = buildExecutionGraph(nodes, edges);
+    const requestId = preflightRequestIdRef.current + 1;
+    preflightRequestIdRef.current = requestId;
+    preflightAbortRef.current?.abort();
+    const controller = new AbortController();
+    preflightAbortRef.current = controller;
+    pendingGraphRef.current = graph;
+    setIsPreflighting(true);
+    let didTimeout = false;
+    const timeoutId = window.setTimeout(() => {
+      didTimeout = true;
+      controller.abort();
+    }, PREFLIGHT_TIMEOUT_MS);
 
-    const graph: Record<string, { type: string; inputs: Record<string, unknown> }> = {};
-    nodes.forEach(node => {
-      const inputs = { ...node.data.values };
-      edges.forEach(edge => {
-        if (edge.target === node.id && edge.targetHandle) {
-          inputs[edge.targetHandle] = [edge.source, parseInt(edge.sourceHandle || '0')];
-        }
+    try {
+      const preflight = await fetchJson<ExecutionPreflightResponse>('/execution/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ graph }),
+        signal: controller.signal,
       });
-      graph[node.id] = { type: node.data.opType, inputs };
-    });
 
+      if (!mountedRef.current || controller.signal.aborted || preflightRequestIdRef.current !== requestId) {
+        return;
+      }
+      if (!preflight || typeof preflight.windowable !== 'boolean') {
+        throw new Error('Invalid execution preflight response');
+      }
+      let normalizedPreflight = preflight;
+      const shapeIsValid = preflight.output_shape == null
+        || isValidOutputShape(preflight.output_shape);
+      const windowMetadataComplete = (
+        preflight.windowable
+        && shapeIsValid
+        && preflight.output_shape != null
+        && preflight.output_shape.length > 0
+        && (preflight.ndim == null || preflight.ndim === preflight.output_shape.length)
+      );
+      if (!shapeIsValid || (preflight.windowable && !windowMetadataComplete)) {
+        normalizedPreflight = {
+          windowable: false,
+          output_shape: null,
+          ndim: null,
+          reason: 'Window metadata could not be represented safely in this browser. Full Graph Execution remains available.',
+        };
+      }
+
+      setExecutionPreflight(normalizedPreflight);
+    } catch (err) {
+      if (preflightRequestIdRef.current !== requestId) return;
+      if (controller.signal.aborted && !didTimeout) return;
+      pendingGraphRef.current = null;
+      addLog(
+        didTimeout
+          ? 'Execution preflight timed out after 60 seconds. Please try again.'
+          : `Execution preflight failed: ${(err as Error).message}`,
+        'error',
+      );
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (preflightRequestIdRef.current === requestId) {
+        preflightAbortRef.current = null;
+        setIsPreflighting(false);
+      }
+    }
+  }, [
+    nodes,
+    edges,
+    addLog,
+    websocketStatus,
+    executionState.phase,
+    isPreflighting,
+    executionPreflight,
+  ]);
+
+  const cancelExecutionDialog = useCallback(() => {
+    preflightRequestIdRef.current += 1;
+    preflightAbortRef.current?.abort();
+    preflightAbortRef.current = null;
+    pendingGraphRef.current = null;
+    setIsPreflighting(false);
+    setExecutionPreflight(null);
+  }, []);
+
+  const confirmExecution = useCallback((executionConfig: ExecutionConfig) => {
+    if (isSubmittingRunRef.current) return;
+
+    const graph = pendingGraphRef.current;
+    const preflight = executionPreflight;
+    if (!graph || !preflight) {
+      addLog('Execution preflight has expired. Please click Run again.', 'warning');
+      cancelExecutionDialog();
+      return;
+    }
+
+    let normalizedConfig: ExecutionConfig = { mode: 'full_graph' };
+    if (executionConfig.mode === 'window') {
+      const outputShape = preflight.output_shape ?? [];
+      const windowShape = [...executionConfig.windowShape];
+      if (!preflight.windowable) {
+        addLog(preflight.reason || 'Window execution is unavailable for this workflow.', 'warning');
+        return;
+      }
+      if (!isValidWindowShape(outputShape, windowShape)) {
+        addLog('Window shape must contain one positive integer per output dimension.', 'warning');
+        return;
+      }
+      normalizedConfig = { mode: 'window', windowShape };
+    }
+
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || websocketStatus !== 'connected') {
+      addLog('Server not connected!', 'error');
+      return;
+    }
+    if (executionState.phase === 'graph_building' || executionState.phase === 'submitted' ||
+        executionState.phase === 'running' || executionState.phase === 'cancelling') {
+      addLog('Another execution is already active.', 'warning');
+      return;
+    }
+
+    const executionId = crypto.randomUUID();
+    finishedRef.current = false;
     isSubmittingRunRef.current = true;
-    ;
+    pendingGraphRef.current = null;
+    setExecutionPreflight(null);
+    sessionStorage.setItem('WorkFlow_execution_id', executionId);
+    dispatchExecution({ type: 'START', executionId });
 
-    setEdges(eds => eds.map(e => ({ ...e, animated: true })));
-
-    setNodes(nds => nds.map(n => ({
-      ...n,
+    setEdges(currentEdges => currentEdges.map(edge => ({ ...edge, animated: true })));
+    setNodes(currentNodes => currentNodes.map(node => ({
+      ...node,
       data: {
-        ...n.data,
+        ...node.data,
         message: 'Pending...',
         runState: 'ready' as RunState,
         waitingFor: undefined,
         device: undefined,
         executionId,
-      }
+      },
     })));
 
     try {
-      wsRef.current.send(JSON.stringify({ command: 'execute_graph', graph, executionId }));
+      ws.send(JSON.stringify({
+        command: 'execute_graph',
+        graph,
+        executionId,
+        executionConfig: normalizedConfig,
+      }));
       addLog('Executing Workflow...', 'info');
     } catch {
       isSubmittingRunRef.current = false;
+      finishedRef.current = true;
+      sessionStorage.removeItem('WorkFlow_execution_id');
+      dispatchExecution({ type: 'RESET' });
+      pendingGraphRef.current = graph;
+      setExecutionPreflight(preflight);
+      setEdges(currentEdges => currentEdges.map(edge => edge.animated ? { ...edge, animated: false } : edge));
+      resetRuntimeNodeState(setNodes);
       addLog('Failed to send execute command', 'error');
     }
-  }, [nodes, edges, addLog, setEdges, setNodes, websocketStatus, executionState.phase]);
+  }, [
+    addLog,
+    cancelExecutionDialog,
+    executionPreflight,
+    executionState.phase,
+    setEdges,
+    setNodes,
+    websocketStatus,
+  ]);
 
   // =========================================================
   // 閸嬫粍顒?(Stop)
@@ -639,8 +847,12 @@ export const useFlowEngine = (
     pluginStatusError,
     dashboardUrl,
     isReloadingNodes,
+    isPreflighting,
+    executionPreflight,
     executionState,
     runFlow,
+    confirmExecution,
+    cancelExecutionDialog,
     stopFlow,
     reloadNodes,
   };

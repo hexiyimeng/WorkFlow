@@ -10,6 +10,7 @@ from core.plugin_diagnostics import get_plugin_diagnostics
 from core.registry import get_node_info
 from core.state_manager import state_manager
 from services.dask_service import dask_service
+from services.executor import preflight_graph
 from services.plugin_loader import reload_all_plugins
 
 
@@ -40,6 +41,34 @@ async def get_plugin_status():
 async def get_dashboard_url():
     client = dask_service.get_client()
     return {"dashboard_url": _dashboard_url_for_client(client)}
+
+
+@router.post("/execution/preflight")
+async def execution_preflight(payload: dict):
+    """Inspect lazy execution-root metadata without reserving an execution slot."""
+    graph = payload.get("graph") if isinstance(payload, dict) else None
+    if not isinstance(graph, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "windowable": False,
+                "message": "Preflight requires a graph object.",
+            },
+        )
+    try:
+        # Plugin reload replaces the registry in place.  Keep one coherent set
+        # of node classes for the complete lazy metadata build.
+        async with _reload_lock:
+            return await preflight_graph(graph)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "windowable": False,
+                "message": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
 
 
 @router.post("/reload_nodes")

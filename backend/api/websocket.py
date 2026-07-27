@@ -5,6 +5,7 @@ from starlette.websockets import WebSocketState
 
 from core.logger import logger
 from core.state_manager import state_manager, ExecutionStatus
+from core.window_execution import parse_execution_config
 from services.executor import execute_graph
 from services.dask_service import dask_service
 
@@ -65,6 +66,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_json({"type": "error", "message": "Received empty graph"})
                         continue
 
+                    try:
+                        execution_config = parse_execution_config(data.get("executionConfig"))
+                    except ValueError as exc:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": str(exc),
+                        })
+                        continue
+
                     # Generate or use provided execution_id
                     execution_id = data.get("executionId") or uuid.uuid4().hex
 
@@ -100,20 +110,31 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     logger.info(f"Executing graph for {client_ip}, execution_id={execution_id}")
 
-                    # Send executionId to frontend
-                    await websocket.send_json({
-                        "type": "execution_started",
-                        "executionId": execution_id
-                    })
-
-                    # Start execution task and bind the real execute_graph task for cancellation.
-                    execution_task = asyncio.create_task(execute_graph(graph, execution_id))
+                    # Bind the task before acknowledging the run.  If the socket
+                    # drops while the acknowledgement is in flight, the durable
+                    # execution id can still be used to subscribe after reconnect.
+                    execution_task = asyncio.create_task(
+                        execute_graph(graph, execution_id, execution_config)
+                    )
                     if not state_manager.attach_execution_task(execution_id, execution_task):
                         execution_task.cancel()
+                        await asyncio.gather(execution_task, return_exceptions=True)
+                        state_manager.set_execution_status(
+                            execution_id,
+                            ExecutionStatus.FAILED,
+                        )
                         await websocket.send_json({
                             "type": "error",
                             "message": "Failed to bind execution task"
                         })
+                        continue
+
+                    # Send executionId to frontend only after the active session
+                    # owns a cancellable task.
+                    await websocket.send_json({
+                        "type": "execution_started",
+                        "executionId": execution_id
+                    })
 
                 elif command == "stop_execution":
                     # 只停止当前客户端的 execution

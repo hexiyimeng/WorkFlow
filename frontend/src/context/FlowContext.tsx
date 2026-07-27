@@ -27,7 +27,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const logBufferRef = useRef<LogEntry[]>([]);
 
   const addLog = useCallback((message: string, type: 'info' | 'success' | 'error' | 'warning' = 'info') => {
-    logBufferRef.current.push({ id: Date.now().toString() + Math.random(), timestamp: new Date().toLocaleTimeString(), type, message });
+    logBufferRef.current.push({ id: Date.now().toString() + Math.random(), timestamp: Date.now(), type, message });
   }, []);
 
   const clearLogs = useCallback(() => {
@@ -65,8 +65,12 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     pluginStatusError,
     dashboardUrl,
     isReloadingNodes,
+    isPreflighting,
+    executionPreflight,
     executionState,
     runFlow,
+    confirmExecution,
+    cancelExecutionDialog,
     stopFlow,
     reloadNodes,
   } = useFlowEngine(nodes, edges, setNodes, setEdges, addLog);
@@ -91,7 +95,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     || executionState.phase === 'running'
     || executionState.phase === 'cancelling';
   const isCancelling = executionState.phase === 'cancelling';
-  const isExecutionLocked = isExecuting;
+  const isExecutionLocked = isExecuting || isPreflighting || executionPreflight !== null;
   const isConnected = websocketStatus === 'connected';
 
   // ===========================================
@@ -272,10 +276,12 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     currentExecutionId: executionState.executionId,
     isExecuting,
     isCancelling,
+    isPreflighting,
+    executionPreflight,
     isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
     addNode, addNodeAt, updateNodeData,
-    runFlow, stopFlow, reloadNodes, clearLogs, addLog,
+    runFlow, confirmExecution, cancelExecutionDialog, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
     theme, toggleTheme, isConsoleOpen, toggleConsole,
     isValidConnection, undo, redo,
@@ -284,9 +290,9 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }), [
     nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected, logs, workflows, activeWorkflowId,
     theme, isConsoleOpen, connectingType,
-    executionState, websocketStatus, isExecuting, isCancelling, isExecutionLocked,
+    executionState, websocketStatus, isExecuting, isCancelling, isPreflighting, executionPreflight, isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
-    addNode, addNodeAt, updateNodeData, runFlow, stopFlow, reloadNodes, clearLogs, addLog,
+    addNode, addNodeAt, updateNodeData, runFlow, confirmExecution, cancelExecutionDialog, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
     toggleTheme, toggleConsole, isValidConnection, undo, redo,
     onConnectStart, onConnectEnd, handleCopy, handlePaste, handleDelete,

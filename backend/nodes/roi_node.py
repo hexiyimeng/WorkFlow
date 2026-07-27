@@ -34,6 +34,7 @@ class DaskROI:
     should crop by axis name rather than ndim convention.
     """
 
+    PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/DataProcessing"
     DISPLAY_NAME = "ROI Crop"
 

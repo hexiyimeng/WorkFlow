@@ -34,22 +34,6 @@ def _normalize_zarr_path(value: str) -> Path:
     return path
 
 
-def _axis_names_from_ngff_axes(axes: Any, ndim: int) -> tuple[str, ...] | None:
-    if not isinstance(axes, list) or len(axes) != int(ndim):
-        return None
-    names: list[str] = []
-    for axis in axes:
-        if isinstance(axis, dict):
-            name = axis.get("name")
-        else:
-            name = axis
-        text = str(name or "").strip().upper()
-        if not text:
-            return None
-        names.append(text)
-    return tuple(names)
-
-
 def _normalize_axes(value: Any, ndim: int) -> tuple[str, ...]:
     axes = ChunkPlanner.normalize_axes(value)
     if axes is None:
@@ -108,15 +92,7 @@ def _resolve_group_array(group, requested_path: str | None, multiscale_index: in
             "Could not infer an array dataset from the zarr group. "
             "Provide array_path explicitly, for example '0' or 'labels/cells/0'."
         )
-    if selected_multiscale is None and isinstance(multiscales, list):
-        for multiscale in multiscales:
-            for dataset in multiscale.get("datasets", []) if isinstance(multiscale, dict) else []:
-                if isinstance(dataset, dict) and str(dataset.get("path", "")).strip("/") == array_path:
-                    selected_multiscale = multiscale
-                    break
-            if selected_multiscale is not None:
-                break
-    return group[array_path], array_path, selected_multiscale
+    return group[array_path], array_path
 
 
 def _target_chunks_by_axes(
@@ -159,6 +135,7 @@ def _target_chunks_by_axes(
 class OMEZarrReader:
     """Lazy reader for direct Zarr arrays and OME-NGFF multiscale datasets."""
 
+    PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr / OME-Zarr Reader"
 
@@ -207,7 +184,6 @@ class OMEZarrReader:
         import zarr
 
         selected_path = None
-        selected_multiscale = None
         try:
             z_arr = zarr.open_array(str(root_path), mode="r")
             array_store_path = root_path
@@ -215,7 +191,7 @@ class OMEZarrReader:
             logger.info("[ZarrReader] Loaded direct array: %s", root_path)
         except Exception:
             group = zarr.open_group(str(root_path), mode="r")
-            z_arr, selected_path, selected_multiscale = _resolve_group_array(
+            z_arr, selected_path = _resolve_group_array(
                 group,
                 requested_path,
                 int(multiscale_index),
@@ -229,10 +205,7 @@ class OMEZarrReader:
         ndim = int(z_arr.ndim)
         native_chunks = tuple(int(x) for x in (z_arr.chunks or tuple(min(64, size) for size in shape)))
 
-        metadata_axes = None
-        if isinstance(selected_multiscale, dict):
-            metadata_axes = _axis_names_from_ngff_axes(selected_multiscale.get("axes"), ndim)
-        resolved_axes = _normalize_axes(axes or metadata_axes, ndim)
+        resolved_axes = _normalize_axes(axes, ndim)
         target_chunks = _target_chunks_by_axes(
             shape=shape,
             native_chunks=native_chunks,

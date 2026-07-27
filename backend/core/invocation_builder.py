@@ -119,10 +119,18 @@ def build_node_invocation(
     prepared_inputs: Mapping[str, Any],
     node_id: str,
     execution_id: str,
+    *,
+    is_preflight: bool = False,
+    is_resuming: bool = False,
 ) -> NodeInvocation:
     input_defs = get_node_input_defs(node_cls)
     return NodeInvocation(
-        runtime=NodeRuntime(node_id=node_id, execution_id=execution_id),
+        runtime=NodeRuntime(
+            node_id=node_id,
+            execution_id=execution_id,
+            is_preflight=bool(is_preflight),
+            is_resuming=bool(is_resuming),
+        ),
         input_defs=input_defs,
         inputs=dict(prepared_inputs),
     )
