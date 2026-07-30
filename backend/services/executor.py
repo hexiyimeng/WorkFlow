@@ -6,6 +6,7 @@ import uuid
 
 import dask
 import dask.array as da
+import numpy as np
 from dask.base import is_dask_collection
 from distributed import wait as dist_wait
 
@@ -18,7 +19,6 @@ from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
 from core.type_system import can_connect_types, is_dask_array_type
 from core.window_execution import (
-    CHECKPOINT_SCHEMA_VERSION,
     ExecutionConfig,
     WindowCheckpointStore,
     WindowGenerator,
@@ -689,58 +689,6 @@ async def preflight_graph(graph: dict) -> dict:
         node_instances.clear()
 
 
-def _new_resume_state(
-    *,
-    workflow_fingerprint: str,
-    plan_fingerprint: str,
-    output_shape: tuple[int, ...],
-    window_shape: tuple[int, ...],
-    next_window_index: int,
-    total_windows: int,
-    phase: str,
-) -> dict:
-    return {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "workflow_fingerprint": workflow_fingerprint,
-        "plan_fingerprint": plan_fingerprint,
-        "output_shape": list(output_shape),
-        "window_shape": list(window_shape),
-        "next_window_index": next_window_index,
-        "total_windows": total_windows,
-        "phase": phase,
-    }
-
-
-def _validate_resume_state(
-    state: dict,
-    *,
-    output_shape: tuple[int, ...],
-    window_shape: tuple[int, ...],
-    total_windows: int,
-) -> int:
-    if state.get("output_shape") != list(output_shape):
-        raise ValueError("Window checkpoint output_shape does not match the current plan.")
-    if state.get("window_shape") != list(window_shape):
-        raise ValueError("Window checkpoint window_shape does not match the current plan.")
-    if state.get("total_windows") != total_windows:
-        raise ValueError("Window checkpoint total_windows does not match the current plan.")
-
-    next_window_index = state.get("next_window_index")
-    if isinstance(next_window_index, bool) or not isinstance(next_window_index, int):
-        raise ValueError("Window checkpoint next_window_index must be an integer.")
-    if next_window_index < 0 or next_window_index > total_windows:
-        raise ValueError("Window checkpoint next_window_index is out of range.")
-
-    phase = state.get("phase")
-    if phase not in {"windows_running", "finalizing"}:
-        raise ValueError(f"Window checkpoint has invalid phase {phase!r}.")
-    if phase == "finalizing" and next_window_index != total_windows:
-        raise ValueError("A finalizing checkpoint must have all Windows committed.")
-    if phase == "windows_running" and next_window_index == total_windows:
-        raise ValueError("A complete Window checkpoint must be in the finalizing phase.")
-    return next_window_index
-
-
 # =============================================================================
 # 3. Core executor
 # =============================================================================
@@ -762,7 +710,7 @@ async def execute_graph(
     window_store: WindowCheckpointStore | None = None
     workflow_fingerprint: str | None = None
     plan_fingerprint: str | None = None
-    saved_resume_state: dict | None = None
+    completed_windows_bitmap: np.ndarray | None = None
     window_generator: WindowGenerator | None = None
     selected_config: ExecutionConfig | None = None
 
@@ -936,17 +884,12 @@ async def execute_graph(
                     selected_config.window_shape,
                 )
                 window_store = checkpoint_store or WindowCheckpointStore()
-                saved_resume_state = window_store.load(
+                completed_windows_bitmap = window_store.load(
                     workflow_fingerprint,
                     plan_fingerprint,
+                    expected_shape=window_generator.axis_counts,
                 )
-                if saved_resume_state is not None:
-                    _validate_resume_state(
-                        saved_resume_state,
-                        output_shape=expected_output_shape,
-                        window_shape=selected_config.window_shape,
-                        total_windows=window_generator.total_windows,
-                    )
+                if completed_windows_bitmap is not None:
                     is_resuming = True
             finally:
                 await _cancel_and_await_tasks(metadata_tasks)
@@ -1021,35 +964,21 @@ async def execute_graph(
             if workflow_fingerprint is None or plan_fingerprint is None:
                 raise RuntimeError("Window recovery identity was not initialized.")
 
-            if saved_resume_state is None:
-                start_index = 0
-                resume_state = _new_resume_state(
-                    workflow_fingerprint=workflow_fingerprint,
-                    plan_fingerprint=plan_fingerprint,
-                    output_shape=actual_output_shape,
-                    window_shape=selected_config.window_shape,
-                    next_window_index=0,
-                    total_windows=window_generator.total_windows,
-                    phase=(
-                        "finalizing"
-                        if window_generator.total_windows == 0
-                        else "windows_running"
-                    ),
+            if completed_windows_bitmap is None:
+                completed_windows_bitmap = window_store.create(
+                    workflow_fingerprint,
+                    plan_fingerprint,
+                    window_generator.axis_counts,
                 )
-                window_store.save(resume_state)
             else:
-                start_index = _validate_resume_state(
-                    saved_resume_state,
-                    output_shape=actual_output_shape,
-                    window_shape=selected_config.window_shape,
-                    total_windows=window_generator.total_windows,
-                )
+                completed_count = int(np.count_nonzero(completed_windows_bitmap))
                 resume_message = (
                     "Resuming Window Execution at finalization."
-                    if start_index == window_generator.total_windows
+                    if completed_count == window_generator.total_windows
                     else (
-                        f"Resuming Window Execution at Window {start_index + 1} / "
-                        f"{window_generator.total_windows}."
+                        "Resuming Window Execution with "
+                        f"{completed_count} / {window_generator.total_windows} "
+                        "Window(s) completed."
                     )
                 )
                 await state_manager.broadcast(
@@ -1063,13 +992,19 @@ async def execute_graph(
                 )
 
             total_windows = window_generator.total_windows
-            if start_index < total_windows:
+            flat_bitmap = completed_windows_bitmap.reshape(-1, order="C")
+            pending_indices = np.flatnonzero(flat_bitmap == 0)
+            all_windows_completed = (
+                total_windows == 0
+                or bool(np.all(completed_windows_bitmap == 1))
+            )
+            if not all_windows_completed:
                 client = dask_service.ensure_client()
                 for node_id in execution_roots:
                     await progress_callback(node_id, None, "Submitted", "submitted")
                 window_summary = (
                     f"Window Execution: {total_windows} Window(s), "
-                    f"starting at index {start_index}."
+                    f"{len(pending_indices)} pending."
                 )
                 await state_manager.broadcast(
                     execution_id,
@@ -1080,25 +1015,29 @@ async def execute_graph(
                     "info",
                     execution_id=execution_id,
                 )
-                progress_stride = max(1, (total_windows + 999) // 1000)
+                progress_stride = max(1, (len(pending_indices) + 999) // 1000)
 
-                for window in window_generator.iter_from(start_index):
+                for pending_position, raw_index in enumerate(pending_indices):
+                    window = window_generator.window_at(int(raw_index))
+                    completed_count = int(
+                        np.count_nonzero(completed_windows_bitmap)
+                    )
                     message = f"Window {window.index + 1} / {total_windows}"
                     await window_progress_callback(
                         current_window=window.index + 1,
-                        completed_windows=window.index,
+                        completed_windows=completed_count,
                         total_windows=total_windows,
                         window_status="running",
                         message=message,
                     )
                     progress_percent = min(
                         99,
-                        int(window.index * 100 / total_windows),
+                        int(completed_count * 100 / total_windows),
                     )
                     should_broadcast_progress = (
-                        window.index == start_index
-                        or window.index + 1 == total_windows
-                        or (window.index - start_index) % progress_stride == 0
+                        pending_position == 0
+                        or pending_position + 1 == len(pending_indices)
+                        or pending_position % progress_stride == 0
                     )
                     for node_id in execution_roots:
                         await progress_callback(
@@ -1125,33 +1064,30 @@ async def execute_graph(
                             lambda futures=current_futures: dist_wait(futures),
                         )
                         wait_completed = True
+                        future_exceptions: list[BaseException] = []
                         for future in current_futures:
                             exception = await loop.run_in_executor(
                                 None,
                                 future.exception,
                             )
                             if exception is not None:
-                                raise exception
+                                future_exceptions.append(exception)
+                        if future_exceptions:
+                            raise future_exceptions[0]
 
-                        next_window_index = window.index + 1
-                        resume_state = _new_resume_state(
-                            workflow_fingerprint=workflow_fingerprint,
-                            plan_fingerprint=plan_fingerprint,
-                            output_shape=actual_output_shape,
-                            window_shape=selected_config.window_shape,
-                            next_window_index=next_window_index,
-                            total_windows=total_windows,
-                            phase=(
-                                "finalizing"
-                                if next_window_index == total_windows
-                                else "windows_running"
-                            ),
+                        # Commit only after every terminal Future succeeded.
+                        window_store.mark_completed(
+                            workflow_fingerprint,
+                            plan_fingerprint,
+                            completed_windows_bitmap,
+                            window.coordinates,
                         )
-                        # Advance only after every root future succeeds.
-                        window_store.save(resume_state)
+                        completed_count = int(
+                            np.count_nonzero(completed_windows_bitmap)
+                        )
                         await window_progress_callback(
                             current_window=window.index + 1,
-                            completed_windows=next_window_index,
+                            completed_windows=completed_count,
                             total_windows=total_windows,
                             window_status="running",
                             message=(
@@ -1174,7 +1110,9 @@ async def execute_graph(
 
             await window_progress_callback(
                 current_window=(total_windows if total_windows else 0),
-                completed_windows=total_windows,
+                completed_windows=int(
+                    np.count_nonzero(completed_windows_bitmap)
+                ),
                 total_windows=total_windows,
                 window_status="finalizing",
                 message="Finalizing Window Execution",

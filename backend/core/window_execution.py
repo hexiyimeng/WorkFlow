@@ -1,7 +1,7 @@
 """Small primitives for final-array Window execution and durable resume.
 
-V1 recovery is intentionally at-least-once: a Window can finish its terminal
-side effects and the process can fail before the atomic checkpoint advances.
+Recovery is intentionally at-least-once: a Window can finish its terminal side
+effects and the process can fail before its completion is durably recorded.
 Terminal side effects therefore need to be safe to retry.
 """
 
@@ -14,10 +14,12 @@ import math
 import operator
 import os
 from pathlib import Path
+import threading
 from typing import Any, Iterator, Literal, Mapping, Sequence
+import zipfile
 
+import numpy as np
 
-CHECKPOINT_SCHEMA_VERSION = 1
 WINDOW_GENERATOR_VERSION = 1
 WINDOW_TRAVERSAL_ORDER = "lexicographic"
 
@@ -31,6 +33,7 @@ class ExecutionConfig:
 @dataclass(frozen=True)
 class Window:
     index: int
+    coordinates: tuple[int, ...]
     starts: tuple[int, ...]
     stops: tuple[int, ...]
 
@@ -167,7 +170,12 @@ class WindowGenerator:
                 self.output_shape,
             )
         )
-        return Window(index=int(normalized_index), starts=starts, stops=stops)
+        return Window(
+            index=int(normalized_index),
+            coordinates=tuple(coordinates),
+            starts=starts,
+            stops=stops,
+        )
 
     def iter_from(self, start_index: int = 0) -> Iterator[Window]:
         try:
@@ -365,54 +373,134 @@ def default_checkpoint_root() -> Path:
 
 class WindowCheckpointStore:
     def __init__(self, root: str | os.PathLike[str] | None = None) -> None:
-        self.root = Path(root).expanduser().resolve() if root is not None else default_checkpoint_root()
+        self.root = (
+            Path(root).expanduser().resolve()
+            if root is not None
+            else default_checkpoint_root()
+        )
+        self._lock = threading.RLock()
 
-    def state_path(self, workflow_fingerprint: str, plan_fingerprint: str) -> Path:
-        return self.root / workflow_fingerprint / plan_fingerprint / "resume_state.json"
+    def checkpoint_path(
+        self,
+        workflow_fingerprint: str,
+        plan_fingerprint: str,
+    ) -> Path:
+        return (
+            self.root
+            / workflow_fingerprint
+            / plan_fingerprint
+            / "completed_windows.npy"
+        )
+
+    @staticmethod
+    def _validate_completed_windows(
+        completed_windows: np.ndarray,
+        *,
+        path: Path | None = None,
+        expected_shape: tuple[int, ...] | None = None,
+    ) -> None:
+        location = f" {path}" if path is not None else ""
+        if not isinstance(completed_windows, np.ndarray):
+            raise ValueError(f"Window checkpoint{location} must contain a NumPy array.")
+        if completed_windows.dtype != np.dtype(np.uint8):
+            raise ValueError(
+                f"Window checkpoint{location} must have dtype uint8, "
+                f"got {completed_windows.dtype}."
+            )
+        if expected_shape is not None and completed_windows.shape != expected_shape:
+            raise ValueError(
+                f"Window checkpoint{location} has shape {completed_windows.shape}, "
+                f"expected {expected_shape}."
+            )
+        if not np.all((completed_windows == 0) | (completed_windows == 1)):
+            raise ValueError(
+                f"Window checkpoint{location} must contain only completion values 0 and 1."
+            )
+
+    def create(
+        self,
+        workflow_fingerprint: str,
+        plan_fingerprint: str,
+        window_grid_shape: tuple[int, ...],
+    ) -> np.ndarray:
+        normalized_shape = _shape_tuple(
+            window_grid_shape,
+            name="window_grid_shape",
+            allow_zero=True,
+        )
+        completed_windows = np.zeros(normalized_shape, dtype=np.uint8)
+        self.save(
+            workflow_fingerprint,
+            plan_fingerprint,
+            completed_windows,
+        )
+        return completed_windows
 
     def load(
         self,
         workflow_fingerprint: str,
         plan_fingerprint: str,
-    ) -> dict[str, Any] | None:
-        path = self.state_path(workflow_fingerprint, plan_fingerprint)
+        *,
+        expected_shape: tuple[int, ...],
+    ) -> np.ndarray | None:
+        path = self.checkpoint_path(workflow_fingerprint, plan_fingerprint)
         if not path.exists():
             return None
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                state = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read Window checkpoint {path}: {exc}") from exc
-        if not isinstance(state, dict):
-            raise ValueError(f"Window checkpoint {path} must contain a JSON object.")
-        if state.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported Window checkpoint schema_version={state.get('schema_version')!r}."
-            )
-        if (
-            state.get("workflow_fingerprint") != workflow_fingerprint
-            or state.get("plan_fingerprint") != plan_fingerprint
-        ):
-            return None
-        return state
 
-    def save(self, state: Mapping[str, Any]) -> Path:
-        workflow_fingerprint = str(state["workflow_fingerprint"])
-        plan_fingerprint = str(state["plan_fingerprint"])
-        path = self.state_path(workflow_fingerprint, plan_fingerprint)
+        normalized_shape = _shape_tuple(
+            expected_shape,
+            name="expected_shape",
+            allow_zero=True,
+        )
+        try:
+            loaded = np.load(path, allow_pickle=False)
+        except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:
+            raise ValueError(f"Cannot read Window checkpoint {path}: {exc}") from exc
+
+        try:
+            self._validate_completed_windows(
+                loaded,
+                path=path,
+                expected_shape=normalized_shape,
+            )
+            # Never expose a read-only mapping or an array owned by np.load.
+            return np.array(loaded, copy=True)
+        finally:
+            close = getattr(loaded, "close", None)
+            if callable(close):
+                close()
+
+    def save(
+        self,
+        workflow_fingerprint: str,
+        plan_fingerprint: str,
+        completed_windows: np.ndarray,
+    ) -> Path:
+        with self._lock:
+            return self._save_unlocked(
+                workflow_fingerprint,
+                plan_fingerprint,
+                completed_windows,
+            )
+
+    def _save_unlocked(
+        self,
+        workflow_fingerprint: str,
+        plan_fingerprint: str,
+        completed_windows: np.ndarray,
+    ) -> Path:
+        self._validate_completed_windows(completed_windows)
+        path = self.checkpoint_path(workflow_fingerprint, plan_fingerprint)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_name(f"{path.name}.tmp")
 
         try:
-            with temporary_path.open("w", encoding="utf-8") as handle:
-                json.dump(
-                    dict(state),
+            with temporary_path.open("wb") as handle:
+                np.save(
                     handle,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
+                    completed_windows,
+                    allow_pickle=False,
                 )
-                handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, path)
@@ -423,20 +511,66 @@ class WindowCheckpointStore:
                 pass
         return path
 
+    def mark_completed(
+        self,
+        workflow_fingerprint: str,
+        plan_fingerprint: str,
+        completed_windows: np.ndarray,
+        coordinates: tuple[int, ...],
+    ) -> bool:
+        with self._lock:
+            self._validate_completed_windows(completed_windows)
+            normalized_coordinates = _shape_tuple(
+                coordinates,
+                name="coordinates",
+                allow_zero=True,
+            )
+            if len(normalized_coordinates) != completed_windows.ndim:
+                raise ValueError(
+                    "Window coordinates rank must match checkpoint rank "
+                    f"({len(normalized_coordinates)} != {completed_windows.ndim})."
+                )
+            for axis, (coordinate, axis_size) in enumerate(
+                zip(normalized_coordinates, completed_windows.shape)
+            ):
+                if coordinate >= axis_size:
+                    raise ValueError(
+                        f"Window coordinate {coordinate} is outside axis {axis} "
+                        f"with size {axis_size}."
+                    )
+
+            if completed_windows[normalized_coordinates] == 1:
+                return False
+
+            completed_windows[normalized_coordinates] = 1
+            try:
+                self._save_unlocked(
+                    workflow_fingerprint,
+                    plan_fingerprint,
+                    completed_windows,
+                )
+            except BaseException:
+                # The Driver may safely retry after a failed durability commit.
+                completed_windows[normalized_coordinates] = 0
+                raise
+            return True
+
     def delete(self, workflow_fingerprint: str, plan_fingerprint: str) -> None:
-        state_path = self.state_path(
+        checkpoint_path = self.checkpoint_path(
             workflow_fingerprint,
             plan_fingerprint,
         )
         # Delete the recovery identity first.  Avoid recursive removal so an
         # unrelated file can never be partially deleted if cleanup fails.
-        state_path.unlink(missing_ok=True)
+        checkpoint_path.unlink(missing_ok=True)
         try:
-            state_path.with_name(f"{state_path.name}.tmp").unlink(missing_ok=True)
+            checkpoint_path.with_name(
+                f"{checkpoint_path.name}.tmp"
+            ).unlink(missing_ok=True)
         except OSError:
             pass
 
-        plan_directory = state_path.parent
+        plan_directory = checkpoint_path.parent
         try:
             plan_directory.rmdir()
         except (FileNotFoundError, OSError):
