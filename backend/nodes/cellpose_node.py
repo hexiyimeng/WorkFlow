@@ -15,10 +15,16 @@ from nodes.base import BaseMapOverlapNode
 def create_cellpose_model(model_ref: str, device: str):
     """Create a worker-local Cellpose model without importing torch at plugin load."""
 
+    if device != "cuda:0":
+        raise RuntimeError(
+            "Cellpose models may only be created on an isolated GPU Worker "
+            "using logical device 'cuda:0'; CPU fallback is not supported."
+        )
+
     from cellpose import models
     import torch
 
-    device_obj = torch.device(device if device else "cpu")
+    device_obj = torch.device("cuda:0")
     kwargs = {
         "gpu": device_obj.type == "cuda",
         "device": device_obj,
@@ -64,6 +70,11 @@ def cellpose_block(
 ) -> np.ndarray:
     if ctx is None:
         raise RuntimeError("Cellpose block requires a BlockContext.")
+    if ctx.device != "cuda:0":
+        raise RuntimeError(
+            "Cellpose requires an isolated GPU Worker using logical "
+            "device 'cuda:0'; CPU fallback is not supported."
+        )
 
     model_name = str(model_name or "").strip()
     if not model_name:
@@ -253,7 +264,9 @@ def cellpose_block(
 @register_node("Cellpose")
 class Cellpose(BaseMapOverlapNode):
     CATEGORY = "WorkFlow/Segmentation"
-    DISPLAY_NAME = "Cellpose1111111"
+    DISPLAY_NAME = "Cellpose"
+    EXECUTION_RESOURCE = "gpu"
+    EXECUTION_WORKERS = 1
 
     MAP_INPUTS = ["image"]
     PRIMARY_INPUT = "image"

@@ -138,6 +138,7 @@ class OMEZarrReader:
     PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr / OME-Zarr Reader"
+    EXECUTION_WORKERS = 0
 
     @classmethod
     def INPUT_TYPES(cls):

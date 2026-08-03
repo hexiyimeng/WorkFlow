@@ -4,6 +4,7 @@ import Sidebar from './components/layout/Sidebar';
 import BottomPanel from './components/layout/BottomPanel';
 import FlowEditor from './components/flow/FlowEditor';
 import ExecutionConfigDialog from './components/execution/ExecutionConfigDialog';
+import RecoveryBrowserDialog from './components/execution/RecoveryBrowserDialog';
 
 export default function App() {
   return (
@@ -19,6 +20,7 @@ export default function App() {
         </main>
       </div>
       <ExecutionConfigDialog />
+      <RecoveryBrowserDialog />
     </div>
   );
 }

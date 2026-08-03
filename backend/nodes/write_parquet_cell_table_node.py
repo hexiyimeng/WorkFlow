@@ -22,12 +22,17 @@ CELL_LOCAL_ID_WIDTH = 6
 
 
 def _normalize_path(value: str, *, name: str) -> str:
-    raw = str(value or "").strip().strip('"').strip("'")
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a literal string.")
+    raw = value.strip()
     if not raw:
         raise ValueError(f"{name} cannot be empty.")
     if "\x00" in raw:
         raise ValueError(f"{name} contains a null byte.")
-    return str(Path(raw).expanduser().resolve())
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{name} must be an absolute path.")
+    return str(path.resolve())
 
 
 def _block_id(block_index: tuple[int, ...]) -> str:
@@ -415,7 +420,9 @@ class WriteParquetCellTable(BaseMapBlocksNode):
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Write Parquet Cell Table"
+    EXECUTION_WORKERS = 0
     OUTPUT_NODE = True
+    OUTPUT_PATH_INPUT = "output_dir"
     CHUNK_POLICY = {"mode": "rechunk_to_primary"}
 
     MAP_INPUTS = ["mask"]
@@ -442,7 +449,7 @@ class WriteParquetCellTable(BaseMapBlocksNode):
         return {
             "required": {
                 "mask": ("DASK_ARRAY[any]",),
-                "output_dir": ("STRING", {"default": "cells", "multiline": False}),
+                "output_dir": ("STRING", {"default": "", "multiline": False}),
             },
             "optional": {
                 "axes": ("STRING", {"default": "", "multiline": False}),
@@ -456,6 +463,10 @@ class WriteParquetCellTable(BaseMapBlocksNode):
                 "sort_by_spatial_key": ("BOOLEAN", {"default": True}),
             },
         }
+
+    @staticmethod
+    def validate_output_path(value: str) -> str:
+        return _normalize_path(value, name="output_dir")
 
     def preprocess(
         self,
@@ -474,7 +485,7 @@ class WriteParquetCellTable(BaseMapBlocksNode):
 
         params = params or {}
         runtime = runtime or {}
-        output_dir = _normalize_path(params.get("output_dir", "cells"), name="output_dir")
+        output_dir = _normalize_path(params.get("output_dir", ""), name="output_dir")
         output_path = Path(output_dir)
         if bool(runtime.get("is_resuming", False)):
             if not output_path.exists():

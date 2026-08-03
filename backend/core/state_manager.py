@@ -15,20 +15,27 @@ class ExecutionStatus:
     RUNNING = "running"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
     FAILED = "failed"
     SUCCEEDED = "succeeded"
 
     VALID_TRANSITIONS = {
-        RUNNING: [CANCELLING, FAILED, SUCCEEDED],
+        RUNNING: [CANCELLING, INTERRUPTED, FAILED, SUCCEEDED],
         CANCELLING: [CANCELLED, FAILED],
         CANCELLED: [],
+        INTERRUPTED: [],
         FAILED: [],
         SUCCEEDED: [],
     }
 
     @classmethod
     def is_finished(cls, status: str) -> bool:
-        return status in (cls.CANCELLED, cls.FAILED, cls.SUCCEEDED)
+        return status in (
+            cls.CANCELLED,
+            cls.INTERRUPTED,
+            cls.FAILED,
+            cls.SUCCEEDED,
+        )
 
 
 @dataclass
@@ -104,11 +111,19 @@ class GlobalStateManager:
         """
         with self._lock:
             active_id = self.active_execution_id
-            if active_id and active_id != execution_id:
+            if active_id is not None:
                 active_session = self.executions.get(active_id)
-                if active_session and not ExecutionStatus.is_finished(active_session.status):
-                    raise RuntimeError("Another execution is already running")
-                self._clear_active_locked(active_id)
+                if (
+                    active_id == execution_id
+                    and active_session is not None
+                    and not ExecutionStatus.is_finished(active_session.status)
+                ):
+                    return active_session
+                # The active slot may intentionally outlive the terminal
+                # status while Driver-side Futures and Worker caches are being
+                # cleaned up. This also rejects reuse of the same execution ID:
+                # the old finally block would otherwise clear the new lease.
+                raise RuntimeError("Another execution is already running")
 
             session = self.create_execution(execution_id)
             if (
@@ -163,7 +178,13 @@ class GlobalStateManager:
     def get_client_execution(self, websocket) -> Optional[str]:
         return self.client_execution_map.get(websocket)
 
-    def set_execution_status(self, execution_id: str, status: str) -> bool:
+    def set_execution_status(
+        self,
+        execution_id: str,
+        status: str,
+        *,
+        release_active: bool = True,
+    ) -> bool:
         with self._lock:
             session = self.executions.get(execution_id)
             if not session:
@@ -189,7 +210,8 @@ class GlobalStateManager:
             session.status = status
             if ExecutionStatus.is_finished(status):
                 session.finished_at = time.time()
-                self._clear_active_locked(execution_id)
+                if release_active:
+                    self._clear_active_locked(execution_id)
             logger.info(f"[StateManager] Execution {execution_id}: {old_status} -> {status}")
             return True
 
@@ -475,11 +497,10 @@ class GlobalStateManager:
     @property
     def is_running(self) -> bool:
         with self._lock:
-            if self.active_execution_id:
-                session = self.executions.get(self.active_execution_id)
-                if session and session.status in (ExecutionStatus.RUNNING, ExecutionStatus.CANCELLING):
-                    return True
-            return False
+            # The active lease deliberately remains held during terminal
+            # Driver/Worker cleanup even though the public session status has
+            # already changed to a finished value.
+            return self.active_execution_id is not None
 
     @property
     def current_task(self) -> Optional[asyncio.Task]:

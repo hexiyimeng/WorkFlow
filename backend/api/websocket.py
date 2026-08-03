@@ -61,17 +61,36 @@ async def websocket_endpoint(websocket: WebSocket):
                 command = data.get("command")
 
                 if command == "execute_graph":
-                    graph = data.get("graph")
-                    if not graph:
-                        await websocket.send_json({"type": "error", "message": "Received empty graph"})
-                        continue
-
                     try:
                         execution_config = parse_execution_config(data.get("executionConfig"))
                     except ValueError as exc:
                         await websocket.send_json({
                             "type": "error",
                             "message": str(exc),
+                        })
+                        continue
+
+                    graph = data.get("graph")
+                    recovery_location = execution_config.recovery_location
+                    is_direct_custom_resume = (
+                        execution_config.mode == "window"
+                        and execution_config.resume_action == "resume"
+                        and recovery_location is not None
+                        and recovery_location.mode == "custom"
+                    )
+                    if not isinstance(graph, dict):
+                        if is_direct_custom_resume and graph is None:
+                            graph = {}
+                        else:
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "Received invalid graph",
+                            })
+                            continue
+                    if not graph and not is_direct_custom_resume:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Received empty graph",
                         })
                         continue
 
@@ -113,9 +132,22 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Bind the task before acknowledging the run.  If the socket
                     # drops while the acknowledgement is in flight, the durable
                     # execution id can still be used to subscribe after reconnect.
-                    execution_task = asyncio.create_task(
-                        execute_graph(graph, execution_id, execution_config)
-                    )
+                    start_gate = asyncio.Event()
+
+                    async def execute_after_ack(
+                        execution_graph=graph,
+                        attached_execution_id=execution_id,
+                        attached_config=execution_config,
+                        gate=start_gate,
+                    ):
+                        await gate.wait()
+                        return await execute_graph(
+                            execution_graph,
+                            attached_execution_id,
+                            attached_config,
+                        )
+
+                    execution_task = asyncio.create_task(execute_after_ack())
                     if not state_manager.attach_execution_task(execution_id, execution_task):
                         execution_task.cancel()
                         await asyncio.gather(execution_task, return_exceptions=True)
@@ -131,10 +163,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # Send executionId to frontend only after the active session
                     # owns a cancellable task.
-                    await websocket.send_json({
-                        "type": "execution_started",
-                        "executionId": execution_id
-                    })
+                    try:
+                        await websocket.send_json({
+                            "type": "execution_started",
+                            "executionId": execution_id
+                        })
+                    finally:
+                        # A lost acknowledgement must not discard a durable
+                        # execution. The saved execution ID can subscribe after
+                        # reconnect, while a connected client always observes
+                        # execution_started before any terminal broadcast.
+                        start_gate.set()
 
                 elif command == "stop_execution":
                     # 只停止当前客户端的 execution
@@ -185,8 +224,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             })
                         else:
                             await websocket.send_json({
-                                "type": "error",
-                                "message": f"Execution {execution_id} not found"
+                                "type": "execution_not_found",
+                                "code": "EXECUTION_NOT_FOUND",
+                                "executionId": execution_id,
+                                "message": f"Execution {execution_id} not found",
                             })
 
             except asyncio.TimeoutError:

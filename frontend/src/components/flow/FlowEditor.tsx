@@ -1,10 +1,11 @@
-import { useState, useCallback, type ComponentType } from 'react';
+import { useState, useCallback, useEffect, useRef, type ComponentType } from 'react';
 import {
   ReactFlow,
   Background,
   MiniMap,
   Panel,
   useReactFlow,
+  useNodesInitialized,
   useViewport,
   BackgroundVariant,
   ConnectionMode,
@@ -200,18 +201,23 @@ export default function FlowEditor() {
     isValidConnection,
     onConnectStart, onConnectEnd,
     isExecutionLocked,
+    isRecoveryGraphReadOnly,
+    recoveredGraphView,
   } = useFlow();
 
-  const { screenToFlowPosition } = useReactFlow();
+  const { screenToFlowPosition, fitView } = useReactFlow();
+  const nodesInitialized = useNodesInitialized();
+  const fittedRecoveryRef = useRef<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; flowPos: { x: number; y: number } } | null>(null);
 
   const onPaneContextMenu = useCallback(
     (event: React.MouseEvent | globalThis.MouseEvent) => {
       event.preventDefault();
+      if (isExecutionLocked) return;
       const nativeEvent = (event as React.MouseEvent).nativeEvent || event;
       setMenu({ x: nativeEvent.clientX, y: nativeEvent.clientY, flowPos: screenToFlowPosition({ x: nativeEvent.clientX, y: nativeEvent.clientY }) });
     },
-    [screenToFlowPosition]
+    [isExecutionLocked, screenToFlowPosition]
   );
 
   const onPaneClick = useCallback(() => setMenu(null), []);
@@ -223,13 +229,35 @@ export default function FlowEditor() {
 
   const onDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault();
+    if (isRecoveryGraphReadOnly) return;
     const type = event.dataTransfer.getData('application/reactflow');
     if (!type) return;
     const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
     addNodeAt(type, position);
-  }, [screenToFlowPosition, addNodeAt]);
+  }, [screenToFlowPosition, addNodeAt, isRecoveryGraphReadOnly]);
 
   const bgVariant = theme === 'dark' ? BackgroundVariant.Dots : BackgroundVariant.Lines;
+
+  useEffect(() => {
+    const recoveryDirectory = recoveredGraphView?.recoveryDirectory ?? null;
+    if (recoveryDirectory === null) {
+      fittedRecoveryRef.current = null;
+      return;
+    }
+    if (
+      !nodesInitialized
+      || nodes.length === 0
+      || fittedRecoveryRef.current === recoveryDirectory
+    ) {
+      return;
+    }
+
+    const frame = requestAnimationFrame(() => {
+      fittedRecoveryRef.current = recoveryDirectory;
+      void fitView({ padding: 0.2, duration: 300 });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [fitView, nodes.length, nodesInitialized, recoveredGraphView?.recoveryDirectory]);
 
   return (
     <div
@@ -241,6 +269,25 @@ export default function FlowEditor() {
     >
       {/* Empty state */}
       {nodes.length === 0 && <EmptyCanvas />}
+
+      {isRecoveryGraphReadOnly && recoveredGraphView && (
+        <div
+          className="pointer-events-none absolute left-1/2 top-3 z-20 max-w-[70%] -translate-x-1/2 rounded-[var(--radius-md)] border px-3 py-2 text-center"
+          style={{
+            color: 'var(--color-warning)',
+            backgroundColor: 'var(--color-warning-soft)',
+            borderColor: 'var(--color-warning)',
+            boxShadow: 'var(--shadow-panel)',
+          }}
+        >
+          <div className="text-[11px] font-semibold">
+            Recovery graph — nodes can move; parameters and connections are read-only
+          </div>
+          <div className="truncate font-mono text-[9px] opacity-80">
+            {recoveredGraphView.recoveryDirectory}
+          </div>
+        </div>
+      )}
 
       <ReactFlow
         nodes={nodes}
@@ -270,10 +317,10 @@ export default function FlowEditor() {
         colorMode={theme === 'dark' ? 'dark' : 'light'}
         onPaneContextMenu={onPaneContextMenu}
         onPaneClick={onPaneClick}
-        nodesDraggable={!isExecutionLocked}
+        nodesDraggable
         nodesConnectable={!isExecutionLocked}
         edgesReconnectable={!isExecutionLocked}
-        elementsSelectable={!isExecutionLocked}
+        elementsSelectable
         deleteKeyCode={isExecutionLocked ? null : ['Backspace', 'Delete']}
       >
         <Background

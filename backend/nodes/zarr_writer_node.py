@@ -15,14 +15,21 @@ TOKEN_DTYPE = np.dtype("uint8")
 
 
 def _normalize_output_path(value: str) -> str:
-    raw = str(value or "").strip().strip('"').strip("'")
+    if not isinstance(value, str):
+        raise ValueError("ZarrWriter output_path must be a literal string.")
+    raw = value.strip()
     if not raw:
         raise ValueError("ZarrWriter output_path cannot be empty.")
     if "\x00" in raw:
         raise ValueError("ZarrWriter output_path contains a null byte.")
     path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("ZarrWriter output_path must be an absolute path.")
     if path.suffix.lower() != ".zarr":
-        path = path.with_suffix(path.suffix + ".zarr") if path.suffix else Path(f"{path}.zarr")
+        raise ValueError(
+            "ZarrWriter output_path must include the complete final '.zarr' suffix; "
+            "the framework does not append file extensions."
+        )
     return str(path.resolve())
 
 
@@ -319,7 +326,9 @@ class ZarrWriter(BaseMapBlocksNode):
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr Writer"
+    EXECUTION_WORKERS = 0
     OUTPUT_NODE = True
+    OUTPUT_PATH_INPUT = "output_path"
 
     MAP_INPUTS = ["array"]
     PRIMARY_INPUT = "array"
@@ -346,7 +355,7 @@ class ZarrWriter(BaseMapBlocksNode):
         return {
             "required": {
                 "array": ("DASK_ARRAY[any]",),
-                "output_path": ("STRING", {"default": "output.zarr", "multiline": False}),
+                "output_path": ("STRING", {"default": "", "multiline": False}),
             },
             "optional": {
                 "store_kind": (["array", "ome_zarr"], {"default": "array"}),
@@ -359,6 +368,10 @@ class ZarrWriter(BaseMapBlocksNode):
             },
         }
 
+    @staticmethod
+    def validate_output_path(value: str) -> str:
+        return _normalize_output_path(value)
+
     def preprocess(
         self,
         dask_arr=None,
@@ -369,7 +382,7 @@ class ZarrWriter(BaseMapBlocksNode):
             raise ValueError("ZarrWriter expects an input Dask Array, got None.")
         params = params or {}
         runtime = runtime or {}
-        output_path = _normalize_output_path(params.get("output_path", "output.zarr"))
+        output_path = _normalize_output_path(params.get("output_path", ""))
         store_kind = str(params.get("store_kind") or "array").strip().lower()
         dataset_path = _normalize_dataset_path(params.get("dataset_path", "0"))
         axes = tuple(

@@ -1,7 +1,7 @@
 // src/components/layout/Header.tsx
 import { useRef, type ChangeEvent } from 'react';
 import { useReactFlow, getNodesBounds, getViewportForBounds } from '@xyflow/react';
-import { RefreshCw } from 'lucide-react';
+import { FolderClock, RefreshCw } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 import { Button } from '../ui/Button';
 import { IconButton } from '../ui/IconButton';
@@ -64,6 +64,8 @@ const PHASE_LABELS: Record<string, string> = {
   submitted: 'Queued',
   running: 'Running',
   cancelling: 'Stopping',
+  disconnected: 'Disconnected',
+  interrupted: 'Interrupted',
   succeeded: 'Done',
   failed: 'Failed',
   cancelled: 'Cancelled',
@@ -75,6 +77,8 @@ const PHASE_PILL: Record<string, 'idle' | 'info' | 'running' | 'success' | 'dang
   submitted: 'info',
   running: 'running',
   cancelling: 'warning',
+  disconnected: 'warning',
+  interrupted: 'warning',
   succeeded: 'success',
   failed: 'danger',
   cancelled: 'warning',
@@ -90,7 +94,9 @@ export default function Header() {
     dashboardUrl,
     isReloadingNodes,
     executionState,
-    isExecuting, isPreflighting, isExecutionLocked, addLog,
+    isConnected, isExecuting, isPreflighting, isExecutionLocked, addLog,
+    recoveredGraphView, openRecoveryBrowser, executeRecoveryDirectory,
+    closeRecoveredGraph,
   } = useFlow();
 
   const reactFlowInstance = useReactFlow();
@@ -279,6 +285,12 @@ export default function Header() {
           {phaseLabel}
         </Pill>
 
+        {recoveredGraphView && (
+          <Pill variant="warning" dot>
+            Recovery · Read only
+          </Pill>
+        )}
+
         {/* Separator */}
         <div className="w-px h-5 mx-0.5" style={{ backgroundColor: 'var(--color-border-subtle)' }} />
 
@@ -296,6 +308,14 @@ export default function Header() {
           title="Reload Nodes"
         >
           <RefreshCw className={isReloadingNodes ? 'w-4 h-4 animate-spin' : 'w-4 h-4'} />
+        </IconButton>
+
+        <IconButton
+          onClick={openRecoveryBrowser}
+          disabled={isExecutionLocked || isPreflighting || !isConnected}
+          title={isConnected ? 'Open recovery directory' : 'Reconnect to open recovery'}
+        >
+          <FolderClock className="h-4 w-4" />
         </IconButton>
 
         {/* Theme */}
@@ -326,9 +346,48 @@ export default function Header() {
 
         {/* Run / Stop */}
         {isExecuting ? (
-          <Button variant="danger" size="sm" onClick={stopFlow} icon={<StopIcon />}>
+          <Button variant="danger" size="sm" onClick={stopFlow} icon={<StopIcon />} disabled={!isConnected}>
             Stop
           </Button>
+        ) : recoveredGraphView ? (
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={closeRecoveredGraph}
+              disabled={executionState.phase === 'disconnected'}
+            >
+              Close Recovery
+            </Button>
+            <Button
+              variant="warning"
+              size="sm"
+              disabled={!isConnected}
+              onClick={() => {
+                if (!window.confirm('Restart this recovery and rerun every Window?')) return;
+                void executeRecoveryDirectory(
+                  recoveredGraphView.recoveryDirectory,
+                  'restart',
+                ).catch(error => addLog(`Restart failed: ${(error as Error).message}`, 'error'));
+              }}
+            >
+              Restart
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!isConnected}
+              onClick={() => {
+                void executeRecoveryDirectory(
+                  recoveredGraphView.recoveryDirectory,
+                  'resume',
+                ).catch(error => addLog(`Resume failed: ${(error as Error).message}`, 'error'));
+              }}
+              icon={<RunIcon />}
+            >
+              Resume
+            </Button>
+          </>
         ) : (
           <Button
             variant="primary"
@@ -336,7 +395,7 @@ export default function Header() {
             onClick={() => { void runFlow(); }}
             icon={<RunIcon />}
             loading={isPreflighting}
-            disabled={isExecutionLocked}
+            disabled={isExecutionLocked || !isConnected}
           >
             {isPreflighting ? 'Checking...' : 'Run'}
           </Button>

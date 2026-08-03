@@ -14,10 +14,41 @@ import type {
   ExecutionConfig,
   ExecutionPreflightResponse,
   WindowExecutionProgress,
+  RecoveredGraphView,
+  RecoveryOpenResponse,
+  RecoverySummary,
+  ResumeAction,
+  ServerDirectoryListing,
 } from '../types';
-import { hydrateNodesWithLatestSpecs, serializeNodesForStorage } from '../utils/workflowPersistence';
-import { isValidOutputShape, isValidWindowShape } from '../utils/executionConfig';
-import { normalizeWindowProgress, parseLegacyWindowProgress } from '../utils/windowProgress';
+import {
+  hydrateFlowWithLatestSpecs,
+  hydrateNodesWithLatestSpecs,
+  serializeFlowForStorage,
+  serializeNodesForStorage,
+  type SerializedFlow,
+} from '../utils/workflowPersistence';
+import {
+  isValidMaxInFlightWindows,
+  isValidOutputShape,
+  isValidWindowShape,
+  preflightResourcesAllowExecution,
+  preflightOutputShape,
+} from '../utils/executionConfig';
+import {
+  createWindowProgressProtocolState,
+  resolveWindowProgressProtocolEvent,
+} from '../utils/windowProgress';
+import {
+  executionGraphToSerializedFlow,
+  normalizeDirectoryListing,
+  normalizeRecoveryOpenResponse,
+  normalizeRecoverySummary,
+} from '../utils/recovery';
+import {
+  blocksExecutionChanges,
+  markExecutionConnectionLost,
+  markExecutionInterrupted,
+} from '../utils/executionRuntime';
 
 // === Reset helper ===
 const resetRuntimeNodeState = (
@@ -61,7 +92,13 @@ const fetchJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   }
   if (!res.ok) {
     const payload = data as Record<string, unknown>;
-    throw new Error(String(payload.message || payload.error_message || `HTTP ${res.status} from ${url}`));
+    const detail = typeof payload.detail === 'string' ? payload.detail : null;
+    throw new Error(String(
+      payload.message
+      || payload.error_message
+      || detail
+      || `HTTP ${res.status} from ${url}`,
+    ));
   }
   return data;
 };
@@ -94,13 +131,15 @@ type ExecutionAction =
   | { type: 'SET_PHASE'; phase: ExecutionPhase }
   | { type: 'SET_WINDOW_PROGRESS'; progress: WindowExecutionProgress }
   | { type: 'SET_SNAPSHOT'; snapshot: Partial<ExecutionRuntimeState> }
-  | { type: 'FINISH'; status: 'succeeded' | 'failed' | 'cancelled'; message?: string }
+  | { type: 'CONNECTION_LOST'; executionId?: string | null }
+  | { type: 'EXECUTION_NOT_FOUND'; executionId?: string | null }
+  | { type: 'FINISH'; status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'; message?: string }
   | { type: 'RESET' };
 
-type TerminalStatus = 'succeeded' | 'failed' | 'cancelled';
+type TerminalStatus = 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 
 const isTerminalStatus = (status: unknown): status is TerminalStatus =>
-  status === 'succeeded' || status === 'failed' || status === 'cancelled';
+  status === 'succeeded' || status === 'failed' || status === 'cancelled' || status === 'interrupted';
 
 const initialExecutionState: ExecutionRuntimeState = {
   phase: 'idle',
@@ -125,6 +164,7 @@ function executionReducer(state: ExecutionRuntimeState, action: ExecutionAction)
         windowProgress: null,
       };
     case 'SET_PHASE':
+      if (isTerminalStatus(state.phase)) return state;
       return { ...state, phase: action.phase };
     case 'SET_WINDOW_PROGRESS':
       if (isTerminalStatus(state.phase)) return state;
@@ -135,11 +175,16 @@ function executionReducer(state: ExecutionRuntimeState, action: ExecutionAction)
       };
     case 'SET_SNAPSHOT':
       return { ...state, ...action.snapshot };
+    case 'CONNECTION_LOST':
+      return markExecutionConnectionLost(state, action.executionId);
+    case 'EXECUTION_NOT_FOUND':
+      return markExecutionInterrupted(state, action.executionId);
     case 'FINISH':
       return {
         ...state,
         phase: action.status,
         finishedAt: Date.now(),
+        lastError: action.status === 'succeeded' ? null : action.message ?? null,
       };
     case 'RESET':
       return { ...initialExecutionState };
@@ -169,6 +214,8 @@ export const useFlowEngine = (
   const [isReloadingNodes, setIsReloadingNodes] = useState(false);
   const [isPreflighting, setIsPreflighting] = useState(false);
   const [executionPreflight, setExecutionPreflight] = useState<ExecutionPreflightResponse | null>(null);
+  const [isRecoveryBrowserOpen, setIsRecoveryBrowserOpen] = useState(false);
+  const [recoveredGraphView, setRecoveredGraphView] = useState<RecoveredGraphView | null>(null);
 
   // --- Execution state (reducer) ---
   const [executionState, dispatchExecution] = useReducer(executionReducer, initialExecutionState);
@@ -180,10 +227,16 @@ export const useFlowEngine = (
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const finishedRef = useRef(false);
   const restoredExecutionRef = useRef(false); // tracks if current session was restored via subscribe
+  const reconciliationSnapshotReceivedRef = useRef(false);
   const isSubmittingRunRef = useRef(false); // prevents double-submit
+  const recoveryRequestInFlightRef = useRef(false);
   const pendingGraphRef = useRef<ExecutionGraph | null>(null);
   const preflightRequestIdRef = useRef(0);
   const preflightAbortRef = useRef<AbortController | null>(null);
+  const editableFlowRef = useRef<SerializedFlow | null>(null);
+  const windowProgressProtocolRef = useRef(
+    createWindowProgressProtocolState(),
+  );
 
   useEffect(() => {
     executionStateRef.current = executionState;
@@ -234,7 +287,7 @@ export const useFlowEngine = (
 
   const reloadNodes = useCallback(async () => {
     if (isReloadingNodes) return;
-    if (['graph_building', 'submitted', 'running', 'cancelling'].includes(executionStateRef.current.phase)) {
+    if (blocksExecutionChanges(executionStateRef.current.phase)) {
       addLog('Cannot reload nodes while execution is running.', 'warning');
       return;
     }
@@ -332,41 +385,99 @@ export const useFlowEngine = (
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
+      const handleExecutionNotFound = (executionId?: string | null, message?: string) => {
+        const retainedExecutionId = executionId
+          || sessionStorage.getItem('WorkFlow_execution_id')
+          || executionStateRef.current.executionId;
+        sessionStorage.removeItem('WorkFlow_execution_id');
+        finishedRef.current = true;
+        isSubmittingRunRef.current = false;
+        restoredExecutionRef.current = false;
+        reconciliationSnapshotReceivedRef.current = false;
+        windowProgressProtocolRef.current = createWindowProgressProtocolState();
+        setWebsocketStatus('connected');
+        dispatchExecution({
+          type: 'EXECUTION_NOT_FOUND',
+          executionId: retainedExecutionId,
+        });
+        setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
+        resetRuntimeNodeState(setNodes);
+        addLog(
+          message || 'The previous backend execution was interrupted. If it was a Window run, open its recovery directory to resume.',
+          'warning',
+        );
+      };
+
       ws.onopen = () => {
         if (!mountedRef.current) { ws.close(); return; }
         console.log('[useFlowEngine] ws open');
-        setWebsocketStatus('connected');
-        addLog('System Connected', 'success');
 
-        // 闁插秷绻涢幁銏狀槻
         const storedExecutionId = sessionStorage.getItem('WorkFlow_execution_id');
         if (storedExecutionId) {
           restoredExecutionRef.current = true;
+          reconciliationSnapshotReceivedRef.current = false;
+          dispatchExecution({
+            type: 'CONNECTION_LOST',
+            executionId: storedExecutionId,
+          });
           ws.send(JSON.stringify({ command: 'subscribe', executionId: storedExecutionId }));
-          addLog(`Attempting to restore execution ${storedExecutionId}...`, 'info');
+          addLog(`Connection restored. Checking execution ${storedExecutionId}...`, 'info');
+        } else {
+          setWebsocketStatus('connected');
+          addLog('System Connected', 'success');
         }
       };
 
       ws.onclose = (event) => {
         console.log('[useFlowEngine] ws close', event.code, event.reason);
         if (!mountedRef.current) return;
+        if (wsRef.current !== ws) return;
         setWebsocketStatus('disconnected');
         wsRef.current = null;
+        reconciliationSnapshotReceivedRef.current = false;
+        preflightRequestIdRef.current += 1;
+        preflightAbortRef.current?.abort();
+        preflightAbortRef.current = null;
+        pendingGraphRef.current = null;
+        setIsPreflighting(false);
+        setExecutionPreflight(null);
         setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
+        const storedExecutionId = sessionStorage.getItem('WorkFlow_execution_id');
+        if (!finishedRef.current && storedExecutionId) {
+          dispatchExecution({
+            type: 'CONNECTION_LOST',
+            executionId: storedExecutionId,
+          });
+          resetRuntimeNodeState(setNodes);
+        }
 
         // Always reconnect unless component is unmounting
-        addLog('Connection lost. Reconnecting...', 'warning');
+        addLog(
+          storedExecutionId && !finishedRef.current
+            ? 'Backend connection lost during execution. Status is unknown; reconnecting...'
+            : 'Connection lost. Reconnecting...',
+          'warning',
+        );
+        clearReconnectTimer();
         reconnectTimerRef.current = setTimeout(connectWs, 1000);
       };
 
       ws.onerror = (event) => {
         console.log('[useFlowEngine] ws error', event);
+        if (
+          wsRef.current === ws
+          && ws.readyState !== WebSocket.CLOSING
+          && ws.readyState !== WebSocket.CLOSED
+        ) {
+          ws.close();
+        }
       };
 
       // ========================================================
       // Message handling uses refs for latest state.
       // ========================================================
       ws.onmessage = (e) => {
+        if (wsRef.current !== ws) return;
         let msg: WSMessage;
         try {
           msg = JSON.parse(e.data);
@@ -377,6 +488,26 @@ export const useFlowEngine = (
 
         const msgType = msg.type;
 
+        if (msgType === 'cluster_ready') {
+          setDashboardUrl(normalizeDashboardUrl(msg.dashboardUrl));
+          const cpuWorkers = Number.isSafeInteger(msg.cpuWorkers)
+            ? Number(msg.cpuWorkers)
+            : 0;
+          const gpuWorkers = Number.isSafeInteger(msg.gpuWorkers)
+            ? Number(msg.gpuWorkers)
+            : 0;
+          addLog(
+            `Dask cluster ready: ${cpuWorkers} CPU / ${gpuWorkers} GPU Worker(s).`,
+            'success',
+          );
+          return;
+        }
+
+        if (msgType === 'execution_not_found') {
+          handleExecutionNotFound(msg.executionId, msg.message);
+          return;
+        }
+
         // Log messages
         if (msgType === 'log') { addLog(msg.message || '', 'info'); return; }
         if (msgType === 'success') { addLog(msg.message || '', 'success'); return; }
@@ -385,31 +516,37 @@ export const useFlowEngine = (
         // execution_finished: authoritative terminal event
         if (msgType === 'error') {
           const msgText = msg.message || '';
-          const hasStatus = msg.status === 'failed' || msg.status === 'cancelled';
-          if (msgText.includes('not found')) {
-            sessionStorage.removeItem('WorkFlow_execution_id');
-            finishedRef.current = true;
-            isSubmittingRunRef.current = false;
-            dispatchExecution({ type: 'SET_PHASE', phase: 'idle' });
-            setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
-            resetRuntimeNodeState(setNodes);
-            addLog('Old execution expired (project restarted). Starting fresh.', 'warning');
+          const hasStatus = isTerminalStatus(msg.status);
+          if (
+            restoredExecutionRef.current
+            && msgText.startsWith('Execution ')
+            && msgText.endsWith(' not found')
+          ) {
+            handleExecutionNotFound(msg.executionId, msgText);
             return;
           }
           if (hasStatus && !finishedRef.current) {
             const status = msg.status;
             if (isTerminalStatus(status)) {
               finishedRef.current = true;
+              windowProgressProtocolRef.current = createWindowProgressProtocolState();
               sessionStorage.removeItem('WorkFlow_execution_id');
               setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
               dispatchExecution({ type: 'FINISH', status, message: msg.message });
-              addLog(msgText || `Execution ${status}`, status === 'cancelled' ? 'warning' : 'error');
+              addLog(
+                msgText || `Execution ${status}`,
+                status === 'interrupted' || status === 'cancelled' ? 'warning' : 'error',
+              );
             }
             return;
           }
           // Generic error: reset execution state and node runtime state so user can retry.
           finishedRef.current = true;
           isSubmittingRunRef.current = false;
+          restoredExecutionRef.current = false;
+          reconciliationSnapshotReceivedRef.current = false;
+          windowProgressProtocolRef.current = createWindowProgressProtocolState();
+          setWebsocketStatus('connected');
           sessionStorage.removeItem('WorkFlow_execution_id');
           dispatchExecution({ type: 'RESET' });
           addLog(msgText || 'Unknown Error', 'error');
@@ -422,10 +559,18 @@ export const useFlowEngine = (
         if (msgType === 'execution_started') {
           if (!msg.executionId) return;
           finishedRef.current = false;
-          isSubmittingRunRef.current = false;
+          windowProgressProtocolRef.current = createWindowProgressProtocolState(
+            msg.executionId,
+          );
           sessionStorage.setItem('WorkFlow_execution_id', msg.executionId);
+          executionStateRef.current = {
+            ...executionStateRef.current,
+            phase: 'submitted',
+            executionId: msg.executionId,
+          };
           dispatchExecution({ type: 'START', executionId: msg.executionId });
           dispatchExecution({ type: 'SET_PHASE', phase: 'submitted' });
+          isSubmittingRunRef.current = false;
           return;
         }
 
@@ -433,6 +578,8 @@ export const useFlowEngine = (
         if (msgType === 'execution_rejected') {
           isSubmittingRunRef.current = false;
           finishedRef.current = true;
+          executionStateRef.current = { ...initialExecutionState };
+          windowProgressProtocolRef.current = createWindowProgressProtocolState();
           sessionStorage.removeItem('WorkFlow_execution_id');
           dispatchExecution({ type: 'RESET' });
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
@@ -444,15 +591,30 @@ export const useFlowEngine = (
         // execution_snapshot: restore execution state on reconnect
         if (msgType === 'execution_snapshot') {
           isSubmittingRunRef.current = false;
+          if (restoredExecutionRef.current) {
+            reconciliationSnapshotReceivedRef.current = true;
+          }
           const snapshotPhase =
             msg.status === 'running' ? 'running'
             : msg.status === 'cancelling' ? 'cancelling'
             : msg.status === 'succeeded' ? 'succeeded'
             : msg.status === 'failed' ? 'failed'
             : msg.status === 'cancelled' ? 'cancelled'
+            : msg.status === 'interrupted' ? 'interrupted'
             : msg.status === 'submitted' ? 'submitted'
             : msg.status === 'graph_building' ? 'graph_building'
             : 'idle';
+
+          const snapshotWindowProgress = resolveWindowProgressProtocolEvent(
+            windowProgressProtocolRef.current,
+            {
+              source: 'structured',
+              executionId: msg.executionId,
+              value: msg.windowProgress,
+            },
+            executionStateRef.current.executionId,
+          );
+          windowProgressProtocolRef.current = snapshotWindowProgress.state;
 
           dispatchExecution({
             type: 'SET_SNAPSHOT',
@@ -462,16 +624,17 @@ export const useFlowEngine = (
               startedAt: msg.createdAt ?? null,
               finishedAt: msg.finishedAt ?? null,
               totalNodes: msg.nodeCount ?? 0,
-              windowProgress: normalizeWindowProgress(msg.windowProgress),
+              windowProgress: snapshotWindowProgress.progress,
+              lastError: null,
             }
           });
 
-          const terminal = ['succeeded', 'failed', 'cancelled'].includes(msg.status ?? '');
+          const terminal = isTerminalStatus(msg.status);
           if (terminal) {
             // Terminal state: clean up all execution state
             finishedRef.current = true;
             isSubmittingRunRef.current = false;
-            restoredExecutionRef.current = false;
+            windowProgressProtocolRef.current = createWindowProgressProtocolState();
             sessionStorage.removeItem('WorkFlow_execution_id');
             setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
           } else if (['running', 'submitted', 'graph_building', 'cancelling'].includes(msg.status ?? '')) {
@@ -482,9 +645,18 @@ export const useFlowEngine = (
         }
 
         if (msgType === 'window_progress') {
-          const windowProgress = normalizeWindowProgress(msg);
-          if (windowProgress) {
-            dispatchExecution({ type: 'SET_WINDOW_PROGRESS', progress: windowProgress });
+          const result = resolveWindowProgressProtocolEvent(
+            windowProgressProtocolRef.current,
+            {
+              source: 'structured',
+              executionId: msg.executionId,
+              value: msg,
+            },
+            executionStateRef.current.executionId,
+          );
+          windowProgressProtocolRef.current = result.state;
+          if (result.progress) {
+            dispatchExecution({ type: 'SET_WINDOW_PROGRESS', progress: result.progress });
           }
           return;
         }
@@ -494,11 +666,20 @@ export const useFlowEngine = (
         // for executions started by a backend that predates window_progress.
         if (msgType === 'node_status' || msgType === 'progress') {
           if (msgType === 'progress') {
-            const legacyWindowProgress = parseLegacyWindowProgress(msg.message);
-            if (legacyWindowProgress) {
+            const result = resolveWindowProgressProtocolEvent(
+              windowProgressProtocolRef.current,
+              {
+                source: 'legacy',
+                executionId: msg.executionId,
+                value: msg.message,
+              },
+              executionStateRef.current.executionId,
+            );
+            windowProgressProtocolRef.current = result.state;
+            if (result.progress) {
               dispatchExecution({
                 type: 'SET_WINDOW_PROGRESS',
-                progress: legacyWindowProgress,
+                progress: result.progress,
               });
             }
           }
@@ -533,12 +714,11 @@ export const useFlowEngine = (
         // execution_finished: authoritative terminal event
         if (msgType === 'execution_finished') {
           if (finishedRef.current) return;
-          finishedRef.current = true;
-          isSubmittingRunRef.current = false;
 
           const status = msg.status;
           // cancelling is not terminal — handled separately
           if (status === 'cancelling') {
+            dispatchExecution({ type: 'SET_PHASE', phase: 'cancelling' });
             return;
           }
 
@@ -548,13 +728,20 @@ export const useFlowEngine = (
             }
             return;
           }
+          finishedRef.current = true;
+          isSubmittingRunRef.current = false;
+          windowProgressProtocolRef.current = createWindowProgressProtocolState();
           sessionStorage.removeItem('WorkFlow_execution_id');
           dispatchExecution({ type: 'FINISH', status, message: msg.message });
 
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
           resetRuntimeNodeState(setNodes);
 
-          const logType: LogEntry['type'] = status === 'failed' || status === 'cancelled' ? 'error' : 'success';
+          const logType: LogEntry['type'] = status === 'succeeded'
+            ? 'success'
+            : status === 'interrupted'
+              ? 'warning'
+              : 'error';
           addLog(msg.message || `Execution ${status}`, logType);
           return;
         }
@@ -563,6 +750,7 @@ export const useFlowEngine = (
         if (msgType === 'done') {
           if (finishedRef.current) return;
           finishedRef.current = true;
+          windowProgressProtocolRef.current = createWindowProgressProtocolState();
           sessionStorage.removeItem('WorkFlow_execution_id');
           dispatchExecution({ type: 'FINISH', status: 'succeeded', message: msg.message });
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
@@ -578,6 +766,7 @@ export const useFlowEngine = (
           const status = msg.status === 'cancelled' ? 'cancelled' : 'failed';
           finishedRef.current = true;
           isSubmittingRunRef.current = false;
+          windowProgressProtocolRef.current = createWindowProgressProtocolState();
           sessionStorage.removeItem('WorkFlow_execution_id');
           dispatchExecution({ type: 'SET_PHASE', phase: 'idle' });
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
@@ -589,16 +778,21 @@ export const useFlowEngine = (
         // subscribed: restore execution on reconnect
         if (msgType === 'subscribed') {
           if (msg.executionId) {
-            addLog(`Restored execution ${msg.executionId}`, 'success');
-            // Only restore edge animation if execution is still active
-            const phase = executionStateRef.current.phase;
-            if (['running', 'submitted', 'graph_building', 'cancelling'].includes(phase)) {
-              setEdges(eds => eds.map(e => ({ ...e, animated: true })));
-            } else {
-              // Terminal or idle — stop animation and clean up
-              setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
-              resetRuntimeNodeState(setNodes);
+            if (
+              restoredExecutionRef.current
+              && !reconciliationSnapshotReceivedRef.current
+            ) {
+              addLog(
+                `Execution ${msg.executionId} could not be reconciled; retrying connection.`,
+                'warning',
+              );
+              ws.close(1012, 'Execution snapshot missing');
+              return;
             }
+            restoredExecutionRef.current = false;
+            reconciliationSnapshotReceivedRef.current = false;
+            setWebsocketStatus('connected');
+            addLog(`Restored execution ${msg.executionId}`, 'success');
           }
           return;
         }
@@ -639,6 +833,214 @@ export const useFlowEngine = (
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // <-- 閸忔娊鏁敍姘涧閺堝瀵曟潪?閸楁瓕娴囩憴锕€褰傞敍灞炬￥閸忔湹绮笟婵婄
 
+  const browseServerDirectories = useCallback(async (
+    path: string,
+  ): Promise<ServerDirectoryListing> => {
+    const query = path.trim() ? `?path=${encodeURIComponent(path.trim())}` : '';
+    const payload = await fetchJson<unknown>(`/filesystem/directories${query}`);
+    return normalizeDirectoryListing(payload);
+  }, []);
+
+  const inspectRecoveryDirectory = useCallback(async (
+    recoveryDirectory: string,
+  ): Promise<RecoverySummary> => {
+    const payload = await fetchJson<unknown>('/execution/recovery/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recoveryDirectory: recoveryDirectory.trim() }),
+    });
+    return normalizeRecoverySummary(payload);
+  }, []);
+
+  const fetchRecoveryGraph = useCallback(async (
+    recoveryDirectory: string,
+  ): Promise<RecoveryOpenResponse> => {
+    const payload = await fetchJson<unknown>('/execution/recovery/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recoveryDirectory: recoveryDirectory.trim() }),
+    });
+    return normalizeRecoveryOpenResponse(payload);
+  }, []);
+
+  const applyRecoveryGraph = useCallback((
+    recoveryDirectory: string,
+    opened: RecoveryOpenResponse,
+  ) => {
+    if (editableFlowRef.current === null) {
+      editableFlowRef.current = serializeFlowForStorage(nodes, edges);
+    }
+
+    const serialized = executionGraphToSerializedFlow(opened.graph);
+    const hydrated = hydrateFlowWithLatestSpecs(serialized, nodeDefs);
+    preflightRequestIdRef.current += 1;
+    preflightAbortRef.current?.abort();
+    preflightAbortRef.current = null;
+    pendingGraphRef.current = null;
+    setIsPreflighting(false);
+    setExecutionPreflight(null);
+    setNodes(hydrated.nodes);
+    setEdges(hydrated.edges);
+    setRecoveredGraphView({
+      recoveryDirectory,
+      summary: opened.recoverySummary,
+      executionConfig: opened.executionConfig,
+    });
+    if (hydrated.invalidNodeTypes.length > 0) {
+      addLog(
+        `Recovery graph opened with ${hydrated.invalidNodeTypes.length} unavailable node type(s).`,
+        'warning',
+      );
+    } else {
+      addLog(`Opened recovery graph from ${recoveryDirectory} (read only).`, 'success');
+    }
+  }, [addLog, edges, nodeDefs, nodes, setEdges, setNodes]);
+
+  const openRecoveryDirectory = useCallback(async (
+    recoveryDirectory: string,
+  ): Promise<RecoveryOpenResponse> => {
+    const normalizedDirectory = recoveryDirectory.trim();
+    const opened = await fetchRecoveryGraph(normalizedDirectory);
+    applyRecoveryGraph(normalizedDirectory, opened);
+    setIsRecoveryBrowserOpen(false);
+    return opened;
+  }, [applyRecoveryGraph, fetchRecoveryGraph]);
+
+  const closeRecoveredGraph = useCallback(() => {
+    if (blocksExecutionChanges(executionStateRef.current.phase)) {
+      addLog('Cannot close the recovery graph while execution is active.', 'warning');
+      return;
+    }
+    const editable = editableFlowRef.current;
+    if (editable) {
+      const hydrated = hydrateFlowWithLatestSpecs(editable, nodeDefs);
+      setNodes(hydrated.nodes);
+      setEdges(hydrated.edges);
+    }
+    editableFlowRef.current = null;
+    setRecoveredGraphView(null);
+    setExecutionPreflight(null);
+    pendingGraphRef.current = null;
+    addLog('Returned to the editable workflow.', 'info');
+  }, [addLog, nodeDefs, setEdges, setNodes]);
+
+  const submitExecution = useCallback((
+    graph: ExecutionGraph,
+    executionConfig: ExecutionConfig,
+  ): boolean => {
+    if (isSubmittingRunRef.current) {
+      addLog('Execution submission is already in progress.', 'warning');
+      return false;
+    }
+    isSubmittingRunRef.current = true;
+
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || websocketStatus !== 'connected') {
+      isSubmittingRunRef.current = false;
+      addLog('Server not connected!', 'error');
+      return false;
+    }
+    if (blocksExecutionChanges(executionStateRef.current.phase)) {
+      isSubmittingRunRef.current = false;
+      addLog('Another execution is already active.', 'warning');
+      return false;
+    }
+
+    const executionId = crypto.randomUUID();
+    finishedRef.current = false;
+    windowProgressProtocolRef.current = createWindowProgressProtocolState(executionId);
+    executionStateRef.current = {
+      ...executionStateRef.current,
+      phase: 'graph_building',
+      executionId,
+    };
+    sessionStorage.setItem('WorkFlow_execution_id', executionId);
+    dispatchExecution({ type: 'START', executionId });
+
+    setEdges(currentEdges => currentEdges.map(edge => ({ ...edge, animated: true })));
+    setNodes(currentNodes => currentNodes.map(node => ({
+      ...node,
+      data: {
+        ...node.data,
+        message: 'Pending...',
+        runState: 'ready' as RunState,
+        waitingFor: undefined,
+        device: undefined,
+        executionId,
+      },
+    })));
+
+    try {
+      ws.send(JSON.stringify({
+        command: 'execute_graph',
+        graph,
+        executionId,
+        executionConfig,
+      }));
+      addLog(
+        executionConfig.mode === 'window' && executionConfig.resumeAction === 'resume'
+          ? 'Resuming Workflow...'
+          : executionConfig.mode === 'window' && executionConfig.resumeAction === 'restart'
+            ? 'Restarting Window Workflow...'
+            : 'Executing Workflow...',
+        'info',
+      );
+      return true;
+    } catch {
+      isSubmittingRunRef.current = false;
+      finishedRef.current = true;
+      executionStateRef.current = { ...initialExecutionState };
+      windowProgressProtocolRef.current = createWindowProgressProtocolState();
+      sessionStorage.removeItem('WorkFlow_execution_id');
+      dispatchExecution({ type: 'RESET' });
+      setEdges(currentEdges => currentEdges.map(
+        edge => edge.animated ? { ...edge, animated: false } : edge,
+      ));
+      resetRuntimeNodeState(setNodes);
+      addLog('Failed to send execute command', 'error');
+      return false;
+    }
+  }, [addLog, setEdges, setNodes, websocketStatus]);
+
+  const executeRecoveryDirectory = useCallback(async (
+    recoveryDirectory: string,
+    action: Exclude<ResumeAction, 'new'>,
+  ): Promise<boolean> => {
+    if (recoveryRequestInFlightRef.current || isSubmittingRunRef.current) {
+      return false;
+    }
+    recoveryRequestInFlightRef.current = true;
+    try {
+      const normalizedDirectory = recoveryDirectory.trim();
+      const opened = await fetchRecoveryGraph(normalizedDirectory);
+      applyRecoveryGraph(normalizedDirectory, opened);
+
+      const windowShape = opened.recoverySummary.windowShape;
+      if (!isValidWindowShape(opened.recoverySummary.outputShape, windowShape)) {
+        throw new Error('Saved recovery Window shape is invalid.');
+      }
+      const config: ExecutionConfig = action === 'resume'
+        ? {
+            mode: 'window',
+            windowShape,
+            resumeAction: 'resume',
+            recoveryLocation: { mode: 'custom', directory: normalizedDirectory },
+          }
+        : {
+            mode: 'window',
+            windowShape,
+            resumeAction: 'restart',
+            recoveryLocation: { mode: 'custom', directory: normalizedDirectory },
+          };
+
+      const submitted = submitExecution(opened.graph, config);
+      if (submitted) setIsRecoveryBrowserOpen(false);
+      return submitted;
+    } finally {
+      recoveryRequestInFlightRef.current = false;
+    }
+  }, [applyRecoveryGraph, fetchRecoveryGraph, submitExecution]);
+
   // =========================================================
   // Execution preflight and confirmed Run
   // =========================================================
@@ -653,8 +1055,7 @@ export const useFlowEngine = (
       addLog('Server not connected!', 'error');
       return;
     }
-    if (executionState.phase === 'graph_building' || executionState.phase === 'submitted' ||
-        executionState.phase === 'running' || executionState.phase === 'cancelling') {
+    if (blocksExecutionChanges(executionState.phase)) {
       return;
     }
 
@@ -687,21 +1088,42 @@ export const useFlowEngine = (
         throw new Error('Invalid execution preflight response');
       }
       let normalizedPreflight = preflight;
-      const shapeIsValid = preflight.output_shape == null
-        || isValidOutputShape(preflight.output_shape);
+      const outputShape = preflight.outputShape ?? preflight.output_shape;
+      const shapeIsValid = outputShape == null || isValidOutputShape(outputShape);
+      const outputs = Array.isArray(preflight.outputs) ? preflight.outputs : [];
+      const outputsComplete = outputs.length > 0 && outputs.every(output => (
+        typeof output?.nodeId === 'string'
+        && typeof output.nodeType === 'string'
+        && typeof output.displayName === 'string'
+        && typeof output.pathInput === 'string'
+        && typeof output.path === 'string'
+      ));
       const windowMetadataComplete = (
         preflight.windowable
         && shapeIsValid
-        && preflight.output_shape != null
-        && preflight.output_shape.length > 0
-        && (preflight.ndim == null || preflight.ndim === preflight.output_shape.length)
+        && outputShape != null
+        && outputShape.length > 0
+        && (preflight.ndim == null || preflight.ndim === outputShape.length)
+        && outputsComplete
       );
       if (!shapeIsValid || (preflight.windowable && !windowMetadataComplete)) {
         normalizedPreflight = {
+          ...preflight,
           windowable: false,
+          outputShape: null,
           output_shape: null,
           ndim: null,
-          reason: 'Window metadata could not be represented safely in this browser. Full Graph Execution remains available.',
+          outputs,
+          reason: outputs.length === 0
+            ? 'The backend did not return persistent output paths for Window recovery. Full Graph Execution remains available.'
+            : 'Window metadata could not be represented safely in this browser. Full Graph Execution remains available.',
+        };
+      } else {
+        normalizedPreflight = {
+          ...preflight,
+          outputShape: outputShape ?? null,
+          output_shape: outputShape ?? null,
+          outputs,
         };
       }
 
@@ -752,11 +1174,19 @@ export const useFlowEngine = (
       cancelExecutionDialog();
       return;
     }
+    if (!preflightResourcesAllowExecution(preflight)) {
+      addLog(
+        preflight.resourceError
+          || 'The active Dask cluster cannot satisfy this workflow.',
+        'error',
+      );
+      return;
+    }
 
     let normalizedConfig: ExecutionConfig = { mode: 'full_graph' };
     if (executionConfig.mode === 'window') {
-      const outputShape = preflight.output_shape ?? [];
-      const windowShape = [...executionConfig.windowShape];
+      const outputShape = preflightOutputShape(preflight);
+      const windowShape = [...(executionConfig.windowShape ?? [])];
       if (!preflight.windowable) {
         addLog(preflight.reason || 'Window execution is unavailable for this workflow.', 'warning');
         return;
@@ -765,80 +1195,52 @@ export const useFlowEngine = (
         addLog('Window shape must contain one positive integer per output dimension.', 'warning');
         return;
       }
-      normalizedConfig = { mode: 'window', windowShape };
+      if (
+        executionConfig.maxInFlightWindows !== undefined
+        && !isValidMaxInFlightWindows(executionConfig.maxInFlightWindows)
+      ) {
+        addLog('Maximum in-flight Windows must be a positive integer.', 'warning');
+        return;
+      }
+      normalizedConfig = { ...executionConfig, windowShape } as ExecutionConfig;
     }
 
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || websocketStatus !== 'connected') {
-      addLog('Server not connected!', 'error');
-      return;
-    }
-    if (executionState.phase === 'graph_building' || executionState.phase === 'submitted' ||
-        executionState.phase === 'running' || executionState.phase === 'cancelling') {
-      addLog('Another execution is already active.', 'warning');
-      return;
-    }
-
-    const executionId = crypto.randomUUID();
-    finishedRef.current = false;
-    isSubmittingRunRef.current = true;
-    pendingGraphRef.current = null;
-    setExecutionPreflight(null);
-    sessionStorage.setItem('WorkFlow_execution_id', executionId);
-    dispatchExecution({ type: 'START', executionId });
-
-    setEdges(currentEdges => currentEdges.map(edge => ({ ...edge, animated: true })));
-    setNodes(currentNodes => currentNodes.map(node => ({
-      ...node,
-      data: {
-        ...node.data,
-        message: 'Pending...',
-        runState: 'ready' as RunState,
-        waitingFor: undefined,
-        device: undefined,
-        executionId,
-      },
-    })));
-
-    try {
-      ws.send(JSON.stringify({
-        command: 'execute_graph',
-        graph,
-        executionId,
-        executionConfig: normalizedConfig,
-      }));
-      addLog('Executing Workflow...', 'info');
-    } catch {
-      isSubmittingRunRef.current = false;
-      finishedRef.current = true;
-      sessionStorage.removeItem('WorkFlow_execution_id');
-      dispatchExecution({ type: 'RESET' });
-      pendingGraphRef.current = graph;
-      setExecutionPreflight(preflight);
-      setEdges(currentEdges => currentEdges.map(edge => edge.animated ? { ...edge, animated: false } : edge));
-      resetRuntimeNodeState(setNodes);
-      addLog('Failed to send execute command', 'error');
+    if (submitExecution(graph, normalizedConfig)) {
+      pendingGraphRef.current = null;
+      setExecutionPreflight(null);
     }
   }, [
     addLog,
     cancelExecutionDialog,
     executionPreflight,
-    executionState.phase,
-    setEdges,
-    setNodes,
-    websocketStatus,
+    submitExecution,
   ]);
 
   // =========================================================
   // 閸嬫粍顒?(Stop)
   // =========================================================
   const stopFlow = useCallback(() => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      addLog('Cannot stop while the backend is disconnected.', 'warning');
+      return;
+    }
     dispatchExecution({ type: 'SET_PHASE', phase: 'cancelling' });
     wsRef.current.send(JSON.stringify({ command: 'stop_execution' }));
     setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
     addLog('Requesting Stop...', 'warning');
   }, [addLog, setEdges]);
+
+  const openRecoveryBrowser = useCallback(() => {
+    if (blocksExecutionChanges(executionStateRef.current.phase)) {
+      addLog('Cannot open another recovery directory while execution is active.', 'warning');
+      return;
+    }
+    setIsRecoveryBrowserOpen(true);
+  }, [addLog]);
+
+  const closeRecoveryBrowser = useCallback(() => {
+    setIsRecoveryBrowserOpen(false);
+  }, []);
 
   return {
     websocketStatus,
@@ -849,10 +1251,19 @@ export const useFlowEngine = (
     isReloadingNodes,
     isPreflighting,
     executionPreflight,
+    isRecoveryBrowserOpen,
+    recoveredGraphView,
     executionState,
     runFlow,
     confirmExecution,
     cancelExecutionDialog,
+    openRecoveryBrowser,
+    closeRecoveryBrowser,
+    browseServerDirectories,
+    inspectRecoveryDirectory,
+    openRecoveryDirectory,
+    executeRecoveryDirectory,
+    closeRecoveredGraph,
     stopFlow,
     reloadNodes,
   };

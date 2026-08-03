@@ -14,7 +14,8 @@ export const useWorkflows = (
   setNodes: React.Dispatch<React.SetStateAction<Node<NodeData>[]>>,
   setEdges: React.Dispatch<React.SetStateAction<Edge[]>>,
   nodeDefs: Record<string, NodeSpec>,
-  addLog: (msg: string, type?: 'info' | 'success' | 'error' | 'warning') => void
+  addLog: (msg: string, type?: 'info' | 'success' | 'error' | 'warning') => void,
+  persistenceEnabled = true,
 ) => {
   // Initial state: one default workflow — store serialized (empty) form
   const [workflows, setWorkflows] = useState<Workflow[]>(() => [
@@ -32,6 +33,7 @@ export const useWorkflows = (
 
   // === Core: save current canvas to activeWorkflow (stripped nodes) ===
   const saveCurrentWorkflow = useCallback(() => {
+    if (!persistenceEnabled) return;
     const serialized = serializeFlowForStorage(nodes, edges);
     setWorkflows(prev =>
       prev.map(w =>
@@ -40,13 +42,14 @@ export const useWorkflows = (
           : w
       )
     );
-  }, [nodes, edges, activeWorkflowId, serializeFlowForStorage]);
+  }, [nodes, edges, activeWorkflowId, persistenceEnabled]);
 
   // === Auto-sync (debounced 500ms) ===
   useEffect(() => {
+    if (!persistenceEnabled) return;
     const timer = setTimeout(() => saveCurrentWorkflow(), 500);
     return () => clearTimeout(timer);
-  }, [nodes, edges, activeWorkflowId, saveCurrentWorkflow]);
+  }, [nodes, edges, activeWorkflowId, persistenceEnabled, saveCurrentWorkflow]);
 
   // === 1. Switch workflow ===
   const switchWorkflow = useCallback(

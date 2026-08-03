@@ -1,5 +1,27 @@
 import type { WindowExecutionProgress, WindowProgressStatus } from '../types';
 
+export interface WindowProgressProtocolState {
+  executionId: string | null;
+  hasStructuredProgress: boolean;
+}
+
+type WindowProgressProtocolEvent =
+  | {
+      source: 'structured';
+      executionId?: string | null;
+      value: unknown;
+    }
+  | {
+      source: 'legacy';
+      executionId?: string | null;
+      value: unknown;
+    };
+
+export interface WindowProgressProtocolResult {
+  state: WindowProgressProtocolState;
+  progress: WindowExecutionProgress | null;
+}
+
 const isSafeInteger = (value: unknown): value is number => (
   typeof value === 'number' && Number.isSafeInteger(value)
 );
@@ -31,8 +53,6 @@ export const normalizeWindowProgress = (value: unknown): WindowExecutionProgress
   } else if (
     currentWindow < 1
     || currentWindow > totalWindows
-    || completedWindows > currentWindow
-    || currentWindow > completedWindows + 1
     || (windowStatus === 'finalizing' && (
       currentWindow !== totalWindows || completedWindows !== totalWindows
     ))
@@ -94,4 +114,50 @@ export const parseLegacyWindowProgress = (
     windowStatus: 'running',
     message: `Window ${currentWindow} / ${totalWindows}`,
   });
+};
+
+export const createWindowProgressProtocolState = (
+  executionId: string | null = null,
+): WindowProgressProtocolState => ({
+  executionId,
+  hasStructuredProgress: false,
+});
+
+/**
+ * Prefer execution-level structured progress once the current execution emits it.
+ * Legacy node messages remain available only for older backends that never emit
+ * ``window_progress``.
+ */
+export const resolveWindowProgressProtocolEvent = (
+  state: WindowProgressProtocolState,
+  event: WindowProgressProtocolEvent,
+  activeExecutionId: string | null = null,
+): WindowProgressProtocolResult => {
+  const executionId = event.executionId ?? activeExecutionId;
+  const currentState = state.executionId === executionId
+    ? state
+    : createWindowProgressProtocolState(executionId);
+
+  if (event.source === 'structured') {
+    const progress = normalizeWindowProgress(event.value);
+    if (!progress) {
+      return { state: currentState, progress: null };
+    }
+    return {
+      state: {
+        executionId,
+        hasStructuredProgress: true,
+      },
+      progress,
+    };
+  }
+
+  if (currentState.hasStructuredProgress) {
+    return { state: currentState, progress: null };
+  }
+
+  return {
+    state: currentState,
+    progress: parseLegacyWindowProgress(event.value),
+  };
 };

@@ -411,7 +411,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
     <>
       <NodeResizer
         color="var(--color-accent)"
-        isVisible={!!selected && !collapsed}
+        isVisible={!!selected && !collapsed && !locked}
         minWidth={260}
         minHeight={80}
         handleStyle={{ width: 8, height: 8 }}

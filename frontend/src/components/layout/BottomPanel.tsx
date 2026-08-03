@@ -17,11 +17,13 @@ function formatTime(ts: string | number): string {
 const PHASE_LABELS: Record<string, string> = {
   idle: 'Idle', graph_building: 'Building', submitted: 'Queued',
   running: 'Running', cancelling: 'Stopping', succeeded: 'Done',
+  disconnected: 'Disconnected', interrupted: 'Interrupted',
   failed: 'Failed', cancelled: 'Cancelled',
 };
 const PHASE_PILL: Record<string, 'idle' | 'info' | 'running' | 'success' | 'danger' | 'warning' | 'muted'> = {
   idle: 'idle', graph_building: 'info', submitted: 'info',
   running: 'running', cancelling: 'warning', succeeded: 'success',
+  disconnected: 'warning', interrupted: 'warning',
   failed: 'danger', cancelled: 'warning',
 };
 
@@ -47,8 +49,12 @@ export default function BottomPanel() {
   }, [logs, isConsoleOpen]);
 
   useEffect(() => {
-    if (websocketStatus === 'reconnecting' && executionState.executionId && !isConsoleOpen) toggleConsole();
-  }, [websocketStatus, executionState.executionId, isConsoleOpen, toggleConsole]);
+    if (
+      websocketStatus === 'reconnecting'
+      && executionState.phase === 'disconnected'
+      && !isConsoleOpen
+    ) toggleConsole();
+  }, [websocketStatus, executionState.phase, isConsoleOpen, toggleConsole]);
 
   const startResizing = useCallback((e: React.MouseEvent) => {
     e.preventDefault(); isDragging.current = true;
@@ -77,8 +83,11 @@ export default function BottomPanel() {
   const hasActiveWindow = Boolean(
     windowProgress
     && windowProgress.windowStatus === 'running'
-    && windowProgress.currentWindow === windowProgress.completedWindows + 1
+    && windowProgress.totalWindows > 0
   );
+  const activeWindowOffset = windowProgress && windowProgress.totalWindows > 0
+    ? (windowProgress.currentWindow - 1) * 100 / windowProgress.totalWindows
+    : 0;
 
   const mainMessage = useMemo(() => {
     if (phase === 'idle') return 'Ready';
@@ -87,6 +96,8 @@ export default function BottomPanel() {
     if (phase === 'running' && windowProgress) return windowProgress.message;
     if (phase === 'running') return 'Workflow running';
     if (phase === 'cancelling') return 'Stopping...';
+    if (phase === 'disconnected') return 'Backend connection lost; checking execution status...';
+    if (phase === 'interrupted') return 'Backend execution interrupted; Window runs can be resumed from Recovery';
     if (phase === 'succeeded') return 'Completed successfully';
     if (phase === 'failed') return executionState.lastError ? `Failed: ${executionState.lastError.slice(0, 80)}` : 'Execution failed';
     if (phase === 'cancelled') return 'Execution cancelled';
@@ -186,7 +197,7 @@ export default function BottomPanel() {
                 <div
                   className="absolute inset-y-0 rounded-full animate-pulse"
                   style={{
-                    left: `${windowProgress.progress}%`,
+                    left: `${activeWindowOffset}%`,
                     width: `${activeWindowWidth}%`,
                     backgroundColor: 'var(--color-info)',
                   }}
@@ -203,7 +214,14 @@ export default function BottomPanel() {
         {/* Actions */}
         <div className="flex items-center gap-1 shrink-0" onClick={e => e.stopPropagation()}>
           {(isExecuting || isCancelling) && (
-            <Button variant="danger" size="xs" onClick={stopFlow}>■ Stop</Button>
+            <Button
+              variant="danger"
+              size="xs"
+              onClick={stopFlow}
+              disabled={websocketStatus !== 'connected'}
+            >
+              ■ Stop
+            </Button>
           )}
           <IconButton size="xs" onClick={() => clearLogs()} title="Clear logs">
             <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>

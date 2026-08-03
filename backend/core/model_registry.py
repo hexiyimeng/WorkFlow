@@ -19,22 +19,9 @@ KNOWN_MODEL_EXTENSIONS = (
 
 
 class ModelRegistry:
-    """
-    Generic local model catalog for WorkFlow.
-
-    Storage convention:
-
-        backend/models/{provider}/{model-file-or-directory}
-
-    or, when WorkFlow_MODELS_DIR is set:
-
-        {WorkFlow_MODELS_DIR}/{provider}/{model-file-or-directory}
-
-    This registry is provider-agnostic. It does not set third-party environment
-    variables, download weights, know model zoo defaults, or special-case
-    Cellpose/SAM/StarDist/etc. Provider nodes/adapters can use provider_dir()
-    when a library needs its own cache directory.
-    """
+    ##1. 确定 provider 模型目录
+    ##2. 列出本地已有模型
+    ##3. 将模型名称解析为绝对路径
 
     def __init__(self, models_root: Path | None = None):
         env_root = os.getenv("WorkFlow_MODELS_DIR")

@@ -1,236 +1,224 @@
-"""
-内存监控工具：用于追踪 execution 生命周期中的内存变化。
+"""Driver and Dask Worker memory diagnostics.
 
-支持的内存类型：
-- Python 进程内存 (RSS)
-- Dask worker 内存（如果可用）
-- GPU 显存（如果可用）
-
-使用方式：
-    from services.memory_monitor import MemoryMonitor
-
-    monitor = MemoryMonitor()
-    monitor.log_snapshot("execution_start")
-    # ... do work ...
-    monitor.log_snapshot("execution_end")
-    monitor.log_delta("execution_start", "execution_end")
+CUDA allocations belong to isolated GPU Worker processes, so GPU memory is
+queried with ``Client.run`` instead of inspecting CUDA state in the Driver.
+Diagnostics are best-effort and never participate in scheduling correctness.
 """
 
-import os
+from __future__ import annotations
+
 import logging
+import os
 import time
-from typing import Optional, Dict, Any
+from typing import Any
 
 logger = logging.getLogger("WorkFlow.MemoryMonitor")
 
 
-class MemoryMonitor:
-    """
-    内存监控器：记录和对比内存快照。
-    """
+def collect_worker_memory_snapshot(dask_worker: Any | None = None) -> dict[str, Any]:
+    """Collect one memory snapshot inside a Dask Worker process."""
+    if dask_worker is None:
+        from distributed import get_worker
 
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
-        self.snapshots: Dict[str, Dict[str, Any]] = {}
+        dask_worker = get_worker()
 
-        # 检测可用的监控后端
-        self._has_psutil = self._check_psutil()
-        self._has_torch = self._check_torch()
+    role = str(
+        getattr(
+            dask_worker,
+            "worker_role",
+            os.environ.get("WORKFLOW_WORKER_ROLE", "unknown"),
+        )
+    )
+    assigned_device = str(getattr(dask_worker, "assigned_gpu", "unknown"))
+    result: dict[str, Any] = {
+        "workerName": str(getattr(dask_worker, "name", "")),
+        "workerRole": role,
+        "assignedDevice": assigned_device,
+        "rssMb": None,
+        "cudaAllocatedMb": None,
+        "cudaReservedMb": None,
+    }
 
-    def _check_psutil(self) -> bool:
-        """检查 psutil 是否可用"""
-        try:
-            import psutil
-            return True
-        except ImportError:
-            logger.debug("[MemoryMonitor] psutil not available, process memory tracking disabled")
-            return False
+    try:
+        import psutil
 
-    def _check_torch(self) -> bool:
-        """检查 PyTorch GPU 是否可用"""
+        result["rssMb"] = round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 1)
+    except Exception as exc:
+        result["rssError"] = f"{type(exc).__name__}: {exc}"
+
+    if role == "gpu":
         try:
             import torch
-            return torch.cuda.is_available()
-        except Exception:
+
+            result["cudaAllocatedMb"] = round(
+                torch.cuda.memory_allocated(0) / (1024 * 1024),
+                1,
+            )
+            result["cudaReservedMb"] = round(
+                torch.cuda.memory_reserved(0) / (1024 * 1024),
+                1,
+            )
+        except Exception as exc:
+            result["cudaError"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def query_worker_memory(client: Any) -> dict[str, dict[str, Any]]:
+    """Return best-effort memory diagnostics from every connected Worker."""
+    try:
+        return client.run(collect_worker_memory_snapshot)
+    except Exception as exc:
+        logger.debug("[MemoryMonitor] Failed to collect Worker memory: %s", exc)
+        return {}
+
+
+class MemoryMonitor:
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.snapshots: dict[str, dict[str, Any]] = {}
+        self._has_psutil = self._check_psutil()
+
+    def _check_psutil(self) -> bool:
+        try:
+            import psutil  # noqa: F401
+
+            return True
+        except ImportError:
+            logger.debug("[MemoryMonitor] psutil unavailable; Driver RSS disabled")
             return False
 
-    def _get_process_memory_mb(self) -> Optional[float]:
-        """获取当前进程的 RSS 内存（MB）"""
+    def _get_process_memory_mb(self) -> float | None:
         if not self._has_psutil:
             return None
         try:
             import psutil
-            process = psutil.Process(os.getpid())
-            return process.memory_info().rss / (1024 * 1024)
-        except Exception as e:
-            logger.debug(f"[MemoryMonitor] Failed to get process memory: {e}")
+
+            return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        except Exception as exc:
+            logger.debug("[MemoryMonitor] Failed to get Driver RSS: %s", exc)
             return None
 
-    def _get_gpu_memory_mb(self) -> Optional[Dict[str, float]]:
-        """获取 GPU 显存使用情况（MB）"""
-        if not self._has_torch:
-            return None
-        try:
-            import torch
-            result = {}
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) / (1024 * 1024)
-                reserved = torch.cuda.memory_reserved(i) / (1024 * 1024)
-                result[f"gpu_{i}"] = {
-                    "allocated_mb": round(allocated, 1),
-                    "reserved_mb": round(reserved, 1)
-                }
-            return result if result else None
-        except Exception as e:
-            logger.debug(f"[MemoryMonitor] Failed to get GPU memory: {e}")
-            return None
-
-    def _get_dask_memory_mb(self, client=None) -> Optional[Dict[str, float]]:
-        """获取 Dask worker 内存使用情况（MB）"""
+    def _get_dask_memory_mb(self, client: Any | None = None) -> dict[str, float] | None:
+        """Compatibility view containing only Worker RSS values."""
         if client is None:
             return None
-        try:
-            # 尝试获取 worker 内存信息
-            def get_worker_memory():
-                import psutil
-                process = psutil.Process()
-                return process.memory_info().rss / (1024 * 1024)
+        diagnostics = query_worker_memory(client)
+        rss_by_worker = {
+            worker: float(info["rssMb"])
+            for worker, info in diagnostics.items()
+            if info.get("rssMb") is not None
+        }
+        return rss_by_worker or None
 
-            # 使用 client.run 在所有 worker 上执行
-            results = client.run(get_worker_memory)
-            if results:
-                return {k: round(v, 1) for k, v in results.items()}
-            return None
-        except Exception as e:
-            logger.debug(f"[MemoryMonitor] Failed to get Dask memory: {e}")
-            return None
-
-    def take_snapshot(self, name: str, client=None) -> Dict[str, Any]:
-        """
-        记录当前内存快照。
-
-        Args:
-            name: 快照名称（如 "execution_start"）
-            client: Dask client（可选，用于获取 worker 内存）
-
-        Returns:
-            内存快照字典
-        """
+    def take_snapshot(self, name: str, client: Any | None = None) -> dict[str, Any]:
+        worker_memory = query_worker_memory(client) if client is not None else None
         snapshot = {
             "timestamp": time.time(),
             "process_mb": self._get_process_memory_mb(),
-            "gpu": self._get_gpu_memory_mb(),
-            "dask_workers": self._get_dask_memory_mb(client) if client else None
+            # Kept for callers that consume the old snapshot schema. Driver-side
+            # CUDA values were misleading once GPU work moved into Nannies.
+            "gpu": None,
+            "dask_workers": (
+                {
+                    worker: float(info["rssMb"])
+                    for worker, info in (worker_memory or {}).items()
+                    if info.get("rssMb") is not None
+                }
+                or None
+            ),
+            "worker_memory": worker_memory or None,
         }
-
         self.snapshots[name] = snapshot
         return snapshot
 
-    def log_snapshot(self, name: str, client=None, level: str = "info") -> Dict[str, Any]:
-        """
-        记录快照并输出日志。
-
-        Args:
-            name: 快照名称
-            client: Dask client
-            level: 日志级别
-
-        Returns:
-            内存快照字典
-        """
+    def log_snapshot(
+        self,
+        name: str,
+        client: Any | None = None,
+        level: str = "info",
+    ) -> dict[str, Any]:
         if not self.enabled:
             return {}
 
         snapshot = self.take_snapshot(name, client)
+        parts: list[str] = []
+        if snapshot["process_mb"] is not None:
+            parts.append(f"Driver={snapshot['process_mb']:.0f}MB")
+        for worker, info in (snapshot.get("worker_memory") or {}).items():
+            worker_parts = [
+                str(info.get("workerRole", "unknown")),
+                f"rss:{info['rssMb']:.0f}MB" if info.get("rssMb") is not None else "rss:N/A",
+            ]
+            if info.get("cudaAllocatedMb") is not None:
+                worker_parts.append(f"alloc:{info['cudaAllocatedMb']:.0f}MB")
+            if info.get("cudaReservedMb") is not None:
+                worker_parts.append(f"res:{info['cudaReservedMb']:.0f}MB")
+            parts.append(f"{worker}=[{','.join(worker_parts)}]")
 
-        # 格式化日志
-        parts = []
-        if snapshot["process_mb"]:
-            parts.append(f"Process={snapshot['process_mb']:.0f}MB")
-        if snapshot["gpu"]:
-            for gpu_id, info in snapshot["gpu"].items():
-                parts.append(f"{gpu_id}=alloc:{info['allocated_mb']:.0f}MB/res:{info['reserved_mb']:.0f}MB")
-        if snapshot["dask_workers"]:
-            worker_mems = [f"{k}:{v:.0f}MB" for k, v in snapshot["dask_workers"].items()]
-            parts.append(f"Dask=[{', '.join(worker_mems)}]")
-
-        msg = f"[Memory] {name}: {' | '.join(parts) if parts else 'N/A'}"
-
+        message = f"[Memory] {name}: {' | '.join(parts) if parts else 'N/A'}"
         if level == "debug":
-            logger.debug(msg)
+            logger.debug(message)
         else:
-            logger.info(msg)
-
+            logger.info(message)
         return snapshot
 
-    def log_delta(self, name1: str, name2: str) -> Dict[str, Any]:
-        """
-        计算并记录两个快照之间的内存变化。
-
-        Args:
-            name1: 起始快照名称
-            name2: 结束快照名称
-
-        Returns:
-            内存变化字典
-        """
+    def log_delta(self, name1: str, name2: str) -> dict[str, Any]:
         if not self.enabled:
             return {}
 
-        s1 = self.snapshots.get(name1)
-        s2 = self.snapshots.get(name2)
-
-        if not s1 or not s2:
-            logger.warning(f"[Memory] Cannot compute delta: missing snapshots {name1} or {name2}")
+        first = self.snapshots.get(name1)
+        second = self.snapshots.get(name2)
+        if not first or not second:
+            logger.warning("[Memory] Cannot compute delta: missing snapshots %s or %s", name1, name2)
             return {}
 
-        delta = {
-            "time_elapsed_s": round(s2["timestamp"] - s1["timestamp"], 1)
+        delta: dict[str, Any] = {
+            "time_elapsed_s": round(second["timestamp"] - first["timestamp"], 1)
         }
+        if first.get("process_mb") is not None and second.get("process_mb") is not None:
+            process_delta = second["process_mb"] - first["process_mb"]
+            delta["process_delta_mb"] = round(process_delta, 1)
+            delta["process_delta_percent"] = (
+                round(process_delta / first["process_mb"] * 100, 1)
+                if first["process_mb"] > 0
+                else 0
+            )
 
-        # Process memory delta
-        if s1["process_mb"] and s2["process_mb"]:
-            delta["process_delta_mb"] = round(s2["process_mb"] - s1["process_mb"], 1)
-            delta["process_delta_percent"] = round(
-                (s2["process_mb"] - s1["process_mb"]) / s1["process_mb"] * 100, 1
-            ) if s1["process_mb"] > 0 else 0
+        worker_deltas: dict[str, dict[str, float]] = {}
+        first_workers = first.get("worker_memory") or {}
+        second_workers = second.get("worker_memory") or {}
+        for worker, current in second_workers.items():
+            previous = first_workers.get(worker)
+            if not previous:
+                continue
+            values: dict[str, float] = {}
+            for key, output_key in (
+                ("rssMb", "rssDeltaMb"),
+                ("cudaAllocatedMb", "cudaAllocatedDeltaMb"),
+                ("cudaReservedMb", "cudaReservedDeltaMb"),
+            ):
+                if current.get(key) is not None and previous.get(key) is not None:
+                    values[output_key] = round(current[key] - previous[key], 1)
+            if values:
+                worker_deltas[worker] = values
+        if worker_deltas:
+            delta["worker_delta"] = worker_deltas
 
-        # GPU memory delta
-        if s1["gpu"] and s2["gpu"]:
-            gpu_deltas = {}
-            for gpu_id in s2["gpu"]:
-                if gpu_id in s1["gpu"]:
-                    alloc_delta = s2["gpu"][gpu_id]["allocated_mb"] - s1["gpu"][gpu_id]["allocated_mb"]
-                    res_delta = s2["gpu"][gpu_id]["reserved_mb"] - s1["gpu"][gpu_id]["reserved_mb"]
-                    gpu_deltas[gpu_id] = {
-                        "allocated_delta_mb": round(alloc_delta, 1),
-                        "reserved_delta_mb": round(res_delta, 1)
-                    }
-            if gpu_deltas:
-                delta["gpu_delta"] = gpu_deltas
-
-        # Log the delta
         parts = [f"elapsed={delta['time_elapsed_s']}s"]
         if "process_delta_mb" in delta:
-            sign = "+" if delta["process_delta_mb"] >= 0 else ""
-            parts.append(f"Process={sign}{delta['process_delta_mb']:.0f}MB ({sign}{delta['process_delta_percent']:.1f}%)")
-        if "gpu_delta" in delta:
-            for gpu_id, info in delta["gpu_delta"].items():
-                sign = "+" if info["allocated_delta_mb"] >= 0 else ""
-                parts.append(f"{gpu_id}={sign}{info['allocated_delta_mb']:.0f}MB")
-
-        logger.info(f"[Memory] Delta {name1} -> {name2}: {' | '.join(parts)}")
-
+            value = delta["process_delta_mb"]
+            parts.append(f"Driver={value:+.0f}MB ({delta['process_delta_percent']:+.1f}%)")
+        for worker, values in worker_deltas.items():
+            detail = ",".join(f"{key}={value:+.0f}MB" for key, value in values.items())
+            parts.append(f"{worker}=[{detail}]")
+        logger.info("[Memory] Delta %s -> %s: %s", name1, name2, " | ".join(parts))
         return delta
 
-# Process-global singleton. This is valid only while state_manager enforces one
-# active execution at a time. Multi-active execution would need per-execution
-# snapshot storage to avoid mixed diagnostics.
-_memory_monitor: Optional[MemoryMonitor] = None
+
+_memory_monitor: MemoryMonitor | None = None
 
 
 def get_memory_monitor(enabled: bool = True) -> MemoryMonitor:
-    """获取全局内存监控器实例"""
     global _memory_monitor
     if _memory_monitor is None:
         _memory_monitor = MemoryMonitor(enabled=enabled)

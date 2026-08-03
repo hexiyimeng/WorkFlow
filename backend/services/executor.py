@@ -1,8 +1,10 @@
 import asyncio
+import contextvars
 import inspect
 import logging
 import operator
 import uuid
+from dataclasses import dataclass, replace
 
 import dask
 import dask.array as da
@@ -15,20 +17,45 @@ from core.invocation_builder import (
     get_node_input_defs,
     prepare_node_inputs,
 )
+from core.config import config
+from core.execution_resources import dask_annotation_kwargs
+from core.platform import rewrite_dashboard_url
 from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
 from core.type_system import can_connect_types, is_dask_array_type
 from core.window_execution import (
+    ActiveExecutionLock,
     ExecutionConfig,
+    ExecutionLayout,
+    RecoveryManifest,
+    RecoveryOutput,
     WindowCheckpointStore,
     WindowGenerator,
+    Window,
+    atomic_write_json,
     compute_plan_fingerprint,
     compute_workflow_fingerprint,
+    execution_config_to_dict,
+    load_execution_config_snapshot,
+    load_graph_snapshot,
+    load_recovery_manifest,
     parse_execution_config,
+    write_execution_config_snapshot,
+    write_graph_snapshot,
+    write_recovery_manifest,
+)
+from core.workflow_resources import (
+    WorkflowResourcePlan,
+    build_workflow_resource_plan,
+    validate_workflow_resource_plan,
 )
 from core.worker_cache import force_clear_worker_cache
 from services.dask_service import dask_service
 from services.memory_monitor import get_memory_monitor
+from services.recovery_service import (
+    discover_terminal_outputs,
+    inspect_recovery_directory,
+)
 
 logger = logging.getLogger("BrainFlow.Executor")
 logging.getLogger("distributed.core").setLevel(logging.CRITICAL)
@@ -317,6 +344,311 @@ def _remove_futures(tracked_futures: list, completed_futures: list) -> None:
             pass
 
 
+def _compute_with_resource_boundaries(
+    client,
+    collections,
+    *,
+    disable_graph_optimization: bool,
+):
+    """Submit collections without constraining framework finalization tasks."""
+    # ``Client.compute`` adds finalization tasks for Dask collections.  Those
+    # tasks are framework work rather than node work, so they may run on any
+    # available Worker. The annotation applies only to layers created by
+    # ``compute``; existing node layers keep their CPU/GPU resource annotations.
+    with dask.annotate(
+        brainflow_node_id="__framework_finalize__",
+        execution_resource="any",
+    ):
+        if disable_graph_optimization:
+            return client.compute(collections, optimize_graph=False)
+        return client.compute(collections)
+
+
+def _available_resources_dict(summary) -> dict[str, int | float | None]:
+    if summary is None:
+        return {
+            "cpuWorkers": None,
+            "gpuWorkers": None,
+            "cpuSlots": None,
+            "gpuSlots": None,
+        }
+    return {
+        "cpuWorkers": len(summary.cpu_workers),
+        "gpuWorkers": len(summary.gpu_workers),
+        "cpuSlots": summary.total_cpu_slots,
+        "gpuSlots": summary.total_gpu_slots,
+    }
+
+
+def _resolve_max_in_flight_windows(
+    requested: int | None,
+    *,
+    resource_plan: WorkflowResourcePlan,
+    cluster_summary,
+) -> int:
+    if requested is not None:
+        resolved = requested
+    elif resource_plan.requires_gpu:
+        resolved = max(1, 2 * len(cluster_summary.gpu_workers))
+    else:
+        resolved = 1
+
+    configured_cap = config.MAX_IN_FLIGHT_WINDOWS
+    if configured_cap is not None:
+        resolved = min(resolved, int(configured_cap))
+    return max(1, int(resolved))
+
+
+def _resource_plan_for_execution_mode(
+    plan: WorkflowResourcePlan,
+    execution_config: ExecutionConfig | None,
+) -> WorkflowResourcePlan:
+    """Validate constrained pools and provide capacity for an all-any DAG."""
+    del execution_config
+
+    has_cpu_nodes = any(node.resource == "cpu" for node in plan.nodes)
+    has_gpu_nodes = any(node.resource == "gpu" for node in plan.nodes)
+    if has_cpu_nodes and plan.cpu_workers == 0:
+        raise ValueError(
+            "The workflow contains CPU-constrained node(s), but their aggregate "
+            "EXECUTION_WORKERS count is 0. Declare at least one CPU Worker."
+        )
+    if has_gpu_nodes and plan.gpu_workers == 0:
+        raise ValueError(
+            "The workflow contains GPU-constrained node(s), but their aggregate "
+            "EXECUTION_WORKERS count is 0. Declare at least one GPU Worker."
+        )
+
+    if plan.cpu_workers > 0 or plan.gpu_workers > 0:
+        return plan
+
+    # An all-any graph has no typed pool from which to derive cluster capacity.
+    # One CPU Worker is the minimal executable topology and is reflected in
+    # preflight so the confirmation dialog matches formal execution.
+    return replace(
+        plan,
+        requires_cpu=True,
+        cpu_workers=1,
+    )
+
+
+def _requires_resource_boundary_preservation(
+    plan: WorkflowResourcePlan,
+) -> bool:
+    """Return whether optimization could fuse differently constrained layers."""
+
+    return len({node.resource for node in plan.nodes}) > 1
+
+
+@dataclass
+class InFlightWindow:
+    window: Window
+    futures: list
+    waiter: asyncio.Task
+
+
+async def _wait_for_window_futures(futures: list) -> None:
+    """Wait for, then inspect, every terminal Future for one Window."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: dist_wait(futures),
+    )
+    future_exceptions: list[BaseException] = []
+    for future in futures:
+        try:
+            exception = await loop.run_in_executor(None, future.exception)
+        except BaseException as exc:
+            future_exceptions.append(exc)
+        else:
+            if exception is not None:
+                future_exceptions.append(exception)
+    if future_exceptions:
+        raise future_exceptions[0]
+
+
+async def _cancel_in_flight_windows(
+    client,
+    in_flight: dict[asyncio.Task, InFlightWindow],
+    tracked_futures: list,
+) -> None:
+    """Cancel and drain all uncommitted Window work without changing the bitmap."""
+    entries = list(in_flight.values())
+    futures = [future for entry in entries for future in entry.futures]
+    waiters = [entry.waiter for entry in entries]
+
+    if futures:
+        try:
+            client.cancel(futures, force=True)
+        except Exception as exc:
+            logger.debug("[Cleanup] In-flight Window cancellation failed: %s", exc)
+
+    for waiter in waiters:
+        if not waiter.done():
+            waiter.cancel()
+    if waiters:
+        await asyncio.gather(*waiters, return_exceptions=True)
+
+    if futures:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: dist_wait(futures, timeout=2),
+            )
+        except Exception as exc:
+            logger.debug("[Cleanup] In-flight Window drain failed: %s", exc)
+        _release_futures(futures)
+        _remove_futures(tracked_futures, futures)
+    in_flight.clear()
+
+
+async def _execute_pending_windows(
+    *,
+    client,
+    root_arrays: list[da.Array],
+    window_generator: WindowGenerator,
+    pending_indices: np.ndarray,
+    completed_windows_bitmap: np.ndarray,
+    window_store: WindowCheckpointStore,
+    max_in_flight_windows: int,
+    execution_roots: list[str],
+    tracked_futures: list,
+    progress_callback,
+    window_progress_callback,
+    disable_graph_optimization: bool,
+) -> None:
+    """Execute zero-valued Window positions with bounded, out-of-order completion."""
+    total_windows = window_generator.total_windows
+    pending_iterator = iter(pending_indices)
+    in_flight: dict[asyncio.Task, InFlightWindow] = {}
+    submitted_count = 0
+    progress_stride = max(1, (len(pending_indices) + 999) // 1000)
+
+    async def submit_next_window() -> bool:
+        nonlocal submitted_count
+        try:
+            raw_index = next(pending_iterator)
+        except StopIteration:
+            return False
+
+        window = window_generator.window_at(int(raw_index))
+        completed_count = int(np.count_nonzero(completed_windows_bitmap))
+        message = f"Window {window.index + 1} / {total_windows}"
+        await window_progress_callback(
+            current_window=window.index + 1,
+            completed_windows=completed_count,
+            total_windows=total_windows,
+            window_status="running",
+            message=message,
+        )
+        progress_percent = min(
+            99,
+            int(completed_count * 100 / total_windows),
+        )
+        should_broadcast_progress = (
+            submitted_count == 0
+            or submitted_count + 1 == len(pending_indices)
+            or submitted_count % progress_stride == 0
+        )
+        for node_id in execution_roots:
+            await progress_callback(
+                node_id,
+                progress_percent,
+                message,
+                "running",
+                broadcast_update=should_broadcast_progress,
+            )
+
+        # Slicing is framework-managed work that may run on either Worker pool.
+        # Existing node layers retain their own resource annotations.
+        with dask.annotate(
+            brainflow_node_id="__window__",
+            execution_resource="any",
+        ):
+            window_collections = [
+                root_array[window.slices]
+                for root_array in root_arrays
+            ]
+        futures = _normalize_futures(
+            _compute_with_resource_boundaries(
+                client,
+                window_collections,
+                disable_graph_optimization=disable_graph_optimization,
+            )
+        )
+        tracked_futures.extend(futures)
+        waiter = asyncio.create_task(_wait_for_window_futures(futures))
+        in_flight[waiter] = InFlightWindow(
+            window=window,
+            futures=futures,
+            waiter=waiter,
+        )
+        submitted_count += 1
+        return True
+
+    try:
+        while (
+            len(in_flight) < max_in_flight_windows
+            and await submit_next_window()
+        ):
+            pass
+
+        while in_flight:
+            done, _ = await asyncio.wait(
+                tuple(in_flight),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            first_error: BaseException | None = None
+            for waiter in done:
+                entry = in_flight.pop(waiter)
+                try:
+                    waiter.result()
+                    # The Driver commits only after all terminal Futures for
+                    # this specific Window have succeeded.
+                    window_store.mark_completed(
+                        completed_windows_bitmap,
+                        entry.window.coordinates,
+                    )
+                    completed_count = int(
+                        np.count_nonzero(completed_windows_bitmap)
+                    )
+                    await window_progress_callback(
+                        current_window=entry.window.index + 1,
+                        completed_windows=completed_count,
+                        total_windows=total_windows,
+                        window_status="running",
+                        message=(
+                            f"Completed Window {entry.window.index + 1} / "
+                            f"{total_windows}"
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                finally:
+                    _release_futures(entry.futures)
+                    _remove_futures(tracked_futures, entry.futures)
+
+            if first_error is not None:
+                raise first_error
+
+            while (
+                len(in_flight) < max_in_flight_windows
+                and await submit_next_window()
+            ):
+                pass
+    except BaseException:
+        await _cancel_in_flight_windows(
+            client,
+            in_flight,
+            tracked_futures,
+        )
+        raise
+
+
 async def _cancel_and_await_tasks(tasks: dict) -> None:
     """Cancel unfinished graph-building tasks and wait until they have stopped."""
     pending = [task for task in tasks.values() if not task.done()]
@@ -571,13 +903,14 @@ async def _build_lazy_execution_roots(
                     if key in signature.parameters
                 }
 
-            with dask.annotate(brainflow_node_id=node_id):
+            with dask.annotate(**dask_annotation_kwargs(node_cls, node_id)):
                 if asyncio.iscoroutinefunction(method):
                     output = await method(**func_args)
                 else:
+                    annotation_context = contextvars.copy_context()
                     output = await loop.run_in_executor(
                         None,
-                        lambda: method(**func_args),
+                        lambda: annotation_context.run(method, **func_args),
                     )
 
             output_items = list(output if isinstance(output, tuple) else (output,))
@@ -635,7 +968,10 @@ async def _build_lazy_execution_roots(
     return results, node_instances, tasks
 
 
-async def preflight_graph(graph: dict) -> dict:
+async def preflight_graph(
+    graph: dict,
+    execution_config: ExecutionConfig | dict | None = None,
+) -> dict:
     """Validate and inspect lazy terminal metadata without compute or an execution slot."""
     validate_graph_structure(graph)
     validate_graph_acyclic(graph)
@@ -647,14 +983,103 @@ async def preflight_graph(graph: dict) -> dict:
             "OUTPUT_NODE=True and have no outgoing graph connections."
         )
 
+    selected_config = (
+        None
+        if execution_config is None
+        else parse_execution_config(execution_config)
+    )
+    resource_plan = _resource_plan_for_execution_mode(
+        build_workflow_resource_plan(graph, execution_roots),
+        selected_config,
+    )
+    resource_summary = None
+    resources_satisfied: bool | None = None
+    resource_error: str | None = None
+    active_client = dask_service.get_client()
+    if active_client is not None:
+        try:
+            resource_summary = await asyncio.to_thread(
+                dask_service.get_cluster_resource_summary,
+                active_client,
+            )
+            validate_workflow_resource_plan(resource_plan, resource_summary)
+            resources_satisfied = True
+        except Exception as exc:
+            # The formal execution path provisions the exact DAG-derived
+            # topology. A smaller cluster left by an earlier workflow is not a
+            # permanent resource failure and must not disable Run in the UI.
+            resources_satisfied = None
+            logger.debug(
+                "[Preflight] Active cluster will be resized for this DAG: %s",
+                exc,
+            )
+
+    outputs = discover_terminal_outputs(graph, execution_roots)
+    output_entries = [
+        output.to_dict(include_path_input=True)
+        for output in outputs
+    ]
+    def response(
+        *,
+        windowable: bool,
+        output_shape: tuple[int, ...] | None,
+        reason: str | None = None,
+    ) -> dict:
+        window_shape: tuple[int, ...] | None = None
+        window_grid_shape: tuple[int, ...] | None = None
+        total_windows: int | None = None
+        if (
+            windowable
+            and output_shape is not None
+            and selected_config is not None
+            and selected_config.mode == "window"
+            and selected_config.window_shape is not None
+        ):
+            generator = WindowGenerator(
+                output_shape,
+                selected_config.window_shape,
+            )
+            window_shape = generator.window_shape
+            window_grid_shape = generator.axis_counts
+            total_windows = generator.total_windows
+
+        result = {
+            "windowable": windowable,
+            # Keep the former snake_case field for older clients while the
+            # canonical API uses camelCase.
+            "output_shape": (
+                list(output_shape) if output_shape is not None else None
+            ),
+            "outputShape": (
+                list(output_shape) if output_shape is not None else None
+            ),
+            "ndim": len(output_shape) if output_shape is not None else None,
+            "windowShape": (
+                list(window_shape) if window_shape is not None else None
+            ),
+            "windowGridShape": (
+                list(window_grid_shape)
+                if window_grid_shape is not None
+                else None
+            ),
+            "totalWindows": total_windows,
+            "outputs": output_entries,
+            "requiredResources": resource_plan.to_preflight_dict(),
+            "availableResources": _available_resources_dict(resource_summary),
+            "resourcesSatisfied": resources_satisfied,
+            "resourceError": resource_error,
+        }
+        if reason is not None:
+            result["reason"] = reason
+        return result
+
     declared_reason = _declared_window_root_reason(graph, execution_roots)
     if declared_reason is not None:
-        return {
-            "windowable": False,
-            "output_shape": None,
-            "ndim": None,
-            "reason": declared_reason,
-        }
+        return response(
+            windowable=False,
+            output_shape=None,
+            reason=declared_reason,
+        )
 
     tasks: dict = {}
     results: dict = {}
@@ -671,22 +1096,76 @@ async def preflight_graph(graph: dict) -> dict:
         )
         _, output_shape, reason = _inspect_window_roots(results, execution_roots)
         if reason is not None:
-            return {
-                "windowable": False,
-                "output_shape": None,
-                "ndim": None,
-                "reason": reason,
-            }
-        return {
-            "windowable": True,
-            "output_shape": list(output_shape),
-            "ndim": len(output_shape),
-        }
+            return response(
+                windowable=False,
+                output_shape=None,
+                reason=reason,
+            )
+        return response(
+            windowable=True,
+            output_shape=output_shape,
+        )
     finally:
         await _cancel_and_await_tasks(tasks)
         tasks.clear()
         results.clear()
         node_instances.clear()
+
+
+def _recovery_control_paths(layout: ExecutionLayout) -> tuple:
+    return (
+        layout.manifest_path,
+        layout.graph_path,
+        layout.execution_config_path,
+        layout.checkpoint_path,
+    )
+
+
+def _output_contract(
+    outputs: tuple[RecoveryOutput, ...],
+) -> dict[str, tuple[str, str]]:
+    return {
+        output.node_id: (output.node_type, output.path)
+        for output in outputs
+    }
+
+
+def _validate_resume_contract(
+    *,
+    manifest: RecoveryManifest,
+    saved_config: ExecutionConfig,
+    outputs: tuple[RecoveryOutput, ...],
+    output_shape: tuple[int, ...],
+    workflow_fingerprint: str,
+    plan_fingerprint: str,
+) -> None:
+    if saved_config.mode != "window" or saved_config.window_shape is None:
+        raise ValueError(
+            "Recovery execution_config.json must describe Window execution "
+            "with a windowShape."
+        )
+    if manifest.workflow_fingerprint != workflow_fingerprint:
+        raise ValueError(
+            "Recovery workflow fingerprint does not match immutable graph.json."
+        )
+    if manifest.plan_fingerprint != plan_fingerprint:
+        raise ValueError(
+            "Recovery plan fingerprint does not match the saved Window plan."
+        )
+    if manifest.window_plan.output_shape != output_shape:
+        raise ValueError(
+            "Recovery output shape does not match the lazy graph metadata "
+            f"({manifest.window_plan.output_shape} != {output_shape})."
+        )
+    if manifest.window_plan.window_shape != saved_config.window_shape:
+        raise ValueError(
+            "Recovery execution_config.json windowShape does not match manifest.json."
+        )
+    if _output_contract(manifest.outputs) != _output_contract(outputs):
+        raise ValueError(
+            "Recovery manifest outputs do not match the terminal OUTPUT nodes "
+            "in immutable graph.json."
+        )
 
 
 # =============================================================================
@@ -699,7 +1178,7 @@ async def execute_graph(
     *,
     checkpoint_store: WindowCheckpointStore | None = None,
 ):
-    """Execute true terminal roots in Full Graph or sequential Window mode."""
+    """Execute true terminal roots in Full Graph or bounded Window mode."""
     tasks: dict = {}
     sink_futures: list = []
     results: dict = {}
@@ -713,6 +1192,14 @@ async def execute_graph(
     completed_windows_bitmap: np.ndarray | None = None
     window_generator: WindowGenerator | None = None
     selected_config: ExecutionConfig | None = None
+    requested_config: ExecutionConfig | None = None
+    recovery_layout: ExecutionLayout | None = None
+    recovery_lock: ActiveExecutionLock | None = None
+    recovery_manifest: RecoveryManifest | None = None
+    terminal_outputs: tuple[RecoveryOutput, ...] = ()
+    legacy_migration_message: str | None = None
+    resource_plan: WorkflowResourcePlan | None = None
+    cluster_summary = None
 
     if not execution_id:
         execution_id = uuid.uuid4().hex
@@ -721,17 +1208,191 @@ async def execute_graph(
     mem_monitor.snapshots.clear()
     state_manager.create_execution(execution_id)
 
+    async def log_memory_snapshot(name: str) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    mem_monitor.log_snapshot,
+                    name,
+                    client,
+                ),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Memory] Timed out collecting Worker diagnostics for %s.",
+                name,
+            )
+
+    def persist_recovery_status(status: str) -> None:
+        nonlocal recovery_manifest
+        if (
+            recovery_layout is None
+            or recovery_manifest is None
+            or recovery_lock is None
+            or not recovery_lock.acquired
+        ):
+            return
+        recovery_manifest = recovery_manifest.with_status(
+            status,
+            execution_id=execution_id,
+        )
+        write_recovery_manifest(recovery_layout, recovery_manifest)
+
     try:
         selected_config = parse_execution_config(execution_config)
+        requested_config = selected_config
+
+        # A direct resume is rooted in the immutable recovery snapshot, not in
+        # a potentially edited graph sent by the browser.  Resolve and own the
+        # selected directory before reading its control files.
+        if (
+            selected_config.mode == "window"
+            and selected_config.resume_action == "resume"
+        ):
+            if checkpoint_store is not None:
+                window_store = checkpoint_store
+                recovery_layout = checkpoint_store.layout
+            elif (
+                selected_config.recovery_location is not None
+                and selected_config.recovery_location.mode == "custom"
+            ):
+                recovery_layout = ExecutionLayout.resolve(
+                    selected_config,
+                    (),
+                )
+                window_store = WindowCheckpointStore(recovery_layout)
+            else:
+                # output_sidecar needs the submitted graph only to locate the
+                # canonical directory.  It is discarded immediately after the
+                # immutable graph snapshot is loaded.
+                validate_graph_structure(graph)
+                validate_graph_acyclic(graph)
+                validate_graph_types(graph)
+                request_roots = find_execution_roots(graph)
+                request_outputs = discover_terminal_outputs(
+                    graph,
+                    request_roots,
+                )
+                recovery_layout = ExecutionLayout.resolve(
+                    selected_config,
+                    request_outputs,
+                )
+                window_store = WindowCheckpointStore(recovery_layout)
+
+            inspection = inspect_recovery_directory(
+                recovery_layout.control_directory,
+                require_unlocked=True,
+            )
+            recovery_lock = ActiveExecutionLock(
+                recovery_layout,
+                execution_id,
+            ).acquire()
+            # Validate again while owning the directory so the files cannot be
+            # swapped between the public inspection and execution startup.
+            inspection = inspect_recovery_directory(
+                recovery_layout.control_directory,
+                require_unlocked=False,
+            )
+            recovery_manifest = inspection.manifest
+            if (
+                not recovery_layout.checkpoint_path.exists()
+                and window_store.legacy_checkpoint_path.exists()
+            ):
+                saved_plan = recovery_manifest.window_plan
+                migrated = window_store.migrate_legacy(
+                    workflow_fingerprint=recovery_manifest.workflow_fingerprint,
+                    plan_fingerprint=recovery_manifest.plan_fingerprint,
+                    output_shape=saved_plan.output_shape,
+                    window_shape=saved_plan.window_shape,
+                    expected_shape=saved_plan.window_grid_shape,
+                    total_windows=saved_plan.total_windows,
+                )
+                if migrated is None:
+                    raise ValueError("Legacy Window checkpoint was not migrated.")
+                legacy_migration_message = (
+                    "Migrated legacy Window checkpoint: "
+                    f"{int(np.count_nonzero(migrated))} / "
+                    f"{saved_plan.total_windows} Window(s) completed."
+                )
+            saved_graph = inspection.graph
+            saved_config = inspection.execution_config
+            if saved_config.mode != "window" or saved_config.window_shape is None:
+                raise ValueError(
+                    "Recovery execution_config.json does not contain a valid "
+                    "Window plan."
+                )
+            if (
+                selected_config.window_shape is not None
+                and selected_config.window_shape != saved_config.window_shape
+            ):
+                raise ValueError(
+                    "Requested windowShape does not match the saved recovery plan."
+                )
+            graph = saved_graph
+            selected_config = ExecutionConfig(
+                mode="window",
+                window_shape=saved_config.window_shape,
+                max_in_flight_windows=requested_config.max_in_flight_windows,
+                recovery_location=requested_config.recovery_location,
+                resume_action="resume",
+            )
+
         validate_graph_structure(graph)
         validate_graph_acyclic(graph)
         validate_graph_types(graph)
-        # Full Graph keeps the existing eager client lifecycle.  Preflight never
-        # reaches this executor, while Window mode creates a client only when it
-        # actually has a Window to submit.
-        if selected_config.mode == "full_graph":
-            client = dask_service.ensure_client()
-        mem_monitor.log_snapshot("execution_start", client=client)
+        execution_roots = find_execution_roots(graph)
+        execution_root_set = set(execution_roots)
+        if not execution_roots:
+            raise ValueError(
+                "No terminal output node found. A workflow execution root must "
+                "declare OUTPUT_NODE=True and have no outgoing graph connections."
+            )
+
+        # This is the authoritative validation path. For Resume, graph is now
+        # the immutable snapshot from the recovery directory.
+        resource_plan = _resource_plan_for_execution_mode(
+            build_workflow_resource_plan(graph, execution_roots),
+            selected_config,
+        )
+        client = await asyncio.to_thread(
+            dask_service.ensure_client,
+            cpu_workers=resource_plan.cpu_workers,
+            gpu_workers=resource_plan.gpu_workers,
+        )
+        cluster_summary = await asyncio.to_thread(
+            dask_service.get_cluster_resource_summary,
+            client,
+        )
+        validate_workflow_resource_plan(resource_plan, cluster_summary)
+        await log_memory_snapshot("execution_start")
+
+        dashboard_url = str(
+            rewrite_dashboard_url(
+                getattr(client, "dashboard_link", None),
+                config.DASHBOARD_HOST,
+            )
+            or ""
+        )
+        cluster_message = (
+            "[System] Dask Cluster Ready: "
+            f"CPU Workers={len(cluster_summary.cpu_workers)}, "
+            f"GPU Workers={len(cluster_summary.gpu_workers)}, "
+            f"Dashboard={dashboard_url or 'unavailable'}"
+        )
+        await state_manager.broadcast(execution_id, {
+            "type": "cluster_ready",
+            "executionId": execution_id,
+            "dashboardUrl": dashboard_url,
+            "cpuWorkers": len(cluster_summary.cpu_workers),
+            "gpuWorkers": len(cluster_summary.gpu_workers),
+            "message": cluster_message,
+        })
+        state_manager.add_log(
+            cluster_message,
+            "success",
+            execution_id=execution_id,
+        )
 
         await state_manager.broadcast(execution_id, {
             "type": "log",
@@ -739,26 +1400,6 @@ async def execute_graph(
             "executionId": execution_id,
         })
         state_manager.add_log("Engine Started...", "info", execution_id=execution_id)
-
-        execution_roots = find_execution_roots(graph)
-        execution_root_set = set(execution_roots)
-        if not execution_roots:
-            state_manager.set_execution_status(execution_id, ExecutionStatus.FAILED)
-            await state_manager.broadcast(execution_id, {
-                "type": "execution_finished",
-                "executionId": execution_id,
-                "status": "failed",
-                "message": (
-                    "No terminal output node found. A workflow execution root must "
-                    "declare OUTPUT_NODE=True and have no outgoing graph connections."
-                ),
-            })
-            state_manager.add_log(
-                "No terminal output node found. Cannot execute.",
-                "error",
-                execution_id=execution_id,
-            )
-            return execution_id
 
         loop = asyncio.get_running_loop()
 
@@ -846,56 +1487,315 @@ async def execute_graph(
         expected_output_shape: tuple[int, ...] | None = None
 
         if selected_config.mode == "window":
-            declared_reason = _declared_window_root_reason(graph, execution_roots)
-            if declared_reason is not None:
-                raise ValueError(declared_reason)
-            # This metadata pass skips preprocess, so opening the Run dialog and
-            # selecting a plan cannot initialize or overwrite writer outputs.
-            metadata_tasks: dict = {}
-            metadata_results: dict = {}
-            metadata_instances: dict = {}
-            try:
-                await _build_lazy_execution_roots(
-                    graph,
-                    execution_roots,
-                    execution_id=None,
-                    is_preflight=True,
-                    tasks=metadata_tasks,
-                    results=metadata_results,
-                    node_instances=metadata_instances,
+            terminal_outputs = discover_terminal_outputs(
+                graph,
+                execution_roots,
+            )
+            preflight = await preflight_graph(graph, selected_config)
+            if not preflight.get("windowable"):
+                raise ValueError(
+                    preflight.get("reason")
+                    or "Window execution is unavailable for this workflow."
                 )
-                _, expected_output_shape, window_reason = _inspect_window_roots(
-                    metadata_results,
-                    execution_roots,
-                )
-                if window_reason is not None:
-                    raise ValueError(window_reason)
+            expected_output_shape = tuple(preflight["outputShape"])
+            if selected_config.window_shape is None:
+                raise ValueError("Window execution requires a resolved windowShape.")
+            window_generator = WindowGenerator(
+                expected_output_shape,
+                selected_config.window_shape,
+            )
+            workflow_fingerprint = compute_workflow_fingerprint(
+                graph,
+                execution_roots,
+            )
+            plan_fingerprint = compute_plan_fingerprint(
+                expected_output_shape,
+                selected_config.window_shape,
+            )
 
-                window_generator = WindowGenerator(
-                    expected_output_shape,
-                    selected_config.window_shape,
+            if selected_config.resume_action == "resume":
+                if (
+                    recovery_layout is None
+                    or recovery_manifest is None
+                    or window_store is None
+                ):
+                    raise RuntimeError("Window recovery was not initialized.")
+                _validate_resume_contract(
+                    manifest=recovery_manifest,
+                    saved_config=load_execution_config_snapshot(recovery_layout),
+                    outputs=terminal_outputs,
+                    output_shape=expected_output_shape,
+                    workflow_fingerprint=workflow_fingerprint,
+                    plan_fingerprint=plan_fingerprint,
                 )
-                workflow_fingerprint = compute_workflow_fingerprint(
-                    graph,
-                    execution_roots,
-                )
-                plan_fingerprint = compute_plan_fingerprint(
-                    expected_output_shape,
-                    selected_config.window_shape,
-                )
-                window_store = checkpoint_store or WindowCheckpointStore()
-                completed_windows_bitmap = window_store.load(
-                    workflow_fingerprint,
-                    plan_fingerprint,
+                if (
+                    requested_config is not None
+                    and requested_config.recovery_location is not None
+                    and requested_config.recovery_location.mode == "output_sidecar"
+                ):
+                    saved_sidecar_layout = ExecutionLayout.resolve(
+                        requested_config,
+                        terminal_outputs,
+                    )
+                    if (
+                        saved_sidecar_layout.control_directory
+                        != recovery_layout.control_directory
+                    ):
+                        raise ValueError(
+                            "Selected sidecar does not match the immutable recovery graph."
+                        )
+                completed_windows_bitmap = window_store.load_writable(
                     expected_shape=window_generator.axis_counts,
                 )
-                if completed_windows_bitmap is not None:
+                if completed_windows_bitmap is None:
+                    raise ValueError(
+                        f"Recovery checkpoint is missing: {recovery_layout.checkpoint_path}"
+                    )
+                is_resuming = True
+            else:
+                if checkpoint_store is not None:
+                    window_store = checkpoint_store
+                    recovery_layout = checkpoint_store.layout
+                else:
+                    recovery_layout = ExecutionLayout.resolve(
+                        selected_config,
+                        terminal_outputs,
+                        workflow_fingerprint=workflow_fingerprint,
+                        plan_fingerprint=plan_fingerprint,
+                    )
+                    window_store = WindowCheckpointStore(recovery_layout)
+
+                recovery_lock = ActiveExecutionLock(
+                    recovery_layout,
+                    execution_id,
+                ).acquire()
+                existing_control_paths = tuple(
+                    path
+                    for path in _recovery_control_paths(recovery_layout)
+                    if path.exists()
+                )
+                required_control_paths = set(
+                    _recovery_control_paths(recovery_layout)
+                )
+                legacy_exists = window_store.legacy_checkpoint_path.exists()
+                implicit_legacy_migration = (
+                    selected_config.resume_action == "new"
+                    and selected_config.recovery_location is None
+                    and legacy_exists
+                )
+
+                if implicit_legacy_migration:
+                    if recovery_layout.checkpoint_path.exists():
+                        # A crash may have happened after the NumPy commit but
+                        # before the old JSON could be removed. The modern record
+                        # is authoritative and must be complete.
+                        if set(existing_control_paths) != required_control_paths:
+                            raise ValueError(
+                                "Legacy migration contains completed_windows.npy "
+                                "but its modern recovery metadata is incomplete."
+                            )
+                        inspection = inspect_recovery_directory(
+                            recovery_layout.control_directory,
+                            require_unlocked=False,
+                        )
+                        recovery_manifest = inspection.manifest
+                        _validate_resume_contract(
+                            manifest=recovery_manifest,
+                            saved_config=inspection.execution_config,
+                            outputs=terminal_outputs,
+                            output_shape=expected_output_shape,
+                            workflow_fingerprint=workflow_fingerprint,
+                            plan_fingerprint=plan_fingerprint,
+                        )
+                        completed_windows_bitmap = window_store.load_writable(
+                            expected_shape=window_generator.axis_counts,
+                        )
+                        if completed_windows_bitmap is None:
+                            raise ValueError("Migrated Window checkpoint is missing.")
+                    else:
+                        legacy_summary = window_store.inspect_legacy(
+                            workflow_fingerprint=workflow_fingerprint,
+                            plan_fingerprint=plan_fingerprint,
+                            output_shape=expected_output_shape,
+                            window_shape=selected_config.window_shape,
+                            expected_shape=window_generator.axis_counts,
+                            total_windows=window_generator.total_windows,
+                        )
+                        if legacy_summary is None:
+                            raise ValueError("Legacy Window checkpoint is missing.")
+
+                        if recovery_layout.graph_path.exists():
+                            if load_graph_snapshot(recovery_layout) != graph:
+                                raise ValueError(
+                                    "Partial legacy migration graph.json does not "
+                                    "match the submitted graph."
+                                )
+                        else:
+                            write_graph_snapshot(recovery_layout, graph)
+
+                        if recovery_layout.execution_config_path.exists():
+                            partial_saved_config = load_execution_config_snapshot(
+                                recovery_layout
+                            )
+                            if (
+                                partial_saved_config.mode != "window"
+                                or partial_saved_config.window_shape
+                                != selected_config.window_shape
+                            ):
+                                raise ValueError(
+                                    "Partial legacy migration execution_config.json "
+                                    "does not match the submitted Window plan."
+                                )
+                        else:
+                            write_execution_config_snapshot(
+                                recovery_layout,
+                                selected_config,
+                            )
+
+                        if recovery_layout.manifest_path.exists():
+                            recovery_manifest = load_recovery_manifest(
+                                recovery_layout
+                            )
+                            _validate_resume_contract(
+                                manifest=recovery_manifest,
+                                saved_config=selected_config,
+                                outputs=terminal_outputs,
+                                output_shape=expected_output_shape,
+                                workflow_fingerprint=workflow_fingerprint,
+                                plan_fingerprint=plan_fingerprint,
+                            )
+                            recovery_manifest = recovery_manifest.with_status(
+                                "prepared",
+                                execution_id=execution_id,
+                            )
+                        else:
+                            recovery_manifest = RecoveryManifest.create(
+                                execution_id=execution_id,
+                                workflow_fingerprint=workflow_fingerprint,
+                                plan_fingerprint=plan_fingerprint,
+                                output_shape=expected_output_shape,
+                                window_shape=selected_config.window_shape,
+                                outputs=terminal_outputs,
+                                status="prepared",
+                            )
+                        # Metadata is durable before the legacy JSON identity is
+                        # replaced by the NumPy checkpoint.
+                        write_recovery_manifest(
+                            recovery_layout,
+                            recovery_manifest,
+                        )
+                        completed_windows_bitmap = window_store.migrate_legacy(
+                            workflow_fingerprint=workflow_fingerprint,
+                            plan_fingerprint=plan_fingerprint,
+                            output_shape=expected_output_shape,
+                            window_shape=selected_config.window_shape,
+                            expected_shape=window_generator.axis_counts,
+                            total_windows=window_generator.total_windows,
+                        )
+                        if completed_windows_bitmap is None:
+                            raise ValueError("Legacy Window checkpoint was not migrated.")
+
                     is_resuming = True
-            finally:
-                await _cancel_and_await_tasks(metadata_tasks)
-                metadata_tasks.clear()
-                metadata_results.clear()
-                metadata_instances.clear()
+                    completed_count = int(
+                        np.count_nonzero(completed_windows_bitmap)
+                    )
+                    legacy_migration_message = (
+                        "Migrated legacy Window checkpoint: "
+                        f"{completed_count} / {window_generator.total_windows} "
+                        "Window(s) completed."
+                    )
+                else:
+                    if (
+                        selected_config.resume_action == "new"
+                        and (existing_control_paths or legacy_exists)
+                    ):
+                        raise FileExistsError(
+                            "Recovery state already exists; choose Resume or Restart: "
+                            f"{recovery_layout.control_directory}"
+                        )
+                    if selected_config.resume_action == "restart":
+                        if set(existing_control_paths) == required_control_paths:
+                            inspect_recovery_directory(
+                                recovery_layout.control_directory,
+                                require_unlocked=False,
+                            )
+                        elif (
+                            legacy_exists
+                            and not recovery_layout.checkpoint_path.exists()
+                        ):
+                            legacy_summary = window_store.inspect_legacy(
+                                workflow_fingerprint=workflow_fingerprint,
+                                plan_fingerprint=plan_fingerprint,
+                                output_shape=expected_output_shape,
+                                window_shape=selected_config.window_shape,
+                                expected_shape=window_generator.axis_counts,
+                                total_windows=window_generator.total_windows,
+                            )
+                            if legacy_summary is None:
+                                raise ValueError(
+                                    "Legacy Window checkpoint is missing."
+                                )
+                        elif existing_control_paths:
+                            raise ValueError(
+                                "Cannot restart an incomplete recovery record. "
+                                "Expected manifest.json, graph.json, "
+                                "execution_config.json, and completed_windows.npy."
+                            )
+
+                        atomic_write_json(recovery_layout.graph_path, graph)
+                        atomic_write_json(
+                            recovery_layout.execution_config_path,
+                            execution_config_to_dict(selected_config),
+                        )
+                    else:
+                        write_graph_snapshot(recovery_layout, graph)
+                        write_execution_config_snapshot(
+                            recovery_layout,
+                            selected_config,
+                        )
+                    completed_windows_bitmap = window_store.create(
+                        window_generator.axis_counts,
+                        overwrite=(selected_config.resume_action == "restart"),
+                    )
+                    recovery_manifest = RecoveryManifest.create(
+                        execution_id=execution_id,
+                        workflow_fingerprint=workflow_fingerprint,
+                        plan_fingerprint=plan_fingerprint,
+                        output_shape=expected_output_shape,
+                        window_shape=selected_config.window_shape,
+                        outputs=terminal_outputs,
+                        status="prepared",
+                    )
+                    write_recovery_manifest(
+                        recovery_layout,
+                        recovery_manifest,
+                    )
+                    if selected_config.resume_action == "restart":
+                        window_store.remove_legacy_checkpoint()
+
+            recovery_message = (
+                "Window recovery directory: "
+                f"{recovery_layout.control_directory}"
+            )
+            await state_manager.broadcast(
+                execution_id,
+                {"type": "log", "message": recovery_message},
+            )
+            state_manager.add_log(
+                recovery_message,
+                "info",
+                execution_id=execution_id,
+            )
+            if legacy_migration_message is not None:
+                await state_manager.broadcast(
+                    execution_id,
+                    {"type": "log", "message": legacy_migration_message},
+                )
+                state_manager.add_log(
+                    legacy_migration_message,
+                    "info",
+                    execution_id=execution_id,
+                )
 
         await state_manager.broadcast(
             execution_id,
@@ -916,12 +1816,19 @@ async def execute_graph(
         if selected_config.mode == "full_graph":
             output_sinks = _collect_output_sinks(results, execution_roots)
             if output_sinks:
-                client = dask_service.ensure_client()
                 for node_id in execution_roots:
                     await progress_callback(node_id, None, "Submitted", "submitted")
 
                 collections = [sink["collection"] for sink in output_sinks]
-                futures = _normalize_futures(client.compute(collections))
+                futures = _normalize_futures(
+                    _compute_with_resource_boundaries(
+                        client,
+                        collections,
+                        disable_graph_optimization=(
+                            _requires_resource_boundary_preservation(resource_plan)
+                        ),
+                    )
+                )
                 sink_futures.extend(futures)
                 await state_manager.broadcast(execution_id, {
                     "type": "log",
@@ -963,14 +1870,21 @@ async def execute_graph(
                 raise RuntimeError("Window Execution was not initialized.")
             if workflow_fingerprint is None or plan_fingerprint is None:
                 raise RuntimeError("Window recovery identity was not initialized.")
-
             if completed_windows_bitmap is None:
-                completed_windows_bitmap = window_store.create(
-                    workflow_fingerprint,
-                    plan_fingerprint,
-                    window_generator.axis_counts,
+                raise RuntimeError(
+                    "Window completion checkpoint was not initialized before "
+                    "the execution graph was built."
                 )
-            else:
+            if recovery_layout is None or recovery_manifest is None:
+                raise RuntimeError("Window recovery manifest was not initialized.")
+
+            recovery_manifest = recovery_manifest.with_status(
+                "running",
+                execution_id=execution_id,
+            )
+            write_recovery_manifest(recovery_layout, recovery_manifest)
+
+            if is_resuming:
                 completed_count = int(np.count_nonzero(completed_windows_bitmap))
                 resume_message = (
                     "Resuming Window Execution at finalization."
@@ -999,9 +1913,13 @@ async def execute_graph(
                 or bool(np.all(completed_windows_bitmap == 1))
             )
             if not all_windows_completed:
-                client = dask_service.ensure_client()
                 for node_id in execution_roots:
                     await progress_callback(node_id, None, "Submitted", "submitted")
+                max_in_flight_windows = _resolve_max_in_flight_windows(
+                    selected_config.max_in_flight_windows,
+                    resource_plan=resource_plan,
+                    cluster_summary=cluster_summary,
+                )
                 window_summary = (
                     f"Window Execution: {total_windows} Window(s), "
                     f"{len(pending_indices)} pending."
@@ -1015,90 +1933,36 @@ async def execute_graph(
                     "info",
                     execution_id=execution_id,
                 )
-                progress_stride = max(1, (len(pending_indices) + 999) // 1000)
-
-                for pending_position, raw_index in enumerate(pending_indices):
-                    window = window_generator.window_at(int(raw_index))
-                    completed_count = int(
-                        np.count_nonzero(completed_windows_bitmap)
+                if max_in_flight_windows > 1:
+                    concurrency_message = (
+                        "Window concurrency: up to "
+                        f"{max_in_flight_windows} Window(s) in flight."
                     )
-                    message = f"Window {window.index + 1} / {total_windows}"
-                    await window_progress_callback(
-                        current_window=window.index + 1,
-                        completed_windows=completed_count,
-                        total_windows=total_windows,
-                        window_status="running",
-                        message=message,
+                    await state_manager.broadcast(
+                        execution_id,
+                        {"type": "log", "message": concurrency_message},
                     )
-                    progress_percent = min(
-                        99,
-                        int(completed_count * 100 / total_windows),
+                    state_manager.add_log(
+                        concurrency_message,
+                        "info",
+                        execution_id=execution_id,
                     )
-                    should_broadcast_progress = (
-                        pending_position == 0
-                        or pending_position + 1 == len(pending_indices)
-                        or pending_position % progress_stride == 0
-                    )
-                    for node_id in execution_roots:
-                        await progress_callback(
-                            node_id,
-                            progress_percent,
-                            message,
-                            "running",
-                            broadcast_update=should_broadcast_progress,
-                        )
-
-                    window_collections = [
-                        root_array[window.slices]
-                        for root_array in root_arrays
-                    ]
-                    current_futures: list = []
-                    wait_completed = False
-                    try:
-                        current_futures = _normalize_futures(
-                            client.compute(window_collections)
-                        )
-                        sink_futures.extend(current_futures)
-                        await loop.run_in_executor(
-                            None,
-                            lambda futures=current_futures: dist_wait(futures),
-                        )
-                        wait_completed = True
-                        future_exceptions: list[BaseException] = []
-                        for future in current_futures:
-                            exception = await loop.run_in_executor(
-                                None,
-                                future.exception,
-                            )
-                            if exception is not None:
-                                future_exceptions.append(exception)
-                        if future_exceptions:
-                            raise future_exceptions[0]
-
-                        # Commit only after every terminal Future succeeded.
-                        window_store.mark_completed(
-                            workflow_fingerprint,
-                            plan_fingerprint,
-                            completed_windows_bitmap,
-                            window.coordinates,
-                        )
-                        completed_count = int(
-                            np.count_nonzero(completed_windows_bitmap)
-                        )
-                        await window_progress_callback(
-                            current_window=window.index + 1,
-                            completed_windows=completed_count,
-                            total_windows=total_windows,
-                            window_status="running",
-                            message=(
-                                f"Completed Window {window.index + 1} / "
-                                f"{total_windows}"
-                            ),
-                        )
-                    finally:
-                        if wait_completed:
-                            _release_futures(current_futures)
-                            _remove_futures(sink_futures, current_futures)
+                await _execute_pending_windows(
+                    client=client,
+                    root_arrays=root_arrays,
+                    window_generator=window_generator,
+                    pending_indices=pending_indices,
+                    completed_windows_bitmap=completed_windows_bitmap,
+                    window_store=window_store,
+                    max_in_flight_windows=max_in_flight_windows,
+                    execution_roots=execution_roots,
+                    tracked_futures=sink_futures,
+                    progress_callback=progress_callback,
+                    window_progress_callback=window_progress_callback,
+                    disable_graph_optimization=(
+                        _requires_resource_boundary_preservation(resource_plan)
+                    ),
+                )
             else:
                 for node_id in execution_roots:
                     await progress_callback(
@@ -1136,12 +2000,25 @@ async def execute_graph(
         for node_id in execution_roots:
             await progress_callback(node_id, 100, "Done", "done")
 
-        # No await is allowed between checkpoint deletion and the terminal state
-        # transition.  A cancellation during the progress update above keeps the
-        # checkpoint; once it is deleted the execution is synchronously terminal.
+        # Recovery history remains durable after success. No await is allowed
+        # between committing the terminal manifest, releasing ownership, and the
+        # synchronous successful state transition.
         if selected_config.mode == "window":
-            window_store.delete(workflow_fingerprint, plan_fingerprint)
-        state_manager.set_execution_status(execution_id, ExecutionStatus.SUCCEEDED)
+            if recovery_layout is None or recovery_manifest is None:
+                raise RuntimeError("Window recovery manifest was not initialized.")
+            if recovery_lock is None or not recovery_lock.acquired:
+                raise RuntimeError("Window recovery lock was not held at success.")
+            recovery_manifest = recovery_manifest.with_status(
+                "succeeded",
+                execution_id=execution_id,
+            )
+            write_recovery_manifest(recovery_layout, recovery_manifest)
+            recovery_lock.release()
+        state_manager.set_execution_status(
+            execution_id,
+            ExecutionStatus.SUCCEEDED,
+            release_active=False,
+        )
         await state_manager.broadcast(execution_id, {
             "type": "execution_finished",
             "executionId": execution_id,
@@ -1162,22 +2039,43 @@ async def execute_graph(
 
     except asyncio.CancelledError:
         should_cancel_dask_objects = True
-        logger.warning("Execution Cancelled.")
         session = state_manager.get_execution(execution_id)
-        if session and session.status == ExecutionStatus.RUNNING:
-            state_manager.set_execution_status(
-                execution_id,
-                ExecutionStatus.CANCELLING,
+        user_requested_stop = bool(
+            session and session.status == ExecutionStatus.CANCELLING
+        )
+        terminal_status = (
+            ExecutionStatus.CANCELLED
+            if user_requested_stop
+            else ExecutionStatus.INTERRUPTED
+        )
+        terminal_message = (
+            "Execution Cancelled"
+            if user_requested_stop
+            else "Execution Interrupted by backend shutdown"
+        )
+        logger.warning("%s.", terminal_message)
+        try:
+            persist_recovery_status(terminal_status)
+        except Exception as status_exc:
+            logger.error(
+                "Failed to persist %s recovery status: %s",
+                terminal_status,
+                status_exc,
+                exc_info=True,
             )
-        state_manager.set_execution_status(execution_id, ExecutionStatus.CANCELLED)
+        state_manager.set_execution_status(
+            execution_id,
+            terminal_status,
+            release_active=False,
+        )
         await state_manager.broadcast(execution_id, {
             "type": "execution_finished",
             "executionId": execution_id,
-            "status": "cancelled",
-            "message": "Execution Cancelled",
+            "status": terminal_status,
+            "message": terminal_message,
         })
         state_manager.add_log(
-            "Execution Cancelled",
+            terminal_message,
             "warning",
             execution_id=execution_id,
         )
@@ -1191,9 +2089,18 @@ async def execute_graph(
         )
         session = state_manager.get_execution(execution_id)
         if session and session.status == ExecutionStatus.CANCELLING:
+            try:
+                persist_recovery_status("cancelled")
+            except Exception as status_exc:
+                logger.error(
+                    "Failed to persist cancelled recovery status: %s",
+                    status_exc,
+                    exc_info=True,
+                )
             state_manager.set_execution_status(
                 execution_id,
                 ExecutionStatus.CANCELLED,
+                release_active=False,
             )
             await state_manager.broadcast(execution_id, {
                 "type": "execution_finished",
@@ -1210,7 +2117,19 @@ async def execute_graph(
                 execution_id=execution_id,
             )
         else:
-            state_manager.set_execution_status(execution_id, ExecutionStatus.FAILED)
+            try:
+                persist_recovery_status("failed")
+            except Exception as status_exc:
+                logger.error(
+                    "Failed to persist failed recovery status: %s",
+                    status_exc,
+                    exc_info=True,
+                )
+            state_manager.set_execution_status(
+                execution_id,
+                ExecutionStatus.FAILED,
+                release_active=False,
+            )
             await state_manager.broadcast(execution_id, {
                 "type": "execution_finished",
                 "executionId": execution_id,
@@ -1223,7 +2142,7 @@ async def execute_graph(
                 execution_id=execution_id,
             )
     finally:
-        mem_monitor.log_snapshot("execution_end_before_cleanup", client=client)
+        await log_memory_snapshot("execution_end_before_cleanup")
         await _cancel_and_await_tasks(tasks)
 
         if client and sink_futures and should_cancel_dask_objects:
@@ -1235,6 +2154,10 @@ async def execute_graph(
                 )
             except Exception as exc:
                 logger.debug("[Cleanup] Cancel failed: %s", exc)
+
+        # Successful Full Graph Futures and cancelled failure Futures both
+        # release their Driver references here.
+        _release_futures(sink_futures)
 
         if should_cancel_dask_objects:
             for node_id, instance in node_instances.items():
@@ -1252,17 +2175,39 @@ async def execute_graph(
 
         if client:
             try:
-                stats = client.run(force_clear_worker_cache)
+                stats = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.run,
+                        force_clear_worker_cache,
+                    ),
+                    timeout=15.0,
+                )
                 logger.info("[Cleanup] Worker cache cleared: %s", stats)
             except Exception as exc:
                 logger.debug("[Cleanup] Worker cache clear failed: %s", exc)
 
+        # Failed, interrupted, and cancelled executions keep ownership until
+        # outstanding Dask work and node cleanup finish, then expose recovery.
+        if recovery_lock is not None and recovery_lock.acquired:
+            try:
+                recovery_lock.release()
+            except Exception as exc:
+                logger.error(
+                    "[Cleanup] Recovery lock release failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+
         sink_futures.clear()
         tasks.clear()
         results.clear()
+        # Keep the single-active-execution lease until all Driver/Worker
+        # cleanup has completed. A following DAG may require a different
+        # Worker topology and must not replace this execution's cluster early.
+        state_manager.clear_active_execution(execution_id)
         state_manager.cleanup_old_executions()
 
-        mem_monitor.log_snapshot("execution_end_after_cleanup", client=client)
+        await log_memory_snapshot("execution_end_after_cleanup")
         mem_monitor.log_delta(
             "execution_start",
             "execution_end_before_cleanup",

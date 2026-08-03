@@ -10,6 +10,10 @@ import type {
   PluginDiagnostics,
   ExecutionConfig,
   ExecutionPreflightResponse,
+  RecoveredGraphView,
+  RecoveryOpenResponse,
+  RecoverySummary,
+  ServerDirectoryListing,
 } from '../types';
 
 export interface FlowContextType {
@@ -34,6 +38,9 @@ export interface FlowContextType {
   isCancelling: boolean;       // phase === 'cancelling'
   isPreflighting: boolean;
   executionPreflight: ExecutionPreflightResponse | null;
+  isRecoveryBrowserOpen: boolean;
+  recoveredGraphView: RecoveredGraphView | null;
+  isRecoveryGraphReadOnly: boolean;
   isExecutionLocked: boolean;   // 运行中是否禁止修改（值、连线、增删节点）
   // Legacy
   isConnected: boolean;        // 保持兼容，等价于 websocketStatus === 'connected'
@@ -64,6 +71,16 @@ export interface FlowContextType {
   runFlow: () => Promise<void>;
   confirmExecution: (config: ExecutionConfig) => void;
   cancelExecutionDialog: () => void;
+  openRecoveryBrowser: () => void;
+  closeRecoveryBrowser: () => void;
+  browseServerDirectories: (path: string) => Promise<ServerDirectoryListing>;
+  inspectRecoveryDirectory: (directory: string) => Promise<RecoverySummary>;
+  openRecoveryDirectory: (directory: string) => Promise<RecoveryOpenResponse>;
+  executeRecoveryDirectory: (
+    directory: string,
+    action: 'resume' | 'restart',
+  ) => Promise<boolean>;
+  closeRecoveredGraph: () => void;
   stopFlow: () => void;
   reloadNodes: () => Promise<void>;
   clearLogs: () => void;

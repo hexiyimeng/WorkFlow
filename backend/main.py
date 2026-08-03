@@ -1,3 +1,4 @@
+import asyncio
 import os
 import mimetypes
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from fastapi.responses import FileResponse, Response
 # 引入项目核心组件
 from services.dask_service import dask_service
 from services.plugin_loader import load_all_plugins
-from core.state_manager import state_manager
+from core.state_manager import ExecutionStatus, state_manager
 
 # 引入路由模块
 from api.http_routes import router as http_router
@@ -73,22 +74,33 @@ async def lifespan(app: FastAPI):
         state_manager.add_log(f"❌ STARTUP FAILED: {type(e).__name__}: {e}", "error")
         raise
 
-    # =========================================================
-    # [关键修复] 第二步：再启动 Dask 集群
-    # 此时主进程资源已就绪，Worker 启动不会造成冲突
-    # =========================================================
-    client = dask_service.start_cluster()
-    if client:
-        state_manager.add_log(f"Dask Cluster Ready: {client.dashboard_link}", "success")
-        logger.info(f"Dask Dashboard available at: {client.dashboard_link}")
-    else:
-        state_manager.add_log("Dask Cluster failed. Local mode.", "warning")
+    # A workflow's resource plan determines its Worker topology. Starting a
+    # fixed pool here would happen before any DAG is available.
+    state_manager.add_log(
+        "Dask Cluster will start when a workflow is executed.",
+        "info",
+    )
+    logger.info("Dask cluster startup deferred until workflow execution.")
 
-    yield
-
-    # 关闭时：清理资源
-    state_manager.add_log("<<< Backend Shutting down...", "warning")
-    dask_service.stop_cluster()
+    try:
+        yield
+    finally:
+        # Let the executor persist interrupted recovery state, release its
+        # active.lock, and finish Future cleanup while the cluster is still
+        # available. Only then tear down Scheduler and Workers.
+        state_manager.add_log("<<< Backend Shutting down...", "warning")
+        active_execution_id = state_manager.active_execution_id
+        active_task = state_manager.current_task
+        if active_execution_id is not None:
+            session = state_manager.get_execution(active_execution_id)
+            if session is not None and session.status in {
+                ExecutionStatus.RUNNING,
+                ExecutionStatus.CANCELLING,
+            }:
+                state_manager.cancel_execution(active_execution_id)
+        if active_task is not None and not active_task.done():
+            await asyncio.gather(active_task, return_exceptions=True)
+        await asyncio.to_thread(dask_service.stop_cluster)
 
 
 # ==========================================
@@ -139,7 +151,7 @@ if os.path.exists(dist_dir):
         # 否则返回 index.html，让 React Router 接管路由
         return FileResponse(os.path.join(dist_dir, "index.html"))
 else:
-    logger.warning("⚠️ 警告: 未检测到 'dist' 文件夹。请先在前端运行 'npm run build'。")
+    logger.warning("警告: 未检测到 'dist' 文件夹。请先在前端运行 'npm run build'。")
 
 # ==========================================
 # 5. 启动入口

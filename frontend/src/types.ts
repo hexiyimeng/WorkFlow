@@ -11,6 +11,8 @@ export type ExecutionPhase =
   | 'submitted'
   | 'running'
   | 'cancelling'
+  | 'disconnected'
+  | 'interrupted'
   | 'succeeded'
   | 'failed'
   | 'cancelled';
@@ -19,9 +21,43 @@ export type WebSocketStatus = 'connected' | 'reconnecting' | 'disconnected';
 
 export type ExecutionMode = 'full_graph' | 'window';
 
+export type ResumeAction = 'new' | 'resume' | 'restart';
+
+export type RecoveryLocation =
+  | { mode: 'output_sidecar'; anchorNodeId: string }
+  | { mode: 'custom'; directory: string };
+
 export type ExecutionConfig =
   | { mode: 'full_graph' }
-  | { mode: 'window'; windowShape: number[] };
+  | {
+      mode: 'window';
+      windowShape: number[];
+      maxInFlightWindows?: number;
+      resumeAction: 'new' | 'restart';
+      recoveryLocation: RecoveryLocation;
+    }
+  | {
+      mode: 'window';
+      windowShape?: number[];
+      maxInFlightWindows?: number;
+      resumeAction: 'resume';
+      recoveryLocation: RecoveryLocation;
+    };
+
+export interface ExecutionOutput {
+  nodeId: string;
+  nodeType: string;
+  displayName: string;
+  pathInput: string;
+  path: string;
+}
+
+export interface WindowPlan {
+  outputShape: number[];
+  windowShape: number[];
+  windowGridShape: number[];
+  totalWindows: number;
+}
 
 export type WindowProgressStatus = 'running' | 'finalizing';
 
@@ -36,9 +72,91 @@ export interface WindowExecutionProgress {
 
 export interface ExecutionPreflightResponse {
   windowable: boolean;
+  outputShape?: number[] | null;
+  windowShape?: number[] | null;
+  windowGridShape?: number[] | null;
+  totalWindows?: number | null;
+  outputs?: ExecutionOutput[];
+  // Transitional aliases accepted from older backends.
   output_shape?: number[] | null;
   ndim?: number | null;
   reason?: string | null;
+  requiredResources?: {
+    requiresCpu: boolean;
+    requiresGpu: boolean;
+    cpuWorkers: number;
+    gpuWorkers: number;
+    cpuNodes: ResourceNodeRequirement[];
+    gpuNodes: ResourceNodeRequirement[];
+    anyNodes?: ResourceNodeRequirement[];
+  };
+  availableResources?: {
+    cpuWorkers: number | null;
+    gpuWorkers: number | null;
+    cpuSlots: number | null;
+    gpuSlots: number | null;
+  };
+  resourcesSatisfied?: boolean | null;
+  resourceError?: string | null;
+}
+
+export type ExecutionResource = 'any' | 'cpu' | 'gpu';
+
+export interface ResourceNodeRequirement {
+  nodeId: string;
+  nodeType: string;
+  displayName: string;
+  workers: number;
+  resource?: ExecutionResource;
+}
+
+export type RecoveryManifestStatus =
+  | 'prepared'
+  | 'running'
+  | 'interrupted'
+  | 'failed'
+  | 'cancelled'
+  | 'succeeded';
+
+export interface RecoverySummary {
+  found: boolean;
+  valid: boolean;
+  compatible: boolean;
+  status: RecoveryManifestStatus;
+  recoveryDirectory: string;
+  completedWindows: number;
+  totalWindows: number;
+  remainingWindows: number;
+  outputShape: number[];
+  windowShape: number[];
+  windowGridShape: number[];
+  outputs: ExecutionOutput[];
+  message?: string | null;
+}
+
+export interface RecoveryOpenResponse {
+  graph: Record<string, { type: string; inputs: Record<string, unknown> }>;
+  readOnly: true;
+  executionConfig: ExecutionConfig;
+  recoverySummary: RecoverySummary;
+}
+
+export interface ServerDirectoryEntry {
+  name: string;
+  path: string;
+  isRecoveryDirectory: boolean;
+}
+
+export interface ServerDirectoryListing {
+  path: string;
+  parent: string | null;
+  directories: ServerDirectoryEntry[];
+}
+
+export interface RecoveredGraphView {
+  recoveryDirectory: string;
+  summary: RecoverySummary;
+  executionConfig: ExecutionConfig;
 }
 
 export interface NodeRuntimeData {
@@ -72,6 +190,8 @@ export interface NodeSpec {
   output: string[];
   output_name?: string[];
   output_node?: boolean;
+  execution_resource?: ExecutionResource;
+  execution_workers?: number;
 }
 
 export interface PluginLoadedEntry {
@@ -161,8 +281,10 @@ export type WSMessageType =
   | 'execution_started'
   | 'execution_finished'
   | 'execution_snapshot'
+  | 'execution_not_found'
   | 'window_progress'
   | 'execution_control_ack'
+  | 'cluster_ready'
   | 'subscribed'
   | 'ping'
   | 'pong';
@@ -187,7 +309,8 @@ export interface WSMessage {
   skippedChunks?: number;
   failedChunks?: number;
 
-  status?: 'graph_building' | 'submitted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'cancelling';
+  status?: 'graph_building' | 'submitted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'cancelling' | 'interrupted';
+  code?: string;
   createdAt?: number;
   finishedAt?: number;
   nodeCount?: number;
@@ -198,6 +321,9 @@ export interface WSMessage {
   windowStatus?: WindowProgressStatus;
   windowProgress?: WindowExecutionProgress | null;
   action?: string;
+  dashboardUrl?: string | null;
+  cpuWorkers?: number;
+  gpuWorkers?: number;
 }
 
 export interface Workflow {

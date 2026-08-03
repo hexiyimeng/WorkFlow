@@ -1,6 +1,6 @@
 // src/context/FlowContext.tsx
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { useNodesState, useEdgesState, addEdge, type Connection, type Node, type Edge, type OnConnectStart, type OnConnectEnd } from '@xyflow/react';
+import { useNodesState, useEdgesState, addEdge, type Connection, type Node, type Edge, type OnConnectStart, type OnConnectEnd, type OnNodesChange, type OnEdgesChange } from '@xyflow/react';
 import type { LogEntry, NodeData } from '../types';
 import { FlowContext } from './FlowContextDef';
 
@@ -11,13 +11,19 @@ import { useFlowEngine } from '../hooks/useFlowEngine';
 import { useWorkflows } from '../hooks/useWorkflows';
 import { canConnectPorts, resolveNodeOutputTypes } from '../utils/portTypes';
 import { visibleNodeInputNames } from '../utils/inputVisibility';
+import {
+  blocksExecutionChanges,
+  filterLockedEdgeChanges,
+  filterLockedNodeChanges,
+  isLiveExecutionPhase,
+} from '../utils/executionRuntime';
 
 export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // ===========================================
   // 1. Base State
   // ===========================================
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node<NodeData>>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [nodes, setNodes, applyNodeChanges] = useNodesState<Node<NodeData>>([]);
+  const [edges, setEdges, applyEdgeChanges] = useEdgesState<Edge>([]);
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [isConsoleOpen, setIsConsoleOpen] = useState(true);
   const [connectingType, setConnectingType] = useState<string | null>(null);
@@ -67,10 +73,19 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isReloadingNodes,
     isPreflighting,
     executionPreflight,
+    isRecoveryBrowserOpen,
+    recoveredGraphView,
     executionState,
     runFlow,
     confirmExecution,
     cancelExecutionDialog,
+    openRecoveryBrowser,
+    closeRecoveryBrowser,
+    browseServerDirectories,
+    inspectRecoveryDirectory,
+    openRecoveryDirectory,
+    executeRecoveryDirectory,
+    closeRecoveredGraph,
     stopFlow,
     reloadNodes,
   } = useFlowEngine(nodes, edges, setNodes, setEdges, addLog);
@@ -85,18 +100,40 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ===========================================
   // 4. Autosave — restores stripped data with latest specs
   // ===========================================
-  useAutoSave(nodes, edges, setNodes, setEdges, nodeDefs);
+  const isRecoveryGraphReadOnly = recoveredGraphView !== null;
+  useAutoSave(
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    nodeDefs,
+    !isRecoveryGraphReadOnly,
+  );
 
   // ===========================================
   // 5. Derived execution state — must precede workflow wrappers
   // ===========================================
-  const isExecuting = executionState.phase === 'graph_building'
-    || executionState.phase === 'submitted'
-    || executionState.phase === 'running'
-    || executionState.phase === 'cancelling';
+  const isExecuting = isLiveExecutionPhase(executionState.phase);
   const isCancelling = executionState.phase === 'cancelling';
-  const isExecutionLocked = isExecuting || isPreflighting || executionPreflight !== null;
+  const isExecutionLocked = blocksExecutionChanges(executionState.phase)
+    || isPreflighting
+    || executionPreflight !== null
+    || isRecoveryGraphReadOnly;
   const isConnected = websocketStatus === 'connected';
+
+  const onNodesChange = useCallback<OnNodesChange<Node<NodeData>>>((changes) => {
+    const permittedChanges = isExecutionLocked
+      ? filterLockedNodeChanges(changes)
+      : changes;
+    if (permittedChanges.length > 0) applyNodeChanges(permittedChanges);
+  }, [applyNodeChanges, isExecutionLocked]);
+
+  const onEdgesChange = useCallback<OnEdgesChange<Edge>>((changes) => {
+    const permittedChanges = isExecutionLocked
+      ? filterLockedEdgeChanges(changes)
+      : changes;
+    if (permittedChanges.length > 0) applyEdgeChanges(permittedChanges);
+  }, [applyEdgeChanges, isExecutionLocked]);
 
   // ===========================================
   // 6. Workflows — stored as stripped nodes, hydrated on switch
@@ -104,7 +141,15 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const {
     workflows, activeWorkflowId, createWorkflow: _createWorkflow, switchWorkflow: _switchWorkflow,
     deleteWorkflow: _deleteWorkflow, renameWorkflow, saveCurrentWorkflow
-  } = useWorkflows(nodes, edges, setNodes, setEdges, nodeDefs, addLog);
+  } = useWorkflows(
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    nodeDefs,
+    addLog,
+    !isRecoveryGraphReadOnly,
+  );
 
   // Wrap workflow ops with execution lock
   const createWorkflow = useCallback(() => {
@@ -126,12 +171,13 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 6. Snapshot trigger — only on non-running state changes
   // ===========================================
   useEffect(() => {
+    if (isRecoveryGraphReadOnly) return;
     syncCurrentState(nodes, edges);
     const hasActiveExecution = nodes.some(
       n => n.data.runState === 'submitted' || n.data.runState === 'running'
     );
     if (!hasActiveExecution) takeSnapshot();
-  }, [nodes, edges, syncCurrentState, takeSnapshot]);
+  }, [nodes, edges, isRecoveryGraphReadOnly, syncCurrentState, takeSnapshot]);
 
   // ===========================================
   // 7. Snapshot trigger — only on non-running state changes
@@ -253,6 +299,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const addNode = useCallback((type: string) => addNodeAt(type, { x: Math.random() * 400 + 200, y: Math.random() * 300 + 100 }), [addNodeAt]);
 
   const updateNodeData = useCallback((id: string, newData: Partial<NodeData>) => {
+    if (isExecutionLocked) return;
     const targetNode = nodes.find(n => n.id === id);
     if (targetNode) {
       const nextData = { ...targetNode.data, ...newData };
@@ -264,7 +311,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
       )));
     }
     setNodes(nds => nds.map(n => n.id === id ? { ...n, data: { ...n.data, ...newData } } : n));
-  }, [nodes, setEdges, setNodes]);
+  }, [isExecutionLocked, nodes, setEdges, setNodes]);
 
   // ===========================================
   // 10. Context memoization
@@ -278,10 +325,16 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isCancelling,
     isPreflighting,
     executionPreflight,
+    isRecoveryBrowserOpen,
+    recoveredGraphView,
+    isRecoveryGraphReadOnly,
     isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
     addNode, addNodeAt, updateNodeData,
-    runFlow, confirmExecution, cancelExecutionDialog, stopFlow, reloadNodes, clearLogs, addLog,
+    runFlow, confirmExecution, cancelExecutionDialog,
+    openRecoveryBrowser, closeRecoveryBrowser, browseServerDirectories,
+    inspectRecoveryDirectory, openRecoveryDirectory, executeRecoveryDirectory,
+    closeRecoveredGraph, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
     theme, toggleTheme, isConsoleOpen, toggleConsole,
     isValidConnection, undo, redo,
@@ -290,9 +343,14 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }), [
     nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected, logs, workflows, activeWorkflowId,
     theme, isConsoleOpen, connectingType,
-    executionState, websocketStatus, isExecuting, isCancelling, isPreflighting, executionPreflight, isExecutionLocked,
+    executionState, websocketStatus, isExecuting, isCancelling, isPreflighting,
+    executionPreflight, isRecoveryBrowserOpen, recoveredGraphView,
+    isRecoveryGraphReadOnly, isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
-    addNode, addNodeAt, updateNodeData, runFlow, confirmExecution, cancelExecutionDialog, stopFlow, reloadNodes, clearLogs, addLog,
+    addNode, addNodeAt, updateNodeData, runFlow, confirmExecution, cancelExecutionDialog,
+    openRecoveryBrowser, closeRecoveryBrowser, browseServerDirectories,
+    inspectRecoveryDirectory, openRecoveryDirectory, executeRecoveryDirectory,
+    closeRecoveredGraph, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
     toggleTheme, toggleConsole, isValidConnection, undo, redo,
     onConnectStart, onConnectEnd, handleCopy, handlePaste, handleDelete,

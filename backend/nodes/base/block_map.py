@@ -4,11 +4,15 @@ from dataclasses import dataclass
 import inspect
 from itertools import islice
 import logging
-import os
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
+from core.execution_resources import (
+    dask_annotation_kwargs,
+    normalize_execution_resource,
+    resolve_execution_resource,
+)
 from core.invocation_builder import declared_type_and_meta, get_node_input_defs, validate_dask_array_input
 from core.node_invocation import NodeInvocation, NodeRuntime
 from core.type_system import dtype_name_to_numpy, is_dask_array_type, parse_port_type
@@ -446,6 +450,7 @@ class BaseNode:
                 execution_id=runtime_data.get("execution_id", raw_inputs.get("_execution_id")),
                 is_preflight=bool(runtime_data.get("is_preflight", False)),
                 is_resuming=bool(runtime_data.get("is_resuming", False)),
+                execution_resource=resolve_execution_resource(type(self)),
             )
         undeclared_inputs = {
             key: value
@@ -990,26 +995,49 @@ class BlockContextFactory:
         )
         return ctx
 
-    def resolve_device_hint(self) -> str:
+    def resolve_device_hint(self, expected_resource: str) -> str:
+        expected = normalize_execution_resource(
+            expected_resource,
+            owner="NodeRuntime",
+        )
         try:
             from distributed import get_worker
 
             worker = get_worker()
-            assigned = getattr(worker, "assigned_gpu", None)
-            if assigned:
-                return assigned
-        except Exception:
-            pass
-        allow_implicit_cuda = os.getenv("WorkFlow_ALLOW_IMPLICIT_CUDA0", "").lower() in ("1", "true", "yes")
-        if allow_implicit_cuda:
-            try:
-                import torch
+        except Exception as exc:
+            raise RuntimeError(
+                f"{expected.upper()} block execution requires a configured "
+                "Dask Worker context."
+            ) from exc
 
-                if torch.cuda.is_available():
-                    return "cuda:0"
-            except Exception:
-                pass
-        return "cpu"
+        worker_role = getattr(worker, "worker_role", None)
+        if expected == "cpu":
+            if worker_role != "cpu":
+                raise RuntimeError(
+                    "CPU task was scheduled on a non-CPU Worker."
+                )
+            return "cpu"
+
+        if expected == "any" and worker_role == "cpu":
+            return "cpu"
+
+        if worker_role != "gpu":
+            if expected == "gpu":
+                raise RuntimeError(
+                    "GPU task was scheduled on a non-GPU Worker; "
+                    "CPU fallback is not supported."
+                )
+            raise RuntimeError(
+                "ANY task was scheduled on an unmanaged "
+                "Worker; expected worker_role='cpu' or 'gpu'."
+            )
+        assigned_gpu = getattr(worker, "assigned_gpu", None)
+        if assigned_gpu != "cuda:0":
+            raise RuntimeError(
+                "GPU Worker does not have a valid isolated CUDA device; "
+                "expected assigned_gpu='cuda:0'."
+            )
+        return "cuda:0"
 
     def extract_block_locations(self, block_info: Any, input_count: int) -> tuple:
         return tuple(
@@ -1103,11 +1131,23 @@ class ProcessBlockBinder:
         def wrapped(*blocks, block_info=None):
             block_info = block_info or {}
             named_blocks = dict(zip(input_plan.ordered_names, blocks))
+            expected_resource = runtime.execution_resource
+            device_hint = context_factory.resolve_device_hint(
+                expected_resource
+            )
+            worker_role = "gpu" if device_hint == "cuda:0" else "cpu"
+            context_resources = dict(preprocess_state or {})
+            context_resources.update(
+                {
+                    "execution_resource": expected_resource,
+                    "worker_role": worker_role,
+                }
+            )
             runtime_dict = {
                 "node_id": runtime.node_id,
                 "execution_id": runtime.execution_id,
-                "device_hint": context_factory.resolve_device_hint(),
-                "resources": preprocess_state or {},
+                "device_hint": device_hint,
+                "resources": context_resources,
             }
             ctx = context_factory.build(
                 named_blocks=named_blocks,
@@ -1225,6 +1265,16 @@ class BaseDaskArrayMapNode(BaseDaskNode):
 
     def execute(self, **kwargs) -> Tuple:
         invocation = self.get_invocation(kwargs)
+        declared_resource = resolve_execution_resource(type(self))
+        runtime_resource = normalize_execution_resource(
+            invocation.runtime.execution_resource,
+            owner="NodeRuntime",
+        )
+        if runtime_resource != declared_resource:
+            raise RuntimeError(
+                f"{type(self).__name__} runtime resource {runtime_resource!r} "
+                f"does not match declared resource {declared_resource!r}."
+            )
         input_planner = self.INPUT_PLANNER()
         output_resolver = self.OUTPUT_SPEC_RESOLVER()
         context_factory = self.CONTEXT_FACTORY()
@@ -1309,6 +1359,7 @@ class BaseDaskArrayMapNode(BaseDaskNode):
             "execution_id": runtime.execution_id,
             "is_preflight": runtime.is_preflight,
             "is_resuming": runtime.is_resuming,
+            "execution_resource": runtime.execution_resource,
         }
         try:
             sig = inspect.signature(preprocess)
@@ -1370,6 +1421,7 @@ class BaseMapBlocksNode(BaseDaskArrayMapNode):
         runtime,
         params,
     ):
+        import dask
         import dask.array as da
 
         map_kwargs = {
@@ -1382,7 +1434,10 @@ class BaseMapBlocksNode(BaseDaskArrayMapNode):
             "name": self.make_task_name(runtime),
         }
         map_kwargs = {key: value for key, value in map_kwargs.items() if value is not None}
-        return da.map_blocks(wrapped_fn, *ordered_arrays, **map_kwargs)
+        with dask.annotate(
+            **dask_annotation_kwargs(type(self), runtime.node_id)
+        ):
+            return da.map_blocks(wrapped_fn, *ordered_arrays, **map_kwargs)
 
 
 class BaseMapOverlapNode(BaseDaskArrayMapNode):
@@ -1415,6 +1470,7 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         runtime,
         params,
     ):
+        import dask
         import dask.array as da
 
         overlap_spec = self.resolve_overlap_spec(
@@ -1445,7 +1501,10 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         if not overlap_spec.trim:
             overlap_kwargs["chunks"] = output_spec.chunks
         overlap_kwargs = {key: value for key, value in overlap_kwargs.items() if value is not None}
-        return da.map_overlap(wrapped_fn, *ordered_arrays, **overlap_kwargs)
+        with dask.annotate(
+            **dask_annotation_kwargs(type(self), runtime.node_id)
+        ):
+            return da.map_overlap(wrapped_fn, *ordered_arrays, **overlap_kwargs)
 
     def resolve_overlap_spec(self, array_inputs, ordered_names, primary_name, params, runtime) -> OverlapSpec:
         override = getattr(self, "infer_overlap_spec", None)

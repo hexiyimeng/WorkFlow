@@ -14,6 +14,7 @@ export const useAutoSave = (
   setNodes: React.Dispatch<React.SetStateAction<Node<NodeData>[]>>,
   setEdges: React.Dispatch<React.SetStateAction<Edge[]>>,
   nodeDefs: Record<string, NodeSpec>,
+  persistenceEnabled = true,
 ) => {
   // Track whether initial restore has happened — only restore once on mount
   const hasRestoredRef = useRef(false);
@@ -57,11 +58,12 @@ export const useAutoSave = (
   // 2. Autosave (save stripped/serialized data only)
   // ============================================================
   useEffect(() => {
+    if (!persistenceEnabled) return;
     const timer = setTimeout(() => {
       const stripped = serializeFlowForStorage(nodes, edges);
       const dataToSave = { ...stripped, timestamp: Date.now() };
       localStorage.setItem('WorkFlow_AUTOSAVE', JSON.stringify(dataToSave));
     }, 1000);
     return () => clearTimeout(timer);
-  }, [nodes, edges]);
+  }, [nodes, edges, persistenceEnabled]);
 };

@@ -2,6 +2,10 @@
 import logging
 from typing import Dict, Type
 
+from core.execution_resources import (
+    resolve_execution_resource,
+    resolve_execution_workers,
+)
 from core.logger import logger
 from core.plugin_diagnostics import clear_node_info_errors, record_node_info_error
 from core.type_system import validate_port_type
@@ -86,6 +90,8 @@ def get_node_info():
         return_names = getattr(cls, "RETURN_NAMES", [])
         try:
             validate_node_port_types(input_config, return_types)
+            execution_resource = resolve_execution_resource(cls)
+            execution_workers = resolve_execution_workers(cls)
         except Exception as e:
             record_node_info_error(name, cls, e)
             diagnostics_logger.exception(
@@ -120,5 +126,7 @@ def get_node_info():
             "output_name": return_names,
             # 告诉前端这个节点实际执行哪个函数（虽然前端不一定用，但这是协议的一部分）
             "output_node": getattr(cls, "OUTPUT_NODE", False),
+            "execution_resource": execution_resource,
+            "execution_workers": execution_workers,
         }
     return info
