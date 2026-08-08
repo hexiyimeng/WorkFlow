@@ -48,7 +48,7 @@ def _parse_gpu_ids(value: str, *, name: str = "WorkFlow_GPU_IDS") -> tuple[str, 
 
 
 def _get_system_memory_gb():
-    """Return total physical memory in GB, or None if detection fails."""
+    """Return total physical memory in binary GiB, or None if detection fails."""
     try:
         import psutil
 
@@ -149,7 +149,7 @@ class AppConfig:
         sys_mem_gb = _get_system_memory_gb()
 
         if _is_main_process():
-            mem_info = f"{sys_mem_gb:.1f}GB" if sys_mem_gb else "unknown"
+            mem_info = f"{sys_mem_gb:.1f}GiB" if sys_mem_gb else "unknown"
             logger.info(f"[Config] Host={hostname} | RAM={mem_info} | CPU={cpu_count}")
 
         logger.debug("[Config] CUDA detection is deferred to DaskService.start_cluster().")
@@ -167,8 +167,8 @@ class AppConfig:
             auto_memory_per_worker = (sys_mem_gb / self.N_WORKERS) * 0.7
             logger.debug(
                 f"[Config] CPU worker memory estimate: "
-                f"{auto_memory_per_worker:.1f}GB/worker "
-                f"(system {sys_mem_gb:.1f}GB / {self.N_WORKERS} workers * 0.7)"
+                f"{auto_memory_per_worker:.1f}GiB/worker "
+                f"(system {sys_mem_gb:.1f}GiB / {self.N_WORKERS} workers * 0.7)"
             )
 
         legacy_workers = os.getenv("WorkFlow_WORKERS")

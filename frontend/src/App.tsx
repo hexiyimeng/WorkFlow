@@ -3,7 +3,7 @@ import PluginDiagnosticsBanner from './components/layout/PluginDiagnosticsBanner
 import Sidebar from './components/layout/Sidebar';
 import BottomPanel from './components/layout/BottomPanel';
 import FlowEditor from './components/flow/FlowEditor';
-import ExecutionConfigDialog from './components/execution/ExecutionConfigDialog';
+import ExecutionSettingsDrawer from './components/execution/ExecutionSettingsDrawer';
 import RecoveryBrowserDialog from './components/execution/RecoveryBrowserDialog';
 
 export default function App() {
@@ -19,7 +19,7 @@ export default function App() {
           <BottomPanel />
         </main>
       </div>
-      <ExecutionConfigDialog />
+      <ExecutionSettingsDrawer />
       <RecoveryBrowserDialog />
     </div>
   );

@@ -16,8 +16,18 @@
  */
 
 import type { Node, Edge } from '@xyflow/react';
-import type { NodeData, NodeSpec } from '../types';
-import { canConnectPorts, resolveNodeOutputTypes } from './portTypes';
+import type {
+  NodeData,
+  NodeSpec,
+  WorkflowExecutionSettingsValidation,
+  WorkflowMetadata,
+} from '../types';
+import { canConnectPorts, resolveNodeOutputTypes } from './portTypes.ts';
+import {
+  cloneWorkflowExecutionSettings,
+  createWorkflowId,
+  sanitizeWorkflowExecutionSettings,
+} from './workflowExecutionSettings.ts';
 
 // ============================================================
 // Types
@@ -26,6 +36,37 @@ import { canConnectPorts, resolveNodeOutputTypes } from './portTypes';
 export interface SerializedFlow {
   nodes: SerializedNode[];
   edges: Edge[];
+}
+
+/** Persistent JSON document used by manual save/load and browser autosave. */
+export interface SerializedWorkflowDocument extends SerializedFlow {
+  workflowId: string;
+  metadata: WorkflowMetadata;
+  workflow_name?: string;
+  timestamp?: number;
+}
+
+export interface ParsedWorkflowDocument extends SerializedFlow {
+  workflowId: string;
+  metadata: WorkflowMetadata;
+  workflowName?: string;
+  timestamp?: number;
+  /** True when a legacy document had no stable workflowId and received one. */
+  migratedWorkflowId: boolean;
+  executionSettingsValidation?: WorkflowExecutionSettingsValidation;
+}
+
+export interface SerializeWorkflowDocumentInput {
+  workflowId: string;
+  metadata?: WorkflowMetadata;
+  nodes: Node<NodeData>[];
+  edges: Edge[];
+  workflowName?: string;
+  timestamp?: number;
+}
+
+export interface ParseWorkflowDocumentOptions {
+  createWorkflowId?: () => string;
 }
 
 export interface SerializedNode {
@@ -129,6 +170,46 @@ export function serializeFlowForStorage(
       targetHandle: e.targetHandle,
       type: e.type,
     })),
+  };
+}
+
+export const cloneWorkflowMetadata = (metadata?: WorkflowMetadata): WorkflowMetadata => {
+  if (!metadata) return {};
+  const cloned: WorkflowMetadata = { ...metadata };
+  if (Object.hasOwn(metadata, 'executionSettings')) {
+    // Rebuild from the explicit persistent schema so runtime/recovery fields
+    // cannot hitchhike into a valid workflow document. Unsupported or
+    // malformed schemas remain byte-for-byte representable until the user
+    // explicitly resets/saves them; silently coercing them to v1 Full Graph
+    // would make an invalid configuration executable.
+    const sanitized = sanitizeWorkflowExecutionSettings(metadata.executionSettings);
+    cloned.executionSettings = sanitized.validation.isValid
+      ? cloneWorkflowExecutionSettings(sanitized.settings)
+      : metadata.executionSettings;
+  }
+  return cloned;
+};
+
+/** Serialize graph, stable identity, and metadata as one workflow document. */
+export function serializeWorkflowDocument({
+  workflowId,
+  metadata,
+  nodes,
+  edges,
+  workflowName,
+  timestamp,
+}: SerializeWorkflowDocumentInput): SerializedWorkflowDocument {
+  const normalizedWorkflowId = workflowId.trim();
+  if (!normalizedWorkflowId) {
+    throw new Error('workflowId must be a non-empty string.');
+  }
+  const flow = serializeFlowForStorage(nodes, edges);
+  return {
+    workflowId: normalizedWorkflowId,
+    metadata: cloneWorkflowMetadata(metadata),
+    ...flow,
+    ...(workflowName === undefined ? {} : { workflow_name: workflowName }),
+    ...(timestamp === undefined ? {} : { timestamp }),
   };
 }
 
@@ -337,7 +418,16 @@ export function parseStoredFlow(raw: unknown): SerializedFlow | null {
   if (!raw || typeof raw !== 'object') return null;
 
   const obj = raw as Record<string, unknown>;
-  const rawNodes = obj.nodes;
+  const graphEnvelope = obj.graph;
+  const graph = (
+    graphEnvelope !== null
+    && typeof graphEnvelope === 'object'
+    && !Array.isArray(graphEnvelope)
+    && Array.isArray((graphEnvelope as Record<string, unknown>).nodes)
+  )
+    ? graphEnvelope as Record<string, unknown>
+    : obj;
+  const rawNodes = graph.nodes;
   if (!Array.isArray(rawNodes)) return null;
 
   const serializedNodes: SerializedNode[] = rawNodes.map((n: unknown) => {
@@ -360,7 +450,7 @@ export function parseStoredFlow(raw: unknown): SerializedFlow | null {
     };
   }).filter(Boolean) as SerializedNode[];
 
-  const rawEdges = obj.edges;
+  const rawEdges = graph.edges;
   const edges: Edge[] = Array.isArray(rawEdges) ? rawEdges.map((e: unknown) => {
     if (!e || typeof e !== 'object') return null;
     const edge = e as Record<string, unknown>;
@@ -376,4 +466,63 @@ export function parseStoredFlow(raw: unknown): SerializedFlow | null {
   }).filter(Boolean) as Edge[] : [];
 
   return { nodes: serializedNodes, edges };
+}
+
+/**
+ * Parse both current workflow documents and legacy flat `{nodes, edges}` JSON.
+ * Legacy documents receive a stable ID exactly once; callers should retain and
+ * write the returned ID on their next autosave/export.
+ */
+export function parseWorkflowDocument(
+  raw: unknown,
+  options: ParseWorkflowDocumentOptions = {},
+): ParsedWorkflowDocument | null {
+  const flow = parseStoredFlow(raw);
+  if (!flow || !raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+
+  const obj = raw as Record<string, unknown>;
+  const savedWorkflowId = typeof obj.workflowId === 'string'
+    ? obj.workflowId.trim()
+    : '';
+  const idFactory = options.createWorkflowId ?? createWorkflowId;
+  const workflowId = savedWorkflowId || idFactory();
+  if (!workflowId.trim()) {
+    throw new Error('The workflow ID factory returned an empty workflowId.');
+  }
+
+  const rawMetadata = (
+    obj.metadata !== null
+    && typeof obj.metadata === 'object'
+    && !Array.isArray(obj.metadata)
+  )
+    ? obj.metadata as Record<string, unknown>
+    : {};
+  const metadata: WorkflowMetadata = { ...rawMetadata };
+  let executionSettingsValidation: WorkflowExecutionSettingsValidation | undefined;
+  if (Object.hasOwn(rawMetadata, 'executionSettings')) {
+    const sanitized = sanitizeWorkflowExecutionSettings(rawMetadata.executionSettings);
+    executionSettingsValidation = sanitized.validation;
+  }
+
+  const workflowName = typeof obj.workflow_name === 'string'
+    ? obj.workflow_name
+    : typeof obj.name === 'string'
+      ? obj.name
+      : undefined;
+  const timestamp = typeof obj.timestamp === 'number' && Number.isFinite(obj.timestamp)
+    ? obj.timestamp
+    : undefined;
+
+  return {
+    workflowId,
+    metadata,
+    nodes: flow.nodes,
+    edges: flow.edges,
+    migratedWorkflowId: !savedWorkflowId,
+    ...(workflowName === undefined ? {} : { workflowName }),
+    ...(timestamp === undefined ? {} : { timestamp }),
+    ...(executionSettingsValidation === undefined
+      ? {}
+      : { executionSettingsValidation }),
+  };
 }

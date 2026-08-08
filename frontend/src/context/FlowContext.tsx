@@ -1,7 +1,13 @@
 // src/context/FlowContext.tsx
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useNodesState, useEdgesState, addEdge, type Connection, type Node, type Edge, type OnConnectStart, type OnConnectEnd, type OnNodesChange, type OnEdgesChange } from '@xyflow/react';
-import type { LogEntry, NodeData } from '../types';
+import type {
+  LogEntry,
+  NodeData,
+  ExecutionPreflightResponse,
+  WorkflowExecutionSettings,
+  WorkflowExecutionSettingsValidation,
+} from '../types';
 import { FlowContext } from './FlowContextDef';
 
 import { useUndoRedo } from '../hooks/useUndoRedo';
@@ -9,6 +15,7 @@ import { useAutoSave } from '../hooks/useAutoSave';
 import { useFlowOperations } from '../hooks/useFlowOperations';
 import { useFlowEngine } from '../hooks/useFlowEngine';
 import { useWorkflows } from '../hooks/useWorkflows';
+import { useWorkflowExecutionSettingsStore } from '../hooks/useWorkflowExecutionSettingsStore';
 import { canConnectPorts, resolveNodeOutputTypes } from '../utils/portTypes';
 import { visibleNodeInputNames } from '../utils/inputVisibility';
 import {
@@ -17,6 +24,17 @@ import {
   filterLockedNodeChanges,
   isLiveExecutionPhase,
 } from '../utils/executionRuntime';
+import {
+  decideNormalRun,
+  normalRunRecoveryFailureValidation,
+  preflightFailureValidation,
+  validationContextFromPreflight,
+} from '../utils/executionExperience';
+import {
+  buildNewRunExecutionConfig,
+  validateWorkflowExecutionSettings,
+  withLastPreflightSummary,
+} from '../utils/workflowExecutionSettings';
 
 export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // ===========================================
@@ -27,6 +45,10 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [isConsoleOpen, setIsConsoleOpen] = useState(true);
   const [connectingType, setConnectingType] = useState<string | null>(null);
+  const [isExecutionSettingsOpen, setIsExecutionSettingsOpen] = useState(false);
+  const [executionSettingsValidation, setExecutionSettingsValidation] = useState<
+    WorkflowExecutionSettingsValidation | null
+  >(null);
 
   // Log system
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -73,17 +95,19 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isReloadingNodes,
     isPreflighting,
     executionPreflight,
+    lastSubmittedExecutionConfig,
     isRecoveryBrowserOpen,
     recoveredGraphView,
     executionState,
-    runFlow,
-    confirmExecution,
-    cancelExecutionDialog,
-    openRecoveryBrowser,
+    preflightFlow,
+    submitPreparedExecution,
+    clearPreparedExecution,
+    openRecoveryBrowser: _openRecoveryBrowser,
     closeRecoveryBrowser,
     browseServerDirectories,
     inspectRecoveryDirectory,
     openRecoveryDirectory,
+    deleteRecoveryDirectory,
     executeRecoveryDirectory,
     closeRecoveredGraph,
     stopFlow,
@@ -101,13 +125,53 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 4. Autosave — restores stripped data with latest specs
   // ===========================================
   const isRecoveryGraphReadOnly = recoveredGraphView !== null;
+  const {
+    workflows,
+    activeWorkflow,
+    activeWorkflowId,
+    createWorkflow: _createWorkflow,
+    switchWorkflow: _switchWorkflow,
+    deleteWorkflow: _deleteWorkflow,
+    renameWorkflow,
+    saveCurrentWorkflow,
+    updateWorkflowMetadata,
+    loadWorkflowDocument: _loadWorkflowDocument,
+  } = useWorkflows(
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    nodeDefs,
+    addLog,
+    !isRecoveryGraphReadOnly,
+  );
+
   useAutoSave(
     nodes,
     edges,
     setNodes,
     setEdges,
     nodeDefs,
+    activeWorkflow,
+    _loadWorkflowDocument,
     !isRecoveryGraphReadOnly,
+  );
+
+  const {
+    executionSettingsByWorkflowId,
+    resolvedExecutionSettingsByWorkflowId,
+    activeWorkflowDocumentId,
+    activeExecutionSettings,
+    activeExecutionSettingsConfigured,
+    activeExecutionSettingsSource,
+    activeExecutionSettingsStoredValidation,
+    saveActiveExecutionSettings,
+  } = useWorkflowExecutionSettingsStore(
+    workflows,
+    activeWorkflowId,
+    updateWorkflowMetadata,
+    nodes,
+    edges,
   );
 
   // ===========================================
@@ -117,7 +181,6 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const isCancelling = executionState.phase === 'cancelling';
   const isExecutionLocked = blocksExecutionChanges(executionState.phase)
     || isPreflighting
-    || executionPreflight !== null
     || isRecoveryGraphReadOnly;
   const isConnected = websocketStatus === 'connected';
 
@@ -138,34 +201,272 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ===========================================
   // 6. Workflows — stored as stripped nodes, hydrated on switch
   // ===========================================
-  const {
-    workflows, activeWorkflowId, createWorkflow: _createWorkflow, switchWorkflow: _switchWorkflow,
-    deleteWorkflow: _deleteWorkflow, renameWorkflow, saveCurrentWorkflow
-  } = useWorkflows(
-    nodes,
-    edges,
-    setNodes,
-    setEdges,
-    nodeDefs,
-    addLog,
-    !isRecoveryGraphReadOnly,
-  );
+  const resetExecutionSettingsUi = useCallback(() => {
+    setIsExecutionSettingsOpen(false);
+    setExecutionSettingsValidation(null);
+    clearPreparedExecution();
+  }, [clearPreparedExecution]);
+
+  const closeExecutionSettings = resetExecutionSettingsUi;
+
+  const openRecoveryBrowser = useCallback(() => {
+    resetExecutionSettingsUi();
+    _openRecoveryBrowser();
+  }, [_openRecoveryBrowser, resetExecutionSettingsUi]);
 
   // Wrap workflow ops with execution lock
   const createWorkflow = useCallback(() => {
     if (isExecutionLocked) { addLog('Cannot create workflow while executing', 'warning'); return; }
+    resetExecutionSettingsUi();
     _createWorkflow();
-  }, [isExecutionLocked, addLog, _createWorkflow]);
+  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _createWorkflow]);
 
   const switchWorkflow = useCallback((id: string) => {
     if (isExecutionLocked) { addLog('Cannot switch workflow while executing', 'warning'); return; }
+    resetExecutionSettingsUi();
     _switchWorkflow(id);
-  }, [isExecutionLocked, addLog, _switchWorkflow]);
+  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _switchWorkflow]);
 
   const deleteWorkflow = useCallback((id: string) => {
     if (isExecutionLocked) { addLog('Cannot delete workflow while executing', 'warning'); return; }
+    resetExecutionSettingsUi();
     _deleteWorkflow(id);
-  }, [isExecutionLocked, addLog, _deleteWorkflow]);
+  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _deleteWorkflow]);
+
+  const loadWorkflowDocument = useCallback<typeof _loadWorkflowDocument>((
+    document,
+    hydratedNodes,
+    hydratedEdges,
+  ) => {
+    resetExecutionSettingsUi();
+    _loadWorkflowDocument(document, hydratedNodes, hydratedEdges);
+  }, [_loadWorkflowDocument, resetExecutionSettingsUi]);
+
+  const preflightExecutionSettings = useCallback(async (
+    settings: WorkflowExecutionSettings,
+  ): Promise<{
+    preflight: ExecutionPreflightResponse;
+    validation: WorkflowExecutionSettingsValidation;
+  }> => {
+    // Always discover current output rank and terminal anchors before sending
+    // a Window plan. Otherwise a stale-rank Window config can be rejected by
+    // the backend before it returns enough metadata to identify the bad field.
+    const metadataPreflight = await preflightFlow({ mode: 'full_graph' });
+    let validation = validateWorkflowExecutionSettings(
+      settings,
+      validationContextFromPreflight(metadataPreflight),
+    );
+    if (settings.mode !== 'window' || !validation.isValid) {
+      return { preflight: metadataPreflight, validation };
+    }
+
+    const detailedPreflight = await preflightFlow(buildNewRunExecutionConfig(
+      settings,
+      validationContextFromPreflight(metadataPreflight),
+    ));
+    validation = validateWorkflowExecutionSettings(
+      settings,
+      validationContextFromPreflight(detailedPreflight),
+    );
+    return { preflight: detailedPreflight, validation };
+  }, [preflightFlow]);
+
+  const refreshExecutionSettingsPreflight = useCallback(async (
+    settings: WorkflowExecutionSettings = activeExecutionSettings,
+  ): Promise<void> => {
+    try {
+      const result = await preflightExecutionSettings(settings);
+      if (
+        settings === activeExecutionSettings
+        && !activeExecutionSettingsStoredValidation.isValid
+      ) {
+        setExecutionSettingsValidation({
+          isValid: false,
+          fieldErrors: {
+            ...result.validation.fieldErrors,
+            ...activeExecutionSettingsStoredValidation.fieldErrors,
+          },
+          generalError: result.validation.generalError
+            ?? activeExecutionSettingsStoredValidation.generalError,
+        });
+      } else {
+        setExecutionSettingsValidation(result.validation);
+      }
+    } catch (error) {
+      setExecutionSettingsValidation(preflightFailureValidation(error));
+      throw error;
+    }
+  }, [
+    activeExecutionSettings,
+    activeExecutionSettingsStoredValidation,
+    preflightExecutionSettings,
+  ]);
+
+  const openExecutionSettings = useCallback(() => {
+    if (isRecoveryGraphReadOnly) {
+      addLog('Close the recovered workflow before editing normal execution settings.', 'warning');
+      return;
+    }
+    closeRecoveryBrowser();
+    setExecutionSettingsValidation(activeExecutionSettingsStoredValidation);
+    setIsExecutionSettingsOpen(true);
+    void refreshExecutionSettingsPreflight(activeExecutionSettings).catch(() => undefined);
+  }, [
+    activeExecutionSettings,
+    activeExecutionSettingsStoredValidation,
+    addLog,
+    closeRecoveryBrowser,
+    isRecoveryGraphReadOnly,
+    refreshExecutionSettingsPreflight,
+  ]);
+
+  const saveExecutionSettings = useCallback(async (
+    settings: WorkflowExecutionSettings,
+  ): Promise<boolean> => {
+    const structuralValidation = validateWorkflowExecutionSettings(settings);
+    if (!structuralValidation.isValid) {
+      setExecutionSettingsValidation(structuralValidation);
+      return false;
+    }
+
+    if (settings.mode === 'full_graph') {
+      let settingsToSave = settings;
+      try {
+        const result = await preflightExecutionSettings(settings);
+        if (!result.validation.isValid) {
+          setExecutionSettingsValidation(result.validation);
+          return false;
+        }
+        settingsToSave = withLastPreflightSummary(settings, result.preflight);
+      } catch (error) {
+        // Full Graph has no graph-specific references, so a valid choice can
+        // still be saved while the current DAG is incomplete or disconnected.
+        addLog(`Settings saved; preflight is unavailable: ${(error as Error).message}`, 'warning');
+      }
+      saveActiveExecutionSettings(settingsToSave);
+      setExecutionSettingsValidation(null);
+      clearPreparedExecution();
+      return true;
+    }
+
+    try {
+      const result = await preflightExecutionSettings(settings);
+      if (!result.validation.isValid) {
+        setExecutionSettingsValidation(result.validation);
+        return false;
+      }
+      saveActiveExecutionSettings(withLastPreflightSummary(settings, result.preflight));
+      setExecutionSettingsValidation(null);
+      clearPreparedExecution();
+      return true;
+    } catch (error) {
+      setExecutionSettingsValidation(preflightFailureValidation(error));
+      return false;
+    }
+  }, [
+    addLog,
+    clearPreparedExecution,
+    preflightExecutionSettings,
+    saveActiveExecutionSettings,
+  ]);
+
+  const normalRunInFlightRef = useRef(false);
+  const runFlow = useCallback(async (): Promise<void> => {
+    if (normalRunInFlightRef.current) return;
+    normalRunInFlightRef.current = true;
+    try {
+      if (isRecoveryGraphReadOnly) {
+        addLog('Normal Run always uses the editable workflow. Close Recovery first.', 'warning');
+        return;
+      }
+
+      const resolved = resolvedExecutionSettingsByWorkflowId[activeWorkflowDocumentId];
+      if (!resolved || !activeExecutionSettingsConfigured) {
+        setExecutionSettingsValidation({
+          isValid: false,
+          fieldErrors: {},
+          generalError: 'Configure and save Execution Settings before the first run.',
+        });
+        setIsExecutionSettingsOpen(true);
+        try {
+          await preflightExecutionSettings(activeExecutionSettings);
+        } catch (error) {
+          setExecutionSettingsValidation(previous => ({
+            ...(previous ?? { isValid: false, fieldErrors: {} }),
+            isValid: false,
+            generalError: (error as Error).message,
+          }));
+        }
+        return;
+      }
+
+      try {
+        const result = await preflightExecutionSettings(activeExecutionSettings);
+        const decision = decideNormalRun(resolved, result.preflight);
+        if (decision.kind === 'open_settings') {
+          setExecutionSettingsValidation(decision.validation);
+          setIsExecutionSettingsOpen(true);
+          return;
+        }
+
+        saveActiveExecutionSettings(withLastPreflightSummary(
+          activeExecutionSettings,
+          result.preflight,
+        ));
+        if (!submitPreparedExecution(decision.config)) {
+          setExecutionSettingsValidation({
+            isValid: false,
+            fieldErrors: {},
+            generalError: 'Execution could not be submitted. Review the saved settings and try again.',
+          });
+          setIsExecutionSettingsOpen(true);
+        }
+      } catch (error) {
+        setExecutionSettingsValidation(preflightFailureValidation(error));
+        setIsExecutionSettingsOpen(true);
+      }
+    } finally {
+      normalRunInFlightRef.current = false;
+    }
+  }, [
+    activeExecutionSettings,
+    activeExecutionSettingsConfigured,
+    activeWorkflowDocumentId,
+    addLog,
+    isRecoveryGraphReadOnly,
+    preflightExecutionSettings,
+    resolvedExecutionSettingsByWorkflowId,
+    saveActiveExecutionSettings,
+    submitPreparedExecution,
+  ]);
+
+  const handledNewRunFailureRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (
+      executionState.phase !== 'failed'
+      || !executionState.lastError
+      || lastSubmittedExecutionConfig?.mode !== 'window'
+      || lastSubmittedExecutionConfig.resumeAction !== 'new'
+    ) {
+      return;
+    }
+    const failureKey = `${executionState.executionId ?? ''}:${executionState.lastError}`;
+    if (handledNewRunFailureRef.current === failureKey) return;
+    handledNewRunFailureRef.current = failureKey;
+    const validation = normalRunRecoveryFailureValidation(
+      executionState.lastError,
+      activeExecutionSettings,
+    );
+    if (!validation) return;
+    setExecutionSettingsValidation(validation);
+    setIsExecutionSettingsOpen(true);
+  }, [
+    activeExecutionSettings,
+    executionState.executionId,
+    executionState.lastError,
+    executionState.phase,
+    lastSubmittedExecutionConfig,
+  ]);
 
   // ===========================================
   // 6. Snapshot trigger — only on non-running state changes
@@ -317,7 +618,12 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 10. Context memoization
   // ===========================================
   const contextValue = useMemo(() => ({
-    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected: isConnected, logs, workflows, activeWorkflowId,
+    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected: isConnected, logs, workflows, activeWorkflow, activeWorkflowId,
+    activeWorkflowDocumentId,
+    executionSettingsByWorkflowId,
+    activeExecutionSettings,
+    activeExecutionSettingsConfigured,
+    activeExecutionSettingsSource,
     executionState,
     websocketStatus,
     currentExecutionId: executionState.executionId,
@@ -325,33 +631,46 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isCancelling,
     isPreflighting,
     executionPreflight,
+    isExecutionSettingsOpen,
+    executionSettingsValidation,
     isRecoveryBrowserOpen,
     recoveredGraphView,
     isRecoveryGraphReadOnly,
     isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
     addNode, addNodeAt, updateNodeData,
-    runFlow, confirmExecution, cancelExecutionDialog,
+    runFlow,
+    openExecutionSettings, closeExecutionSettings,
+    saveExecutionSettings, refreshExecutionSettingsPreflight,
     openRecoveryBrowser, closeRecoveryBrowser, browseServerDirectories,
-    inspectRecoveryDirectory, openRecoveryDirectory, executeRecoveryDirectory,
+    inspectRecoveryDirectory, openRecoveryDirectory, deleteRecoveryDirectory,
+    executeRecoveryDirectory,
     closeRecoveredGraph, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
+    loadWorkflowDocument,
     theme, toggleTheme, isConsoleOpen, toggleConsole,
     isValidConnection, undo, redo,
     onConnectStart, onConnectEnd, connectingType,
     handleCopy, handlePaste, handleDelete,
   }), [
-    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected, logs, workflows, activeWorkflowId,
+    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected, logs, workflows, activeWorkflow, activeWorkflowId,
+    activeWorkflowDocumentId, executionSettingsByWorkflowId,
+    activeExecutionSettings, activeExecutionSettingsConfigured, activeExecutionSettingsSource,
     theme, isConsoleOpen, connectingType,
     executionState, websocketStatus, isExecuting, isCancelling, isPreflighting,
-    executionPreflight, isRecoveryBrowserOpen, recoveredGraphView,
+    executionPreflight, isExecutionSettingsOpen, executionSettingsValidation,
+    isRecoveryBrowserOpen, recoveredGraphView,
     isRecoveryGraphReadOnly, isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
-    addNode, addNodeAt, updateNodeData, runFlow, confirmExecution, cancelExecutionDialog,
+    addNode, addNodeAt, updateNodeData, runFlow,
+    openExecutionSettings, closeExecutionSettings,
+    saveExecutionSettings, refreshExecutionSettingsPreflight,
     openRecoveryBrowser, closeRecoveryBrowser, browseServerDirectories,
-    inspectRecoveryDirectory, openRecoveryDirectory, executeRecoveryDirectory,
+    inspectRecoveryDirectory, openRecoveryDirectory, deleteRecoveryDirectory,
+    executeRecoveryDirectory,
     closeRecoveredGraph, stopFlow, reloadNodes, clearLogs, addLog,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
+    loadWorkflowDocument,
     toggleTheme, toggleConsole, isValidConnection, undo, redo,
     onConnectStart, onConnectEnd, handleCopy, handlePaste, handleDelete,
   ]);

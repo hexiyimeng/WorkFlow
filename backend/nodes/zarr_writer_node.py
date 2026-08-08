@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+from itertools import product
+import logging
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +16,7 @@ from nodes.base import BaseMapBlocksNode
 
 
 TOKEN_DTYPE = np.dtype("uint8")
+logger = logging.getLogger("WorkFlow.ZarrWriter")
 
 
 def _normalize_output_path(value: str) -> str:
@@ -39,7 +44,10 @@ def _normalize_dataset_path(value: str | None) -> str:
         return "0"
     if "\x00" in raw:
         raise ValueError("dataset_path contains a null byte.")
-    return raw.replace("\\", "/")
+    normalized = "/".join(
+        part for part in raw.replace("\\", "/").split("/") if part
+    )
+    return normalized or "0"
 
 
 def _normalize_voxel_size(value: Any, ndim: int) -> tuple[float, ...]:
@@ -56,17 +64,153 @@ def _normalize_voxel_size(value: Any, ndim: int) -> tuple[float, ...]:
     return tuple(float(x) for x in values)
 
 
-def _validate_regular_chunks(chunks: tuple[tuple[int, ...], ...]) -> None:
-    for axis, axis_chunks in enumerate(chunks):
-        if len(axis_chunks) <= 1:
-            continue
-        nominal = int(axis_chunks[0])
-        for index, size in enumerate(axis_chunks[:-1]):
-            if int(size) != nominal:
-                raise ValueError(
-                    "ZarrWriter requires regular chunks except possibly the final boundary chunk. "
-                    f"Axis {axis} chunk {index} has size {size}, expected {nominal}."
-                )
+def _zarr_lock_namespace(
+    output_path: str,
+    store_kind: str,
+    dataset_path: str,
+) -> str:
+    normalized_store = os.path.normcase(str(Path(output_path).expanduser().resolve()))
+    dataset_identity = dataset_path if store_kind == "ome_zarr" else "<array>"
+    identity = f"{normalized_store}\x00{store_kind}\x00{dataset_identity}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"workflow-zarr-write:{digest}"
+
+
+def _zarr_chunk_lock_name(namespace: str, coordinate: tuple[int, ...]) -> str:
+    suffix = ",".join(str(int(index)) for index in coordinate)
+    return f"{namespace}:{suffix}"
+
+
+def _block_region_bounds(
+    origin: tuple[int, ...],
+    block_shape: tuple[int, ...],
+    array_shape: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    ndim = len(array_shape)
+    if len(origin) != ndim or len(block_shape) != ndim:
+        raise RuntimeError(
+            "ZarrWriter block origin, block shape, and target shape must have matching "
+            f"dimensions, got origin={origin}, block_shape={block_shape}, "
+            f"target_shape={array_shape}."
+        )
+
+    starts = tuple(int(value) for value in origin)
+    lengths = tuple(int(value) for value in block_shape)
+    stops = tuple(start + length for start, length in zip(starts, lengths))
+    for axis, (start, length, stop, size) in enumerate(
+        zip(starts, lengths, stops, array_shape)
+    ):
+        if start < 0 or length < 0 or stop > int(size):
+            raise RuntimeError(
+                "ZarrWriter block region is outside the destination array: "
+                f"axis={axis}, start={start}, length={length}, "
+                f"stop={stop}, array_size={size}."
+            )
+    return starts, stops
+
+
+def _validate_storage_chunks(
+    storage_chunks: tuple[int, ...],
+    ndim: int,
+) -> tuple[int, ...]:
+    chunks = tuple(int(value) for value in storage_chunks)
+    if len(chunks) != int(ndim) or any(value <= 0 for value in chunks):
+        raise RuntimeError(
+            "ZarrWriter destination storage chunks must contain one positive size per "
+            f"array axis, got chunks={chunks}, ndim={ndim}."
+        )
+    return chunks
+
+
+def _is_storage_chunk_aligned(
+    starts: tuple[int, ...],
+    stops: tuple[int, ...],
+    array_shape: tuple[int, ...],
+    storage_chunks: tuple[int, ...],
+) -> bool:
+    return all(
+        start % chunk_size == 0
+        and (stop % chunk_size == 0 or stop == int(axis_size))
+        for start, stop, axis_size, chunk_size in zip(
+            starts,
+            stops,
+            array_shape,
+            storage_chunks,
+        )
+    )
+
+
+def _partial_storage_chunk_coordinates(
+    starts: tuple[int, ...],
+    stops: tuple[int, ...],
+    array_shape: tuple[int, ...],
+    storage_chunks: tuple[int, ...],
+) -> tuple[tuple[int, ...], ...]:
+    if any(stop <= start for start, stop in zip(starts, stops)):
+        return ()
+
+    intersected_axes = tuple(
+        range(start // chunk_size, ((stop - 1) // chunk_size) + 1)
+        for start, stop, chunk_size in zip(starts, stops, storage_chunks)
+    )
+    partial: list[tuple[int, ...]] = []
+    for coordinate in product(*intersected_axes):
+        fully_covered = True
+        for axis, chunk_index in enumerate(coordinate):
+            chunk_start = int(chunk_index) * storage_chunks[axis]
+            chunk_stop = min(
+                chunk_start + storage_chunks[axis],
+                int(array_shape[axis]),
+            )
+            if starts[axis] > chunk_start or stops[axis] < chunk_stop:
+                fully_covered = False
+                break
+        if not fully_covered:
+            partial.append(tuple(int(index) for index in coordinate))
+    return tuple(sorted(partial))
+
+
+def _make_distributed_lock(name: str):
+    from dask.distributed import Lock
+
+    return Lock(name)
+
+
+def _write_with_storage_chunk_locks(
+    *,
+    target,
+    region: tuple[slice, ...],
+    array: np.ndarray,
+    lock_names: tuple[str, ...],
+) -> None:
+    acquired_locks = []
+    primary_error: BaseException | None = None
+    try:
+        for lock_name in lock_names:
+            lock = _make_distributed_lock(lock_name)
+            acquired = lock.acquire()
+            if acquired is False:
+                raise RuntimeError(f"Failed to acquire Zarr storage-chunk lock {lock_name!r}.")
+            acquired_locks.append(lock)
+        target[region] = array
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        first_release_error: BaseException | None = None
+        for lock in reversed(acquired_locks):
+            try:
+                released = lock.release()
+                if released is False:
+                    raise RuntimeError(
+                        f"Failed to release Zarr storage-chunk lock {lock.name!r}."
+                    )
+            except BaseException as exc:
+                if first_release_error is None:
+                    first_release_error = exc
+                logger.exception("Failed to release a Zarr storage-chunk lock.")
+        if first_release_error is not None and primary_error is None:
+            raise first_release_error
 
 
 def _prepare_compressor(name: str):
@@ -314,8 +458,43 @@ def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
         target = zarr.open_group(str(output_path), mode="r+")[dataset_path]
     else:
         target = zarr.open(str(output_path), mode="r+")
-    region = tuple(slice(int(start), int(start) + int(length)) for start, length in zip(origin, array.shape))
-    target[region] = array
+
+    array_shape = tuple(int(value) for value in target.shape)
+    storage_chunks = _validate_storage_chunks(
+        tuple(int(value) for value in target.chunks),
+        len(array_shape),
+    )
+    starts, stops = _block_region_bounds(
+        tuple(int(value) for value in origin),
+        tuple(int(value) for value in array.shape),
+        array_shape,
+    )
+    region = tuple(slice(start, stop) for start, stop in zip(starts, stops))
+
+    if _is_storage_chunk_aligned(starts, stops, array_shape, storage_chunks):
+        target[region] = array
+    else:
+        partial_coordinates = _partial_storage_chunk_coordinates(
+            starts,
+            stops,
+            array_shape,
+            storage_chunks,
+        )
+        namespace = _zarr_lock_namespace(
+            str(output_path),
+            str(store_kind),
+            str(dataset_path),
+        )
+        lock_names = tuple(
+            _zarr_chunk_lock_name(namespace, coordinate)
+            for coordinate in partial_coordinates
+        )
+        _write_with_storage_chunk_locks(
+            target=target,
+            region=region,
+            array=array,
+            lock_names=lock_names,
+        )
     token_shape = ctx.output_chunk_shape or ((1,) * int(array.ndim))
     return np.ones(tuple(int(x) for x in token_shape), dtype=TOKEN_DTYPE)
 
@@ -326,7 +505,8 @@ class ZarrWriter(BaseMapBlocksNode):
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr Writer"
-    EXECUTION_WORKERS = 0
+    EXECUTION_RESOURCE = "cpu"
+    EXECUTION_WORKERS = 2
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_path"
 
@@ -398,13 +578,24 @@ class ZarrWriter(BaseMapBlocksNode):
             int(axis_chunks[0]) if axis_chunks else 1
             for axis_chunks in dask_arr.chunks
         )
+        input_shape = tuple(int(x) for x in dask_arr.shape)
+        input_chunks = tuple(
+            tuple(int(size) for size in axis_chunks)
+            for axis_chunks in dask_arr.chunks
+        )
 
-        _validate_regular_chunks(dask_arr.chunks)
+        logger.debug(
+            "[ZarrWriter] input_shape=%s input_chunks=%s "
+            "destination_storage_chunks=%s",
+            input_shape,
+            input_chunks,
+            chunks,
+        )
         _prepare_store(
             output_path=output_path,
             store_kind=store_kind,
             dataset_path=dataset_path,
-            shape=tuple(int(x) for x in dask_arr.shape),
+            shape=input_shape,
             chunks=chunks,
             dtype=np.dtype(dask_arr.dtype),
             axes=axes,

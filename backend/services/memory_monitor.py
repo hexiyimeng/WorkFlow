@@ -1,8 +1,10 @@
 """Driver and Dask Worker memory diagnostics.
 
-CUDA allocations belong to isolated GPU Worker processes, so GPU memory is
-queried with ``Client.run`` instead of inspecting CUDA state in the Driver.
-Diagnostics are best-effort and never participate in scheduling correctness.
+Worker RSS is read from the Scheduler's heartbeat metrics.  Diagnostics must
+never fan a function out with ``Client.run``: that executes on every Worker's
+control thread and, on a large Windows cluster, one slow Worker can leave an
+uncancellable RPC outstanding for minutes.  Diagnostics are best-effort and
+never participate in scheduling correctness.
 """
 
 from __future__ import annotations
@@ -15,58 +17,61 @@ from typing import Any
 logger = logging.getLogger("WorkFlow.MemoryMonitor")
 
 
-def collect_worker_memory_snapshot(dask_worker: Any | None = None) -> dict[str, Any]:
-    """Collect one memory snapshot inside a Dask Worker process."""
-    if dask_worker is None:
-        from distributed import get_worker
+def _scheduler_worker_memory(
+    worker_address: object,
+    worker_info: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert one Scheduler Worker identity into the monitor schema."""
+    startup = dict(worker_info.get("workflowDevice") or {})
+    resources = dict(worker_info.get("resources") or {})
+    role = str(startup.get("workerRole") or "")
+    if not role:
+        if float(resources.get("GPU", 0) or 0) > 0:
+            role = "gpu"
+        elif float(resources.get("CPU", 0) or 0) > 0:
+            role = "cpu"
+        else:
+            role = "unknown"
 
-        dask_worker = get_worker()
+    metrics = dict(worker_info.get("metrics") or {})
+    raw_rss = metrics.get("memory")
+    try:
+        rss_mb = round(float(raw_rss) / (1024 * 1024), 1)
+    except (TypeError, ValueError, OverflowError):
+        rss_mb = None
 
-    role = str(
-        getattr(
-            dask_worker,
-            "worker_role",
-            os.environ.get("WORKFLOW_WORKER_ROLE", "unknown"),
+    assigned_device = startup.get("assignedDevice")
+    if not assigned_device:
+        assigned_device = (
+            "cuda:0"
+            if role == "gpu"
+            else "cpu"
+            if role == "cpu"
+            else "unknown"
         )
-    )
-    assigned_device = str(getattr(dask_worker, "assigned_gpu", "unknown"))
-    result: dict[str, Any] = {
-        "workerName": str(getattr(dask_worker, "name", "")),
+
+    return {
+        "workerName": str(worker_info.get("name") or worker_address),
         "workerRole": role,
-        "assignedDevice": assigned_device,
-        "rssMb": None,
+        "assignedDevice": str(assigned_device),
+        "rssMb": rss_mb,
+        # PyTorch allocator counters cannot be obtained safely from Scheduler
+        # heartbeats.  Keep the stable schema and report them as unavailable.
         "cudaAllocatedMb": None,
         "cudaReservedMb": None,
     }
 
-    try:
-        import psutil
-
-        result["rssMb"] = round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 1)
-    except Exception as exc:
-        result["rssError"] = f"{type(exc).__name__}: {exc}"
-
-    if role == "gpu":
-        try:
-            import torch
-
-            result["cudaAllocatedMb"] = round(
-                torch.cuda.memory_allocated(0) / (1024 * 1024),
-                1,
-            )
-            result["cudaReservedMb"] = round(
-                torch.cuda.memory_reserved(0) / (1024 * 1024),
-                1,
-            )
-        except Exception as exc:
-            result["cudaError"] = f"{type(exc).__name__}: {exc}"
-    return result
-
 
 def query_worker_memory(client: Any) -> dict[str, dict[str, Any]]:
-    """Return best-effort memory diagnostics from every connected Worker."""
+    """Return best-effort Worker RSS without executing code on Workers."""
     try:
-        return client.run(collect_worker_memory_snapshot)
+        scheduler_info = client.scheduler_info(n_workers=-1)
+        return {
+            str(address): _scheduler_worker_memory(address, dict(info or {}))
+            for address, info in dict(
+                scheduler_info.get("workers", {})
+            ).items()
+        }
     except Exception as exc:
         logger.debug("[MemoryMonitor] Failed to collect Worker memory: %s", exc)
         return {}
@@ -110,9 +115,10 @@ class MemoryMonitor:
         }
         return rss_by_worker or None
 
-    def take_snapshot(self, name: str, client: Any | None = None) -> dict[str, Any]:
+    def collect_snapshot(self, client: Any | None = None) -> dict[str, Any]:
+        """Collect a snapshot without mutating monitor state or logging it."""
         worker_memory = query_worker_memory(client) if client is not None else None
-        snapshot = {
+        return {
             "timestamp": time.time(),
             "process_mb": self._get_process_memory_mb(),
             # Kept for callers that consume the old snapshot schema. Driver-side
@@ -128,19 +134,22 @@ class MemoryMonitor:
             ),
             "worker_memory": worker_memory or None,
         }
+
+    def take_snapshot(self, name: str, client: Any | None = None) -> dict[str, Any]:
+        snapshot = self.collect_snapshot(client)
         self.snapshots[name] = snapshot
         return snapshot
 
-    def log_snapshot(
+    def record_snapshot(
         self,
         name: str,
-        client: Any | None = None,
+        snapshot: dict[str, Any],
         level: str = "info",
     ) -> dict[str, Any]:
         if not self.enabled:
             return {}
 
-        snapshot = self.take_snapshot(name, client)
+        self.snapshots[name] = snapshot
         parts: list[str] = []
         if snapshot["process_mb"] is not None:
             parts.append(f"Driver={snapshot['process_mb']:.0f}MB")
@@ -161,6 +170,20 @@ class MemoryMonitor:
         else:
             logger.info(message)
         return snapshot
+
+    def log_snapshot(
+        self,
+        name: str,
+        client: Any | None = None,
+        level: str = "info",
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
+        return self.record_snapshot(
+            name,
+            self.collect_snapshot(client),
+            level=level,
+        )
 
     def log_delta(self, name1: str, name2: str) -> dict[str, Any]:
         if not self.enabled:

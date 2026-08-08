@@ -1501,10 +1501,38 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         if not overlap_spec.trim:
             overlap_kwargs["chunks"] = output_spec.chunks
         overlap_kwargs = {key: value for key, value in overlap_kwargs.items() if value is not None}
+        task_name = self.make_task_name(runtime)
+        # ``da.map_overlap`` creates thousands of framework-only overlap,
+        # rechunk, concatenate, slice, and trim tasks around the actual block
+        # function.  Constraining that entire construction to a GPU Worker
+        # serializes CPU-capable data preparation and retains its intermediates
+        # in the model process.  Build helper layers as unconstrained work, then
+        # restore the node's resource annotation only on the layer that invokes
+        # ``wrapped_fn``.
         with dask.annotate(
-            **dask_annotation_kwargs(type(self), runtime.node_id)
+            brainflow_node_id="__map_overlap__",
+            execution_resource="any",
+            resources={},
         ):
-            return da.map_overlap(wrapped_fn, *ordered_arrays, **overlap_kwargs)
+            result = da.map_overlap(
+                wrapped_fn,
+                *ordered_arrays,
+                **overlap_kwargs,
+            )
+
+        graph = result.__dask_graph__()
+        layers = getattr(graph, "layers", None)
+        model_layer = layers.get(task_name) if isinstance(layers, Mapping) else None
+        if model_layer is None:
+            raise RuntimeError(
+                f"{type(self).__name__} could not locate its map_overlap task "
+                f"layer {task_name!r}."
+            )
+        model_layer.annotations = dask_annotation_kwargs(
+            type(self),
+            runtime.node_id,
+        )
+        return result
 
     def resolve_overlap_spec(self, array_inputs, ordered_names, primary_name, params, runtime) -> OverlapSpec:
         override = getattr(self, "infer_overlap_spec", None)

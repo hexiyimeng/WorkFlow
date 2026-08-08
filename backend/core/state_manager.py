@@ -71,6 +71,7 @@ class GlobalStateManager:
     MAX_FINISHED_EXECUTIONS = 10
     EXECUTION_TTL_SECONDS = 3600
     MAX_FAILED_EXECUTION_LOGS = 3
+    WEBSOCKET_SEND_TIMEOUT_SECONDS = 1.0
 
     def __new__(cls):
         if cls._instance is None:
@@ -355,18 +356,40 @@ class GlobalStateManager:
         if "executionId" not in message_dict:
             message_dict["executionId"] = execution_id
 
-        bad_sockets = []
-        for ws in list(session.subscribers):
+        async def send_one(ws):
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
-                    await ws.send_json(message_dict)
-                else:
-                    bad_sockets.append(ws)
+                    await asyncio.wait_for(
+                        ws.send_json(message_dict),
+                        timeout=self.WEBSOCKET_SEND_TIMEOUT_SECONDS,
+                    )
+                    return None
             except Exception:
-                bad_sockets.append(ws)
+                # Ensure a half-open transport becomes visibly disconnected so
+                # the frontend reconnects and re-subscribes with its persisted
+                # execution ID.  Unsubscribing alone could leave an apparently
+                # open socket that silently receives no further progress.
+                close = getattr(ws, "close", None)
+                if callable(close):
+                    try:
+                        await asyncio.wait_for(
+                            close(code=1011),
+                            timeout=0.25,
+                        )
+                    except Exception:
+                        pass
+            return ws
 
-        for ws in bad_sockets:
-            self.unsubscribe_client(ws)
+        # A browser/RDP disconnect is observational state, not a dependency of
+        # the workflow.  Send to subscribers concurrently and cap the wait so
+        # one half-open socket cannot pause Dask submission for minutes.
+        results = await asyncio.gather(
+            *(send_one(ws) for ws in list(session.subscribers)),
+        )
+
+        for bad_socket in results:
+            if bad_socket is not None:
+                self.unsubscribe_client(bad_socket)
 
     async def broadcast_to_subscribers(self, websocket, message_dict: dict):
         execution_id = self.client_execution_map.get(websocket)

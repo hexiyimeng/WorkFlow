@@ -15,6 +15,7 @@ import type {
   ExecutionPreflightResponse,
   WindowExecutionProgress,
   RecoveredGraphView,
+  RecoveryDeleteResponse,
   RecoveryOpenResponse,
   RecoverySummary,
   ResumeAction,
@@ -33,12 +34,14 @@ import {
   isValidWindowShape,
   preflightResourcesAllowExecution,
   preflightOutputShape,
+  sameServerPath,
 } from '../utils/executionConfig';
 import {
   createWindowProgressProtocolState,
   resolveWindowProgressProtocolEvent,
 } from '../utils/windowProgress';
 import {
+  buildRecoveryExecutionRequest,
   executionGraphToSerializedFlow,
   normalizeDirectoryListing,
   normalizeRecoveryOpenResponse,
@@ -214,6 +217,7 @@ export const useFlowEngine = (
   const [isReloadingNodes, setIsReloadingNodes] = useState(false);
   const [isPreflighting, setIsPreflighting] = useState(false);
   const [executionPreflight, setExecutionPreflight] = useState<ExecutionPreflightResponse | null>(null);
+  const [lastSubmittedExecutionConfig, setLastSubmittedExecutionConfig] = useState<ExecutionConfig | null>(null);
   const [isRecoveryBrowserOpen, setIsRecoveryBrowserOpen] = useState(false);
   const [recoveredGraphView, setRecoveredGraphView] = useState<RecoveredGraphView | null>(null);
 
@@ -231,6 +235,8 @@ export const useFlowEngine = (
   const isSubmittingRunRef = useRef(false); // prevents double-submit
   const recoveryRequestInFlightRef = useRef(false);
   const pendingGraphRef = useRef<ExecutionGraph | null>(null);
+  const executionPreflightRef = useRef<ExecutionPreflightResponse | null>(null);
+  const preflightInFlightRef = useRef(false);
   const preflightRequestIdRef = useRef(0);
   const preflightAbortRef = useRef<AbortController | null>(null);
   const editableFlowRef = useRef<SerializedFlow | null>(null);
@@ -438,8 +444,10 @@ export const useFlowEngine = (
         preflightRequestIdRef.current += 1;
         preflightAbortRef.current?.abort();
         preflightAbortRef.current = null;
+        preflightInFlightRef.current = false;
         pendingGraphRef.current = null;
         setIsPreflighting(false);
+        executionPreflightRef.current = null;
         setExecutionPreflight(null);
         setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
         const storedExecutionId = sessionStorage.getItem('WorkFlow_execution_id');
@@ -824,6 +832,7 @@ export const useFlowEngine = (
       preflightRequestIdRef.current += 1;
       preflightAbortRef.current?.abort();
       preflightAbortRef.current = null;
+      preflightInFlightRef.current = false;
       clearReconnectTimer();
       if (wsRef.current) {
         wsRef.current.close(1000, 'component unmount');
@@ -876,8 +885,10 @@ export const useFlowEngine = (
     preflightRequestIdRef.current += 1;
     preflightAbortRef.current?.abort();
     preflightAbortRef.current = null;
+    preflightInFlightRef.current = false;
     pendingGraphRef.current = null;
     setIsPreflighting(false);
+    executionPreflightRef.current = null;
     setExecutionPreflight(null);
     setNodes(hydrated.nodes);
     setEdges(hydrated.edges);
@@ -919,13 +930,67 @@ export const useFlowEngine = (
     }
     editableFlowRef.current = null;
     setRecoveredGraphView(null);
+    executionPreflightRef.current = null;
     setExecutionPreflight(null);
     pendingGraphRef.current = null;
     addLog('Returned to the editable workflow.', 'info');
   }, [addLog, nodeDefs, setEdges, setNodes]);
 
+  const deleteRecoveryDirectory = useCallback(async (
+    recoveryDirectory: string,
+    expectedExecutionId: string,
+  ): Promise<RecoveryDeleteResponse> => {
+    if (blocksExecutionChanges(executionStateRef.current.phase)) {
+      throw new Error('Cannot delete a recovery record while execution is active.');
+    }
+    const normalizedDirectory = recoveryDirectory.trim();
+    const deleted = await fetchJson<RecoveryDeleteResponse>(
+      '/execution/recovery/delete',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recoveryDirectory: normalizedDirectory,
+          expectedExecutionId,
+        }),
+      },
+    );
+    if (
+      deleted.deleted !== true
+      || deleted.deletedExecutionId !== expectedExecutionId
+      || typeof deleted.recoveryDirectory !== 'string'
+      || deleted.recoveryDirectory.trim() === ''
+      || !Array.isArray(deleted.outputsPreserved)
+      || deleted.outputsPreserved.some(path => typeof path !== 'string')
+      || typeof deleted.cleanupPending !== 'boolean'
+      || (
+        deleted.cleanupPending
+        && (
+          typeof deleted.cleanupDirectory !== 'string'
+          || deleted.cleanupDirectory.trim() === ''
+        )
+      )
+    ) {
+      throw new Error('The backend did not confirm recovery-record deletion.');
+    }
+    if (sameServerPath(
+      recoveredGraphView?.recoveryDirectory,
+      deleted.recoveryDirectory,
+    )) {
+      closeRecoveredGraph();
+    }
+    addLog(
+      deleted.cleanupPending
+        ? `Deleted recovery record ${deleted.recoveryDirectory}; output data was not deleted. `
+          + `Detached metadata still needs filesystem cleanup at ${deleted.cleanupDirectory}.`
+        : `Deleted recovery record ${deleted.recoveryDirectory}; its output data was not deleted.`,
+      deleted.cleanupPending ? 'warning' : 'success',
+    );
+    return deleted;
+  }, [addLog, closeRecoveredGraph, recoveredGraphView]);
+
   const submitExecution = useCallback((
-    graph: ExecutionGraph,
+    graph: ExecutionGraph | null,
     executionConfig: ExecutionConfig,
   ): boolean => {
     if (isSubmittingRunRef.current) {
@@ -947,6 +1012,7 @@ export const useFlowEngine = (
     }
 
     const executionId = crypto.randomUUID();
+    setLastSubmittedExecutionConfig(executionConfig);
     finishedRef.current = false;
     windowProgressProtocolRef.current = createWindowProgressProtocolState(executionId);
     executionStateRef.current = {
@@ -987,6 +1053,7 @@ export const useFlowEngine = (
       );
       return true;
     } catch {
+      setLastSubmittedExecutionConfig(null);
       isSubmittingRunRef.current = false;
       finishedRef.current = true;
       executionStateRef.current = { ...initialExecutionState };
@@ -1015,25 +1082,12 @@ export const useFlowEngine = (
       const opened = await fetchRecoveryGraph(normalizedDirectory);
       applyRecoveryGraph(normalizedDirectory, opened);
 
-      const windowShape = opened.recoverySummary.windowShape;
-      if (!isValidWindowShape(opened.recoverySummary.outputShape, windowShape)) {
-        throw new Error('Saved recovery Window shape is invalid.');
-      }
-      const config: ExecutionConfig = action === 'resume'
-        ? {
-            mode: 'window',
-            windowShape,
-            resumeAction: 'resume',
-            recoveryLocation: { mode: 'custom', directory: normalizedDirectory },
-          }
-        : {
-            mode: 'window',
-            windowShape,
-            resumeAction: 'restart',
-            recoveryLocation: { mode: 'custom', directory: normalizedDirectory },
-          };
-
-      const submitted = submitExecution(opened.graph, config);
+      const request = buildRecoveryExecutionRequest(
+        opened,
+        normalizedDirectory,
+        action,
+      );
+      const submitted = submitExecution(request.graph, request.executionConfig);
       if (submitted) setIsRecoveryBrowserOpen(false);
       return submitted;
     } finally {
@@ -1042,21 +1096,29 @@ export const useFlowEngine = (
   }, [applyRecoveryGraph, fetchRecoveryGraph, submitExecution]);
 
   // =========================================================
-  // Execution preflight and confirmed Run
+  // Execution preflight and prepared submission
   // =========================================================
-  const runFlow = useCallback(async () => {
-    if (isSubmittingRunRef.current || isPreflighting || executionPreflight) return;
-
+  const preflightFlow = useCallback(async (
+    executionConfig: ExecutionConfig,
+  ): Promise<ExecutionPreflightResponse> => {
+    if (isSubmittingRunRef.current) {
+      throw new Error('Execution submission is already in progress.');
+    }
+    if (preflightInFlightRef.current) {
+      throw new Error('Execution preflight is already in progress.');
+    }
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      addLog('Server not connected!', 'error');
-      return;
+      const error = new Error('Server not connected!');
+      addLog(error.message, 'error');
+      throw error;
     }
     if (websocketStatus !== 'connected') {
-      addLog('Server not connected!', 'error');
-      return;
+      const error = new Error('Server not connected!');
+      addLog(error.message, 'error');
+      throw error;
     }
     if (blocksExecutionChanges(executionState.phase)) {
-      return;
+      throw new Error('Another execution is already active.');
     }
 
     const graph = buildExecutionGraph(nodes, edges);
@@ -1065,7 +1127,7 @@ export const useFlowEngine = (
     preflightAbortRef.current?.abort();
     const controller = new AbortController();
     preflightAbortRef.current = controller;
-    pendingGraphRef.current = graph;
+    preflightInFlightRef.current = true;
     setIsPreflighting(true);
     let didTimeout = false;
     const timeoutId = window.setTimeout(() => {
@@ -1077,12 +1139,15 @@ export const useFlowEngine = (
       const preflight = await fetchJson<ExecutionPreflightResponse>('/execution/preflight', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ graph }),
+        body: JSON.stringify({ graph, executionConfig }),
         signal: controller.signal,
       });
 
-      if (!mountedRef.current || controller.signal.aborted || preflightRequestIdRef.current !== requestId) {
-        return;
+      if (!mountedRef.current) {
+        throw new Error('Execution preflight was cancelled because the editor was closed.');
+      }
+      if (controller.signal.aborted || preflightRequestIdRef.current !== requestId) {
+        throw new Error('Execution preflight was cancelled.');
       }
       if (!preflight || typeof preflight.windowable !== 'boolean') {
         throw new Error('Invalid execution preflight response');
@@ -1127,21 +1192,34 @@ export const useFlowEngine = (
         };
       }
 
+      // Replace the prepared graph and summary together only after a complete,
+      // valid response. A failed refresh therefore leaves the last preparation
+      // available to the caller.
+      pendingGraphRef.current = graph;
+      executionPreflightRef.current = normalizedPreflight;
       setExecutionPreflight(normalizedPreflight);
+      return normalizedPreflight;
     } catch (err) {
-      if (preflightRequestIdRef.current !== requestId) return;
-      if (controller.signal.aborted && !didTimeout) return;
-      pendingGraphRef.current = null;
-      addLog(
-        didTimeout
-          ? 'Execution preflight timed out after 60 seconds. Please try again.'
-          : `Execution preflight failed: ${(err as Error).message}`,
-        'error',
-      );
+      const error = err instanceof Error ? err : new Error(String(err));
+      const isCurrentRequest = preflightRequestIdRef.current === requestId;
+      const wasExplicitlyCancelled = controller.signal.aborted && !didTimeout;
+      if (isCurrentRequest && !wasExplicitlyCancelled) {
+        addLog(
+          didTimeout
+            ? 'Execution preflight timed out after 60 seconds. Please try again.'
+            : `Execution preflight failed: ${error.message}`,
+          'error',
+        );
+      }
+      if (didTimeout) {
+        throw new Error('Execution preflight timed out after 60 seconds. Please try again.');
+      }
+      throw error;
     } finally {
       window.clearTimeout(timeoutId);
       if (preflightRequestIdRef.current === requestId) {
         preflightAbortRef.current = null;
+        preflightInFlightRef.current = false;
         setIsPreflighting(false);
       }
     }
@@ -1151,28 +1229,29 @@ export const useFlowEngine = (
     addLog,
     websocketStatus,
     executionState.phase,
-    isPreflighting,
-    executionPreflight,
   ]);
 
-  const cancelExecutionDialog = useCallback(() => {
+  const clearPreparedExecution = useCallback(() => {
     preflightRequestIdRef.current += 1;
     preflightAbortRef.current?.abort();
     preflightAbortRef.current = null;
+    preflightInFlightRef.current = false;
     pendingGraphRef.current = null;
+    executionPreflightRef.current = null;
     setIsPreflighting(false);
     setExecutionPreflight(null);
   }, []);
 
-  const confirmExecution = useCallback((executionConfig: ExecutionConfig) => {
-    if (isSubmittingRunRef.current) return;
+  const submitPreparedExecution = useCallback((
+    executionConfig: ExecutionConfig,
+  ): boolean => {
+    if (isSubmittingRunRef.current) return false;
 
     const graph = pendingGraphRef.current;
-    const preflight = executionPreflight;
+    const preflight = executionPreflightRef.current;
     if (!graph || !preflight) {
-      addLog('Execution preflight has expired. Please click Run again.', 'warning');
-      cancelExecutionDialog();
-      return;
+      addLog('Execution preflight has expired. Please run preflight again.', 'warning');
+      return false;
     }
     if (!preflightResourcesAllowExecution(preflight)) {
       addLog(
@@ -1180,7 +1259,7 @@ export const useFlowEngine = (
           || 'The active Dask cluster cannot satisfy this workflow.',
         'error',
       );
-      return;
+      return false;
     }
 
     let normalizedConfig: ExecutionConfig = { mode: 'full_graph' };
@@ -1189,30 +1268,31 @@ export const useFlowEngine = (
       const windowShape = [...(executionConfig.windowShape ?? [])];
       if (!preflight.windowable) {
         addLog(preflight.reason || 'Window execution is unavailable for this workflow.', 'warning');
-        return;
+        return false;
       }
       if (!isValidWindowShape(outputShape, windowShape)) {
         addLog('Window shape must contain one positive integer per output dimension.', 'warning');
-        return;
+        return false;
       }
       if (
         executionConfig.maxInFlightWindows !== undefined
         && !isValidMaxInFlightWindows(executionConfig.maxInFlightWindows)
       ) {
         addLog('Maximum in-flight Windows must be a positive integer.', 'warning');
-        return;
+        return false;
       }
       normalizedConfig = { ...executionConfig, windowShape } as ExecutionConfig;
     }
 
     if (submitExecution(graph, normalizedConfig)) {
       pendingGraphRef.current = null;
+      executionPreflightRef.current = null;
       setExecutionPreflight(null);
+      return true;
     }
+    return false;
   }, [
     addLog,
-    cancelExecutionDialog,
-    executionPreflight,
     submitExecution,
   ]);
 
@@ -1251,17 +1331,19 @@ export const useFlowEngine = (
     isReloadingNodes,
     isPreflighting,
     executionPreflight,
+    lastSubmittedExecutionConfig,
     isRecoveryBrowserOpen,
     recoveredGraphView,
     executionState,
-    runFlow,
-    confirmExecution,
-    cancelExecutionDialog,
+    preflightFlow,
+    submitPreparedExecution,
+    clearPreparedExecution,
     openRecoveryBrowser,
     closeRecoveryBrowser,
     browseServerDirectories,
     inspectRecoveryDirectory,
     openRecoveryDirectory,
+    deleteRecoveryDirectory,
     executeRecoveryDirectory,
     closeRecoveredGraph,
     stopFlow,

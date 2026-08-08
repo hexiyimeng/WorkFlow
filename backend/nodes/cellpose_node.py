@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import inspect
 import itertools
+import logging
+import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +13,15 @@ import numpy as np
 from core.model_registry import list_models
 from core.registry import register_node
 from nodes.base import BaseMapOverlapNode
+
+
+logger = logging.getLogger("WorkFlow.Cellpose")
+
+# Cellpose 4.x scales Y/X relative to the model's nominal training diameter.
+# Keep this diagnostic constant local to the integration rather than importing
+# Cellpose during graph construction (which must remain lightweight and must
+# not initialize CUDA on the Driver).
+CELLPOSE_TRAINING_DIAMETER = 30.0
 
 
 def create_cellpose_model(model_ref: str, device: str):
@@ -21,8 +33,26 @@ def create_cellpose_model(model_ref: str, device: str):
             "using logical device 'cuda:0'; CPU fallback is not supported."
         )
 
+    physical_gpu_id = os.getenv("WORKFLOW_PHYSICAL_GPU_ID", "unknown")
+    visible_device = os.getenv("CUDA_VISIBLE_DEVICES", "")
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+        visible_count = int(torch.cuda.device_count())
+        if visible_count != 1:
+            raise RuntimeError(
+                f"expected exactly one visible CUDA device, found {visible_count}"
+            )
+        torch.cuda.set_device(0)
+    except Exception as exc:
+        raise RuntimeError(
+            "Cellpose GPU Worker CUDA initialization failed for physical GPU "
+            f"{physical_gpu_id!r} (CUDA_VISIBLE_DEVICES={visible_device!r}): {exc}"
+        ) from exc
+
     from cellpose import models
-    import torch
 
     device_obj = torch.device("cuda:0")
     kwargs = {
@@ -187,18 +217,23 @@ def cellpose_block(
             else segment
         )
 
+        explicit_diameter = float(diameter or 0.0)
         eval_kwargs: dict[str, Any] = {
             "batch_size": int(gpu_batch_size),
             "progress": None,
             "bsize": 256,
             "tile_overlap": 0.1,
-            "resample": False,
+            # An explicit diameter makes Cellpose rescale Y/X before inference.
+            # Cellpose 4.x only restores diameter-scaled flows/masks to the
+            # caller's shape when resample=True.  Keep the cheaper path when no
+            # diameter scaling was requested.
+            "resample": explicit_diameter > 0,
             "normalize": bool(normalize),
             "flow_threshold": float(flow_threshold),
             "cellprob_threshold": float(cellprob_threshold),
         }
-        if float(diameter or 0.0) > 0:
-            eval_kwargs["diameter"] = float(diameter)
+        if explicit_diameter > 0:
+            eval_kwargs["diameter"] = explicit_diameter
         if has_channels:
             eval_kwargs["channel_axis"] = -1
 
@@ -241,14 +276,28 @@ def cellpose_block(
                 result[0] if isinstance(result, tuple) else result,
                 dtype=np.uint32,
             )
-            expected_shape = tuple(int(size) for size in segment_for_model.shape[:3])
-            if mask.ndim == 2 and expected_shape[0] == 1:
-                mask = mask[np.newaxis, ...]
-            if mask.shape != expected_shape:
-                raise ValueError(
-                    "Cellpose 2D plane batch returned mask shape "
-                    f"{mask.shape}, expected {expected_shape}."
-                )
+
+        expected_shape = tuple(
+            int(size)
+            for size in (
+                segment_for_model.shape[:-1]
+                if has_channels
+                else segment_for_model.shape
+            )
+        )
+        if mask.shape != expected_shape:
+            # Cellpose squeezes its result, which may remove any singleton
+            # spatial axis.  Restore only singleton dimensions; never resize,
+            # crop, or otherwise reinterpret non-singleton model output.
+            actual_non_singleton = tuple(size for size in mask.shape if size != 1)
+            expected_non_singleton = tuple(size for size in expected_shape if size != 1)
+            if actual_non_singleton == expected_non_singleton:
+                mask = mask.reshape(expected_shape)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                "Cellpose returned mask shape "
+                f"{mask.shape}, expected input-block spatial shape {expected_shape}."
+            )
 
         inverse_order = [
             segment_spatial_axes.index(axis)
@@ -289,10 +338,124 @@ class Cellpose(BaseMapOverlapNode):
     }
     MAP_BLOCKS_OUTPUT_SPEC = {
         "dtype": "uint32",
-        "drop_axis": "C",
-        "chunks": "drop_axis_from_primary",
+        "chunks": "same_as_primary",
         "enforce_ndim": True,
     }
+
+    def preprocess(self, dask_arr=None, params=None, runtime=None):
+        """Log one graph-level estimate of the largest model input block."""
+
+        del runtime
+        if dask_arr is None:
+            return {}
+
+        params = dict(params or {})
+        axes = tuple(
+            str(axis).upper()
+            for axis in ((self._axes_by_name or {}).get(self.PRIMARY_INPUT) or ())
+        )
+        if len(axes) != int(dask_arr.ndim):
+            return {}
+
+        from dask.array.overlap import ensure_minimum_chunksize
+
+        halo_block = []
+        for axis, axis_chunks, axis_length in zip(
+            axes,
+            dask_arr.chunks,
+            dask_arr.shape,
+        ):
+            configured_depth = int(self.MAP_OVERLAP_SPEC["depth"].get(axis, 0))
+            depth = min(configured_depth, max(0, int(axis_length)))
+            normalized_chunks = tuple(int(chunk) for chunk in axis_chunks)
+            if self.MAP_OVERLAP_SPEC.get("allow_rechunk", False) and depth:
+                # Match Dask's own overlap rechunk rule.  Merely adding the
+                # halo to the original maximum chunk underestimates the model
+                # block when chunks smaller than ``depth`` are merged first.
+                normalized_chunks = ensure_minimum_chunksize(
+                    depth,
+                    normalized_chunks,
+                )
+            halo_block.append(max(normalized_chunks) + 2 * depth)
+
+        diameter = float(params.get("diameter") or 0.0)
+        scale = CELLPOSE_TRAINING_DIAMETER / diameter if diameter > 0 else 1.0
+        estimated_model_block = tuple(
+            int(math.ceil(length * scale)) if axis in {"Y", "X"} else int(length)
+            for axis, length in zip(axes, halo_block)
+            if axis != "C"
+        )
+        logger.info(
+            "[Cellpose] input_shape=%s input_chunks=%s axes=%s "
+            "halo_max_block=%s diameter=%s estimated_model_block=%s do_3d=%s",
+            tuple(int(length) for length in dask_arr.shape),
+            dask_arr.chunks,
+            axes,
+            tuple(halo_block),
+            diameter,
+            estimated_model_block,
+            params.get("do_3d", "auto"),
+        )
+        if scale > 1.0:
+            logger.warning(
+                "[Cellpose] diameter=%s scales Y/X by about %.2fx "
+                "(%.2fx pixels per plane); reduce the source Y/X chunk sizes "
+                "if host-memory pressure persists.",
+                diameter,
+                scale,
+                scale * scale,
+            )
+        return {}
+
+    def infer_output_spec(self, array_inputs, _params, primary_name):
+        """Drop a declared channel axis while preserving channel-less inputs."""
+
+        axes = tuple(
+            str(axis).upper()
+            for axis in ((self._axes_by_name or {}).get(primary_name) or ())
+        )
+        if "C" not in axes:
+            return self.MAP_BLOCKS_OUTPUT_SPEC
+        return {
+            "dtype": "uint32",
+            "drop_axis": axes.index("C"),
+            "chunks": "drop_axis_from_primary",
+            "enforce_ndim": True,
+        }
+
+    def infer_overlap_spec(
+        self,
+        *,
+        array_inputs,
+        ordered_names,
+        primary_name,
+        params,
+        runtime,
+    ):
+        """Apply only halos whose named spatial axes exist on this input."""
+
+        del ordered_names, params, runtime
+        primary = array_inputs[primary_name]
+        axes = tuple(
+            str(axis).upper()
+            for axis in ((self._axes_by_name or {}).get(primary_name) or ())
+        )
+        axis_lookup = {axis: index for index, axis in enumerate(axes)}
+        depth_by_axis = {}
+        for axis, configured_depth in self.MAP_OVERLAP_SPEC["depth"].items():
+            if axis not in axis_lookup:
+                continue
+            axis_length = int(primary.shape[axis_lookup[axis]])
+            # Dask rejects overlap depth greater than a complete axis.  Clamp
+            # short axes while retaining as much reflected context as possible.
+            depth_by_axis[axis] = min(
+                int(configured_depth),
+                max(0, axis_length),
+            )
+        return {
+            **self.MAP_OVERLAP_SPEC,
+            "depth": depth_by_axis,
+        }
 
     @classmethod
     def INPUT_TYPES(cls):

@@ -32,14 +32,11 @@ from core.window_execution import (
     WindowCheckpointStore,
     WindowGenerator,
     Window,
-    atomic_write_json,
     compute_plan_fingerprint,
     compute_workflow_fingerprint,
-    execution_config_to_dict,
     load_execution_config_snapshot,
-    load_graph_snapshot,
-    load_recovery_manifest,
     parse_execution_config,
+    require_window_recovery_location,
     write_execution_config_snapshot,
     write_graph_snapshot,
     write_recovery_manifest,
@@ -447,6 +444,44 @@ class InFlightWindow:
     waiter: asyncio.Task
 
 
+async def _log_memory_snapshot_with_timeout(
+    memory_monitor,
+    name: str,
+    client,
+    *,
+    timeout_seconds: float = 15.0,
+) -> bool:
+    """Publish a memory snapshot only if its background collection is timely.
+
+    Cancelling ``asyncio.to_thread`` cannot stop the worker thread.  Keeping
+    collection side-effect free prevents a timed-out request from logging or
+    mutating snapshot state minutes later when that thread eventually returns.
+    """
+    if not getattr(memory_monitor, "enabled", True):
+        return False
+    try:
+        snapshot = await asyncio.wait_for(
+            asyncio.to_thread(memory_monitor.collect_snapshot, client),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[Memory] Timed out collecting Worker diagnostics for %s.",
+            name,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "[Memory] Failed collecting Worker diagnostics for %s: %s",
+            name,
+            exc,
+        )
+        return False
+
+    memory_monitor.record_snapshot(name, snapshot)
+    return True
+
+
 async def _wait_for_window_futures(futures: list) -> None:
     """Wait for, then inspect, every terminal Future for one Window."""
     loop = asyncio.get_running_loop()
@@ -479,7 +514,14 @@ async def _cancel_in_flight_windows(
 
     if futures:
         try:
-            client.cancel(futures, force=True)
+            await asyncio.wait_for(
+                asyncio.to_thread(client.cancel, futures, force=True),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Cleanup] Timed out requesting cancellation for in-flight Windows."
+            )
         except Exception as exc:
             logger.debug("[Cleanup] In-flight Window cancellation failed: %s", exc)
 
@@ -510,6 +552,7 @@ async def _execute_pending_windows(
     window_generator: WindowGenerator,
     pending_indices: np.ndarray,
     completed_windows_bitmap: np.ndarray,
+    completed_count: int,
     window_store: WindowCheckpointStore,
     max_in_flight_windows: int,
     execution_roots: list[str],
@@ -517,7 +560,7 @@ async def _execute_pending_windows(
     progress_callback,
     window_progress_callback,
     disable_graph_optimization: bool,
-) -> None:
+) -> int:
     """Execute zero-valued Window positions with bounded, out-of-order completion."""
     total_windows = window_generator.total_windows
     pending_iterator = iter(pending_indices)
@@ -533,7 +576,6 @@ async def _execute_pending_windows(
             return False
 
         window = window_generator.window_at(int(raw_index))
-        completed_count = int(np.count_nonzero(completed_windows_bitmap))
         message = f"Window {window.index + 1} / {total_windows}"
         await window_progress_callback(
             current_window=window.index + 1,
@@ -606,13 +648,12 @@ async def _execute_pending_windows(
                     waiter.result()
                     # The Driver commits only after all terminal Futures for
                     # this specific Window have succeeded.
-                    window_store.mark_completed(
+                    committed = window_store.mark_completed(
                         completed_windows_bitmap,
                         entry.window.coordinates,
                     )
-                    completed_count = int(
-                        np.count_nonzero(completed_windows_bitmap)
-                    )
+                    if committed:
+                        completed_count += 1
                     await window_progress_callback(
                         current_window=entry.window.index + 1,
                         completed_windows=completed_count,
@@ -647,6 +688,7 @@ async def _execute_pending_windows(
             tracked_futures,
         )
         raise
+    return completed_count
 
 
 async def _cancel_and_await_tasks(tasks: dict) -> None:
@@ -1015,6 +1057,15 @@ async def preflight_graph(
             )
 
     outputs = discover_terminal_outputs(graph, execution_roots)
+    if (
+        selected_config is not None
+        and selected_config.mode == "window"
+        and selected_config.recovery_location is not None
+    ):
+        # Read-only layout resolution validates the saved recovery location,
+        # including separation from every terminal output path.  It does not
+        # create the directory or any recovery files.
+        ExecutionLayout.resolve(selected_config, outputs)
     output_entries = [
         output.to_dict(include_path_input=True)
         for output in outputs
@@ -1121,6 +1172,23 @@ def _recovery_control_paths(layout: ExecutionLayout) -> tuple:
     )
 
 
+def _unexpected_recovery_entries(layout: ExecutionLayout) -> tuple:
+    """Return entries that do not belong to the current recovery format."""
+
+    if not layout.control_directory.exists():
+        return ()
+    allowed_names = {
+        *(path.name for path in _recovery_control_paths(layout)),
+        layout.lock_path.name,
+        layout.lock_mutation_guard_path.name,
+    }
+    return tuple(
+        child
+        for child in layout.control_directory.iterdir()
+        if child.name not in allowed_names
+    )
+
+
 def _output_contract(
     outputs: tuple[RecoveryOutput, ...],
 ) -> dict[str, tuple[str, str]]:
@@ -1190,6 +1258,7 @@ async def execute_graph(
     workflow_fingerprint: str | None = None
     plan_fingerprint: str | None = None
     completed_windows_bitmap: np.ndarray | None = None
+    completed_count = 0
     window_generator: WindowGenerator | None = None
     selected_config: ExecutionConfig | None = None
     requested_config: ExecutionConfig | None = None
@@ -1197,7 +1266,6 @@ async def execute_graph(
     recovery_lock: ActiveExecutionLock | None = None
     recovery_manifest: RecoveryManifest | None = None
     terminal_outputs: tuple[RecoveryOutput, ...] = ()
-    legacy_migration_message: str | None = None
     resource_plan: WorkflowResourcePlan | None = None
     cluster_summary = None
 
@@ -1209,20 +1277,11 @@ async def execute_graph(
     state_manager.create_execution(execution_id)
 
     async def log_memory_snapshot(name: str) -> None:
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    mem_monitor.log_snapshot,
-                    name,
-                    client,
-                ),
-                timeout=15.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[Memory] Timed out collecting Worker diagnostics for %s.",
-                name,
-            )
+        await _log_memory_snapshot_with_timeout(
+            mem_monitor,
+            name,
+            client,
+        )
 
     def persist_recovery_status(status: str) -> None:
         nonlocal recovery_manifest
@@ -1241,27 +1300,22 @@ async def execute_graph(
 
     try:
         selected_config = parse_execution_config(execution_config)
+        require_window_recovery_location(selected_config)
         requested_config = selected_config
 
-        # A direct resume is rooted in the immutable recovery snapshot, not in
-        # a potentially edited graph sent by the browser.  Resolve and own the
-        # selected directory before reading its control files.
+        # Recovery actions are rooted in the immutable recovery snapshot, not
+        # in a potentially edited graph sent by the browser. Resolve and own
+        # the selected directory before reading its control files. A custom
+        # location therefore supports graph=None for both Resume and Restart.
         if (
             selected_config.mode == "window"
-            and selected_config.resume_action == "resume"
+            and selected_config.resume_action in {"resume", "restart"}
         ):
-            if checkpoint_store is not None:
-                window_store = checkpoint_store
-                recovery_layout = checkpoint_store.layout
-            elif (
-                selected_config.recovery_location is not None
-                and selected_config.recovery_location.mode == "custom"
-            ):
+            if selected_config.recovery_location.mode == "custom":
                 recovery_layout = ExecutionLayout.resolve(
                     selected_config,
                     (),
                 )
-                window_store = WindowCheckpointStore(recovery_layout)
             else:
                 # output_sidecar needs the submitted graph only to locate the
                 # canonical directory.  It is discarded immediately after the
@@ -1278,43 +1332,42 @@ async def execute_graph(
                     selected_config,
                     request_outputs,
                 )
+            if checkpoint_store is not None:
+                if (
+                    checkpoint_store.layout.control_directory
+                    != recovery_layout.control_directory
+                ):
+                    raise ValueError(
+                        "Injected Window checkpoint store does not match the "
+                        "explicit recoveryLocation."
+                    )
+                window_store = checkpoint_store
+            else:
                 window_store = WindowCheckpointStore(recovery_layout)
 
-            inspection = inspect_recovery_directory(
-                recovery_layout.control_directory,
-                require_unlocked=True,
-            )
+            if not recovery_layout.control_directory.exists():
+                raise FileNotFoundError(
+                    "Recovery directory does not exist: "
+                    f"{recovery_layout.control_directory}"
+                )
+            if not recovery_layout.control_directory.is_dir():
+                raise NotADirectoryError(
+                    "Recovery path is not a directory: "
+                    f"{recovery_layout.control_directory}"
+                )
             recovery_lock = ActiveExecutionLock(
                 recovery_layout,
                 execution_id,
             ).acquire()
-            # Validate again while owning the directory so the files cannot be
-            # swapped between the public inspection and execution startup.
+            # Load and validate the recovery record once while ownership keeps
+            # its immutable files and bitmap stable for this execution.
             inspection = inspect_recovery_directory(
                 recovery_layout.control_directory,
                 require_unlocked=False,
             )
             recovery_manifest = inspection.manifest
-            if (
-                not recovery_layout.checkpoint_path.exists()
-                and window_store.legacy_checkpoint_path.exists()
-            ):
-                saved_plan = recovery_manifest.window_plan
-                migrated = window_store.migrate_legacy(
-                    workflow_fingerprint=recovery_manifest.workflow_fingerprint,
-                    plan_fingerprint=recovery_manifest.plan_fingerprint,
-                    output_shape=saved_plan.output_shape,
-                    window_shape=saved_plan.window_shape,
-                    expected_shape=saved_plan.window_grid_shape,
-                    total_windows=saved_plan.total_windows,
-                )
-                if migrated is None:
-                    raise ValueError("Legacy Window checkpoint was not migrated.")
-                legacy_migration_message = (
-                    "Migrated legacy Window checkpoint: "
-                    f"{int(np.count_nonzero(migrated))} / "
-                    f"{saved_plan.total_windows} Window(s) completed."
-                )
+            completed_windows_bitmap = inspection.completed_windows_bitmap
+            completed_count = inspection.completed_windows
             saved_graph = inspection.graph
             saved_config = inspection.execution_config
             if saved_config.mode != "window" or saved_config.window_shape is None:
@@ -1333,9 +1386,9 @@ async def execute_graph(
             selected_config = ExecutionConfig(
                 mode="window",
                 window_shape=saved_config.window_shape,
-                max_in_flight_windows=requested_config.max_in_flight_windows,
+                max_in_flight_windows=saved_config.max_in_flight_windows,
                 recovery_location=requested_config.recovery_location,
-                resume_action="resume",
+                resume_action=requested_config.resume_action,
             )
 
         validate_graph_structure(graph)
@@ -1349,8 +1402,8 @@ async def execute_graph(
                 "declare OUTPUT_NODE=True and have no outgoing graph connections."
             )
 
-        # This is the authoritative validation path. For Resume, graph is now
-        # the immutable snapshot from the recovery directory.
+        # This is the authoritative validation path. For Resume and Restart,
+        # graph is now the immutable snapshot from the recovery directory.
         resource_plan = _resource_plan_for_execution_mode(
             build_workflow_resource_plan(graph, execution_roots),
             selected_config,
@@ -1393,6 +1446,7 @@ async def execute_graph(
             "success",
             execution_id=execution_id,
         )
+        logger.info("%s | execution_id=%s", cluster_message, execution_id)
 
         await state_manager.broadcast(execution_id, {
             "type": "log",
@@ -1513,7 +1567,7 @@ async def execute_graph(
                 selected_config.window_shape,
             )
 
-            if selected_config.resume_action == "resume":
+            if selected_config.resume_action in {"resume", "restart"}:
                 if (
                     recovery_layout is None
                     or recovery_manifest is None
@@ -1544,26 +1598,56 @@ async def execute_graph(
                         raise ValueError(
                             "Selected sidecar does not match the immutable recovery graph."
                         )
-                completed_windows_bitmap = window_store.load_writable(
-                    expected_shape=window_generator.axis_counts,
+
+                canonical_layout = ExecutionLayout.resolve(
+                    selected_config,
+                    terminal_outputs,
                 )
-                if completed_windows_bitmap is None:
+                if (
+                    canonical_layout.control_directory
+                    != recovery_layout.control_directory
+                ):
                     raise ValueError(
-                        f"Recovery checkpoint is missing: {recovery_layout.checkpoint_path}"
+                        "Selected recovery directory does not match the immutable "
+                        "recovery graph."
                     )
-                is_resuming = True
-            else:
-                if checkpoint_store is not None:
-                    window_store = checkpoint_store
-                    recovery_layout = checkpoint_store.layout
+
+                if selected_config.resume_action == "resume":
+                    if completed_windows_bitmap is None:
+                        raise ValueError(
+                            f"Recovery checkpoint is missing: {recovery_layout.checkpoint_path}"
+                        )
+                    is_resuming = True
                 else:
-                    recovery_layout = ExecutionLayout.resolve(
-                        selected_config,
-                        terminal_outputs,
-                        workflow_fingerprint=workflow_fingerprint,
-                        plan_fingerprint=plan_fingerprint,
+                    # Restart retains the immutable graph/config snapshots and
+                    # resets only mutable execution state.
+                    completed_windows_bitmap = window_store.create(
+                        window_generator.axis_counts,
+                        overwrite=True,
                     )
-                    window_store = WindowCheckpointStore(recovery_layout)
+                    completed_count = 0
+            else:
+                if selected_config.resume_action != "new":
+                    raise RuntimeError(
+                        "Unexpected Window recovery action during initialization."
+                    )
+                canonical_layout = ExecutionLayout.resolve(
+                    selected_config,
+                    terminal_outputs,
+                )
+                if checkpoint_store is not None:
+                    if (
+                        checkpoint_store.layout.control_directory
+                        != canonical_layout.control_directory
+                    ):
+                        raise ValueError(
+                            "Injected Window checkpoint store does not match "
+                            "the explicit recoveryLocation."
+                        )
+                    window_store = checkpoint_store
+                else:
+                    window_store = WindowCheckpointStore(canonical_layout)
+                recovery_layout = canonical_layout
 
                 recovery_lock = ActiveExecutionLock(
                     recovery_layout,
@@ -1574,204 +1658,46 @@ async def execute_graph(
                     for path in _recovery_control_paths(recovery_layout)
                     if path.exists()
                 )
-                required_control_paths = set(
-                    _recovery_control_paths(recovery_layout)
+                unexpected_entries = _unexpected_recovery_entries(
+                    recovery_layout
                 )
-                legacy_exists = window_store.legacy_checkpoint_path.exists()
-                implicit_legacy_migration = (
-                    selected_config.resume_action == "new"
-                    and selected_config.recovery_location is None
-                    and legacy_exists
+                if existing_control_paths or unexpected_entries:
+                    raise FileExistsError(
+                        "Recovery directory is not empty. To run the current "
+                        "edited workflow, choose another recovery location or "
+                        "delete the old record in Recovery; Resume and Restart "
+                        f"use its saved workflow: "
+                        f"{recovery_layout.control_directory}"
+                    )
+                write_graph_snapshot(recovery_layout, graph)
+                write_execution_config_snapshot(
+                    recovery_layout,
+                    selected_config,
                 )
+                completed_windows_bitmap = window_store.create(
+                    window_generator.axis_counts,
+                    overwrite=False,
+                )
+                completed_count = 0
 
-                if implicit_legacy_migration:
-                    if recovery_layout.checkpoint_path.exists():
-                        # A crash may have happened after the NumPy commit but
-                        # before the old JSON could be removed. The modern record
-                        # is authoritative and must be complete.
-                        if set(existing_control_paths) != required_control_paths:
-                            raise ValueError(
-                                "Legacy migration contains completed_windows.npy "
-                                "but its modern recovery metadata is incomplete."
-                            )
-                        inspection = inspect_recovery_directory(
-                            recovery_layout.control_directory,
-                            require_unlocked=False,
-                        )
-                        recovery_manifest = inspection.manifest
-                        _validate_resume_contract(
-                            manifest=recovery_manifest,
-                            saved_config=inspection.execution_config,
-                            outputs=terminal_outputs,
-                            output_shape=expected_output_shape,
-                            workflow_fingerprint=workflow_fingerprint,
-                            plan_fingerprint=plan_fingerprint,
-                        )
-                        completed_windows_bitmap = window_store.load_writable(
-                            expected_shape=window_generator.axis_counts,
-                        )
-                        if completed_windows_bitmap is None:
-                            raise ValueError("Migrated Window checkpoint is missing.")
-                    else:
-                        legacy_summary = window_store.inspect_legacy(
-                            workflow_fingerprint=workflow_fingerprint,
-                            plan_fingerprint=plan_fingerprint,
-                            output_shape=expected_output_shape,
-                            window_shape=selected_config.window_shape,
-                            expected_shape=window_generator.axis_counts,
-                            total_windows=window_generator.total_windows,
-                        )
-                        if legacy_summary is None:
-                            raise ValueError("Legacy Window checkpoint is missing.")
-
-                        if recovery_layout.graph_path.exists():
-                            if load_graph_snapshot(recovery_layout) != graph:
-                                raise ValueError(
-                                    "Partial legacy migration graph.json does not "
-                                    "match the submitted graph."
-                                )
-                        else:
-                            write_graph_snapshot(recovery_layout, graph)
-
-                        if recovery_layout.execution_config_path.exists():
-                            partial_saved_config = load_execution_config_snapshot(
-                                recovery_layout
-                            )
-                            if (
-                                partial_saved_config.mode != "window"
-                                or partial_saved_config.window_shape
-                                != selected_config.window_shape
-                            ):
-                                raise ValueError(
-                                    "Partial legacy migration execution_config.json "
-                                    "does not match the submitted Window plan."
-                                )
-                        else:
-                            write_execution_config_snapshot(
-                                recovery_layout,
-                                selected_config,
-                            )
-
-                        if recovery_layout.manifest_path.exists():
-                            recovery_manifest = load_recovery_manifest(
-                                recovery_layout
-                            )
-                            _validate_resume_contract(
-                                manifest=recovery_manifest,
-                                saved_config=selected_config,
-                                outputs=terminal_outputs,
-                                output_shape=expected_output_shape,
-                                workflow_fingerprint=workflow_fingerprint,
-                                plan_fingerprint=plan_fingerprint,
-                            )
-                            recovery_manifest = recovery_manifest.with_status(
-                                "prepared",
-                                execution_id=execution_id,
-                            )
-                        else:
-                            recovery_manifest = RecoveryManifest.create(
-                                execution_id=execution_id,
-                                workflow_fingerprint=workflow_fingerprint,
-                                plan_fingerprint=plan_fingerprint,
-                                output_shape=expected_output_shape,
-                                window_shape=selected_config.window_shape,
-                                outputs=terminal_outputs,
-                                status="prepared",
-                            )
-                        # Metadata is durable before the legacy JSON identity is
-                        # replaced by the NumPy checkpoint.
-                        write_recovery_manifest(
-                            recovery_layout,
-                            recovery_manifest,
-                        )
-                        completed_windows_bitmap = window_store.migrate_legacy(
-                            workflow_fingerprint=workflow_fingerprint,
-                            plan_fingerprint=plan_fingerprint,
-                            output_shape=expected_output_shape,
-                            window_shape=selected_config.window_shape,
-                            expected_shape=window_generator.axis_counts,
-                            total_windows=window_generator.total_windows,
-                        )
-                        if completed_windows_bitmap is None:
-                            raise ValueError("Legacy Window checkpoint was not migrated.")
-
-                    is_resuming = True
-                    completed_count = int(
-                        np.count_nonzero(completed_windows_bitmap)
+            if selected_config.resume_action != "resume":
+                if completed_windows_bitmap is None:
+                    raise ValueError(
+                        "Window completion bitmap was not initialized."
                     )
-                    legacy_migration_message = (
-                        "Migrated legacy Window checkpoint: "
-                        f"{completed_count} / {window_generator.total_windows} "
-                        "Window(s) completed."
-                    )
-                else:
-                    if (
-                        selected_config.resume_action == "new"
-                        and (existing_control_paths or legacy_exists)
-                    ):
-                        raise FileExistsError(
-                            "Recovery state already exists; choose Resume or Restart: "
-                            f"{recovery_layout.control_directory}"
-                        )
-                    if selected_config.resume_action == "restart":
-                        if set(existing_control_paths) == required_control_paths:
-                            inspect_recovery_directory(
-                                recovery_layout.control_directory,
-                                require_unlocked=False,
-                            )
-                        elif (
-                            legacy_exists
-                            and not recovery_layout.checkpoint_path.exists()
-                        ):
-                            legacy_summary = window_store.inspect_legacy(
-                                workflow_fingerprint=workflow_fingerprint,
-                                plan_fingerprint=plan_fingerprint,
-                                output_shape=expected_output_shape,
-                                window_shape=selected_config.window_shape,
-                                expected_shape=window_generator.axis_counts,
-                                total_windows=window_generator.total_windows,
-                            )
-                            if legacy_summary is None:
-                                raise ValueError(
-                                    "Legacy Window checkpoint is missing."
-                                )
-                        elif existing_control_paths:
-                            raise ValueError(
-                                "Cannot restart an incomplete recovery record. "
-                                "Expected manifest.json, graph.json, "
-                                "execution_config.json, and completed_windows.npy."
-                            )
-
-                        atomic_write_json(recovery_layout.graph_path, graph)
-                        atomic_write_json(
-                            recovery_layout.execution_config_path,
-                            execution_config_to_dict(selected_config),
-                        )
-                    else:
-                        write_graph_snapshot(recovery_layout, graph)
-                        write_execution_config_snapshot(
-                            recovery_layout,
-                            selected_config,
-                        )
-                    completed_windows_bitmap = window_store.create(
-                        window_generator.axis_counts,
-                        overwrite=(selected_config.resume_action == "restart"),
-                    )
-                    recovery_manifest = RecoveryManifest.create(
-                        execution_id=execution_id,
-                        workflow_fingerprint=workflow_fingerprint,
-                        plan_fingerprint=plan_fingerprint,
-                        output_shape=expected_output_shape,
-                        window_shape=selected_config.window_shape,
-                        outputs=terminal_outputs,
-                        status="prepared",
-                    )
-                    write_recovery_manifest(
-                        recovery_layout,
-                        recovery_manifest,
-                    )
-                    if selected_config.resume_action == "restart":
-                        window_store.remove_legacy_checkpoint()
+                recovery_manifest = RecoveryManifest.create(
+                    execution_id=execution_id,
+                    workflow_fingerprint=workflow_fingerprint,
+                    plan_fingerprint=plan_fingerprint,
+                    output_shape=expected_output_shape,
+                    window_shape=selected_config.window_shape,
+                    outputs=terminal_outputs,
+                    status="prepared",
+                )
+                write_recovery_manifest(
+                    recovery_layout,
+                    recovery_manifest,
+                )
 
             recovery_message = (
                 "Window recovery directory: "
@@ -1786,22 +1712,12 @@ async def execute_graph(
                 "info",
                 execution_id=execution_id,
             )
-            if legacy_migration_message is not None:
-                await state_manager.broadcast(
-                    execution_id,
-                    {"type": "log", "message": legacy_migration_message},
-                )
-                state_manager.add_log(
-                    legacy_migration_message,
-                    "info",
-                    execution_id=execution_id,
-                )
-
         await state_manager.broadcast(
             execution_id,
             {"type": "log", "message": "GraphBuilding..."},
         )
         state_manager.add_log("GraphBuilding...", "info", execution_id=execution_id)
+        logger.info("[Execution %s] Building lazy Dask graph...", execution_id)
         await _build_lazy_execution_roots(
             graph,
             execution_roots,
@@ -1812,6 +1728,7 @@ async def execute_graph(
             results=results,
             node_instances=node_instances,
         )
+        logger.info("[Execution %s] Lazy Dask graph built.", execution_id)
 
         if selected_config.mode == "full_graph":
             output_sinks = _collect_output_sinks(results, execution_roots)
@@ -1838,6 +1755,11 @@ async def execute_graph(
                     f"Submitted {len(output_sinks)} sink(s) - Computing...",
                     "info",
                     execution_id=execution_id,
+                )
+                logger.info(
+                    "[Execution %s] Submitted %s terminal sink(s) to Dask.",
+                    execution_id,
+                    len(output_sinks),
                 )
                 for node_id in execution_roots:
                     await progress_callback(node_id, None, "Running", "running")
@@ -1885,7 +1807,6 @@ async def execute_graph(
             write_recovery_manifest(recovery_layout, recovery_manifest)
 
             if is_resuming:
-                completed_count = int(np.count_nonzero(completed_windows_bitmap))
                 resume_message = (
                     "Resuming Window Execution at finalization."
                     if completed_count == window_generator.total_windows
@@ -1908,10 +1829,7 @@ async def execute_graph(
             total_windows = window_generator.total_windows
             flat_bitmap = completed_windows_bitmap.reshape(-1, order="C")
             pending_indices = np.flatnonzero(flat_bitmap == 0)
-            all_windows_completed = (
-                total_windows == 0
-                or bool(np.all(completed_windows_bitmap == 1))
-            )
+            all_windows_completed = completed_count == total_windows
             if not all_windows_completed:
                 for node_id in execution_roots:
                     await progress_callback(node_id, None, "Submitted", "submitted")
@@ -1947,12 +1865,13 @@ async def execute_graph(
                         "info",
                         execution_id=execution_id,
                     )
-                await _execute_pending_windows(
+                completed_count = await _execute_pending_windows(
                     client=client,
                     root_arrays=root_arrays,
                     window_generator=window_generator,
                     pending_indices=pending_indices,
                     completed_windows_bitmap=completed_windows_bitmap,
+                    completed_count=completed_count,
                     window_store=window_store,
                     max_in_flight_windows=max_in_flight_windows,
                     execution_roots=execution_roots,
@@ -1974,9 +1893,7 @@ async def execute_graph(
 
             await window_progress_callback(
                 current_window=(total_windows if total_windows else 0),
-                completed_windows=int(
-                    np.count_nonzero(completed_windows_bitmap)
-                ),
+                completed_windows=completed_count,
                 total_windows=total_windows,
                 window_status="finalizing",
                 message="Finalizing Window Execution",

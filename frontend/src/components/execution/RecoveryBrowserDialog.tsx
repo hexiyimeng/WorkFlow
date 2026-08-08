@@ -7,9 +7,11 @@ export default function RecoveryBrowserDialog() {
   const {
     isRecoveryBrowserOpen,
     closeRecoveryBrowser,
+    recoveredGraphView,
     browseServerDirectories,
     inspectRecoveryDirectory,
     openRecoveryDirectory,
+    deleteRecoveryDirectory,
     executeRecoveryDirectory,
     isConnected,
     isExecuting,
@@ -18,6 +20,10 @@ export default function RecoveryBrowserDialog() {
   const [listing, setListing] = useState<ServerDirectoryListing | null>(null);
   const [summary, setSummary] = useState<RecoverySummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{
+    message: string;
+    severity: 'success' | 'warning';
+  } | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
   useEffect(() => {
@@ -25,34 +31,72 @@ export default function RecoveryBrowserDialog() {
       setListing(null);
       setSummary(null);
       setError(null);
+      setNotice(null);
       setBusyAction(null);
       return;
     }
 
     let cancelled = false;
-    setBusyAction('browse');
-    void browseServerDirectories('')
-      .then(result => {
+    const recoveredDirectory = recoveredGraphView?.recoveryDirectory ?? '';
+    setPath(recoveredDirectory);
+    // Re-inspect an already opened record instead of showing a potentially
+    // stale progress snapshot from the previous drawer session.
+    setSummary(null);
+    setError(null);
+    setNotice(null);
+    setBusyAction(recoveredDirectory ? 'inspect' : 'browse');
+    void (async () => {
+      try {
+        const result = await browseServerDirectories('');
         if (cancelled) return;
         setListing(result);
-        setPath(result.path);
-      })
-      .catch(reason => {
-        if (!cancelled) setError((reason as Error).message);
-      })
-      .finally(() => {
-        if (!cancelled) setBusyAction(null);
-      });
+        if (!recoveredDirectory) setPath(result.path);
+      } catch (reason) {
+        if (!recoveredDirectory && !cancelled) {
+          setError((reason as Error).message);
+        }
+      }
+
+      if (recoveredDirectory && !cancelled) {
+        try {
+          const inspected = await inspectRecoveryDirectory(recoveredDirectory);
+          if (cancelled) return;
+          setPath(inspected.recoveryDirectory);
+          setSummary(inspected);
+        } catch (reason) {
+          if (!cancelled) setError((reason as Error).message);
+        }
+      }
+
+      if (!cancelled) setBusyAction(null);
+    })();
     return () => {
       cancelled = true;
     };
-  }, [browseServerDirectories, isRecoveryBrowserOpen]);
+  }, [
+    browseServerDirectories,
+    inspectRecoveryDirectory,
+    isRecoveryBrowserOpen,
+    recoveredGraphView,
+  ]);
+
+  useEffect(() => {
+    if (!isRecoveryBrowserOpen) return undefined;
+    const handleEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape' && busyAction === null) {
+        closeRecoveryBrowser();
+      }
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [busyAction, closeRecoveryBrowser, isRecoveryBrowserOpen]);
 
   if (!isRecoveryBrowserOpen) return null;
 
   const loadDirectory = async (nextPath: string) => {
     setBusyAction('browse');
     setError(null);
+    setNotice(null);
     setSummary(null);
     try {
       const result = await browseServerDirectories(nextPath);
@@ -69,6 +113,7 @@ export default function RecoveryBrowserDialog() {
     setPath(directory);
     setBusyAction('inspect');
     setError(null);
+    setNotice(null);
     setSummary(null);
     try {
       const inspected = await inspectRecoveryDirectory(directory);
@@ -81,9 +126,10 @@ export default function RecoveryBrowserDialog() {
     }
   };
 
-  const openReadOnly = async () => {
+  const openSavedWorkflow = async () => {
     setBusyAction('open');
     setError(null);
+    setNotice(null);
     try {
       await openRecoveryDirectory(path);
     } catch (reason) {
@@ -104,6 +150,7 @@ export default function RecoveryBrowserDialog() {
     }
     setBusyAction(action);
     setError(null);
+    setNotice(null);
     try {
       const submitted = await executeRecoveryDirectory(path, action);
       if (!submitted) {
@@ -116,44 +163,94 @@ export default function RecoveryBrowserDialog() {
     }
   };
 
+  const deleteRecord = async () => {
+    if (!summary || summary.recoveryDirectory !== path) return;
+    if (!window.confirm(
+      `Delete the recovery record at:\n${path}\n\n`
+      + 'Resume and Restart for this record will no longer be available. '
+      + 'Its saved graph, execution snapshot, and Window bitmap will be removed now; '
+      + 'Zarr/Parquet outputs are not deleted by this action. A later new Run may still '
+      + 'overwrite those outputs when a Writer has overwrite enabled. Continue?',
+    )) {
+      return;
+    }
+
+    setBusyAction('delete');
+    setError(null);
+    setNotice(null);
+    try {
+      const deleted = await deleteRecoveryDirectory(
+        path,
+        summary.executionId,
+      );
+      setSummary(null);
+      setNotice({
+        message: deleted.cleanupPending
+          ? `Recovery record deleted and ${deleted.outputsPreserved.length} output location(s) were not deleted. `
+            + `Detached metadata still needs filesystem cleanup at ${deleted.cleanupDirectory}.`
+          : `Recovery record deleted. ${deleted.outputsPreserved.length} output location(s) `
+            + 'were not deleted. If Execution Settings still points here, Normal Run can create '
+            + 'a new record using the current workflow.',
+        severity: deleted.cleanupPending ? 'warning' : 'success',
+      });
+      if (listing) {
+        try {
+          setListing(await browseServerDirectories(listing.path));
+        } catch {
+          // The deletion already succeeded; listing refresh is best effort.
+        }
+      }
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const selectedIsInspected = summary?.recoveryDirectory === path;
 
   return (
-    <div
-      className="fixed inset-0 z-[10020] flex items-center justify-center p-4"
-      style={{ backgroundColor: 'var(--color-bg-overlay)' }}
-      onMouseDown={event => {
-        if (event.target === event.currentTarget && busyAction === null) {
-          closeRecoveryBrowser();
-        }
+    <aside
+      role="dialog"
+      aria-modal="false"
+      aria-labelledby="recovery-browser-title"
+      className="fixed bottom-0 right-0 top-12 z-[10020] flex w-full max-w-xl flex-col overflow-hidden border-l"
+      style={{
+        backgroundColor: 'var(--color-bg-surface)',
+        borderColor: 'var(--color-border-default)',
+        boxShadow: 'var(--shadow-floating)',
       }}
     >
       <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="recovery-browser-title"
-        className="flex max-h-[calc(100vh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-[var(--radius-lg)] border"
-        style={{
-          backgroundColor: 'var(--color-bg-surface)',
-          borderColor: 'var(--color-border-default)',
-          boxShadow: 'var(--shadow-floating)',
-        }}
+        className="flex items-start justify-between gap-4 border-b px-5 py-4"
+        style={{ borderColor: 'var(--color-border-subtle)' }}
       >
-        <div className="border-b px-5 py-4" style={{ borderColor: 'var(--color-border-subtle)' }}>
+        <div>
           <h2 id="recovery-browser-title" className="text-[15px] font-semibold">
-            Open Window Recovery
+            Recovery
           </h2>
           <p className="mt-1 text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
-            Enter an absolute path or browse directories available on the backend server.
+            Inspect, delete, open, resume, or restart a saved Window recovery record.
           </p>
         </div>
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost"
+          aria-label="Close Recovery"
+          onClick={closeRecoveryBrowser}
+          disabled={busyAction !== null}
+        >
+          Close
+        </Button>
+      </div>
 
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
           <div>
             <label className="mb-1 block text-[10px] font-medium" htmlFor="recovery-server-path">
-              Server directory
+              Recovery directory
             </label>
-            <div className="flex gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row">
               <input
                 id="recovery-server-path"
                 value={path}
@@ -162,6 +259,7 @@ export default function RecoveryBrowserDialog() {
                   setPath(event.target.value);
                   setSummary(null);
                   setError(null);
+                  setNotice(null);
                 }}
                 onKeyDown={event => {
                   if (event.key === 'Enter') {
@@ -171,7 +269,7 @@ export default function RecoveryBrowserDialog() {
                     closeRecoveryBrowser();
                   }
                 }}
-                placeholder="/shared/project"
+                placeholder="/shared/project/run.workflow"
                 className="h-9 min-w-0 flex-1 rounded-[var(--radius-md)] border bg-[var(--color-bg-field)] px-2 font-mono text-[11px] outline-none focus:border-[var(--color-border-focus)]"
                 style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-default)' }}
                 autoFocus
@@ -233,6 +331,7 @@ export default function RecoveryBrowserDialog() {
                       setPath(directory.path);
                       setSummary(null);
                       setError(null);
+                      setNotice(null);
                     }}
                   >
                     <span className="block truncate text-[11px] font-medium">{directory.name}</span>
@@ -281,7 +380,7 @@ export default function RecoveryBrowserDialog() {
                 />
               </div>
               <div className="mt-2 font-mono text-[9px]" style={{ color: 'var(--color-text-muted)' }}>
-                Window ({summary.windowShape.join(', ')}) · grid ({summary.windowGridShape.join(', ')})
+                Window ({summary.windowShape.join(' × ')}) · grid ({summary.windowGridShape.join(' × ')})
               </div>
               <div className="mt-2 space-y-1">
                 {summary.outputs.map(output => (
@@ -305,23 +404,50 @@ export default function RecoveryBrowserDialog() {
               {error}
             </div>
           )}
+          {notice && (
+            <div
+              role="status"
+              className="rounded-[var(--radius-md)] px-3 py-2 text-[10px]"
+              style={{
+                color: notice.severity === 'warning'
+                  ? 'var(--color-warning)'
+                  : 'var(--color-success)',
+                backgroundColor: notice.severity === 'warning'
+                  ? 'var(--color-warning-soft)'
+                  : 'var(--color-success-soft)',
+              }}
+            >
+              {notice.message}
+            </div>
+          )}
         </div>
 
-        <div
-          className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t px-5 py-3"
-          style={{ borderColor: 'var(--color-border-subtle)', backgroundColor: 'var(--color-bg-surface-2)' }}
-        >
-          <Button type="button" size="md" onClick={closeRecoveryBrowser} disabled={busyAction !== null}>
-            Cancel
+      <div
+        className="shrink-0 space-y-2 border-t px-5 py-3"
+        style={{ borderColor: 'var(--color-border-subtle)', backgroundColor: 'var(--color-bg-surface-2)' }}
+      >
+        <p className="text-[9px]" style={{ color: 'var(--color-text-muted)' }}>
+          Resume and Restart use the immutable saved graph. Delete removes the recovery record, not its outputs.
+        </p>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button
+            type="button"
+            size="md"
+            variant="danger"
+            disabled={!selectedIsInspected || busyAction !== null || !isConnected || isExecuting}
+            loading={busyAction === 'delete'}
+            onClick={() => { void deleteRecord(); }}
+          >
+            Delete Recovery Record
           </Button>
           <Button
             type="button"
             size="md"
             disabled={!selectedIsInspected || busyAction !== null || !isConnected || isExecuting}
             loading={busyAction === 'open'}
-            onClick={() => { void openReadOnly(); }}
+            onClick={() => { void openSavedWorkflow(); }}
           >
-            Open Read-only
+            Open Saved Workflow
           </Button>
           <Button
             type="button"
@@ -345,6 +471,6 @@ export default function RecoveryBrowserDialog() {
           </Button>
         </div>
       </div>
-    </div>
+    </aside>
   );
 }

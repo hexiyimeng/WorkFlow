@@ -5,7 +5,10 @@ from starlette.websockets import WebSocketState
 
 from core.logger import logger
 from core.state_manager import state_manager, ExecutionStatus
-from core.window_execution import parse_execution_config
+from core.window_execution import (
+    parse_execution_config,
+    require_window_recovery_location,
+)
 from services.executor import execute_graph
 from services.dask_service import dask_service
 
@@ -63,6 +66,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if command == "execute_graph":
                     try:
                         execution_config = parse_execution_config(data.get("executionConfig"))
+                        require_window_recovery_location(execution_config)
                     except ValueError as exc:
                         await websocket.send_json({
                             "type": "error",
@@ -72,14 +76,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     graph = data.get("graph")
                     recovery_location = execution_config.recovery_location
-                    is_direct_custom_resume = (
+                    is_direct_custom_recovery = (
                         execution_config.mode == "window"
-                        and execution_config.resume_action == "resume"
+                        and execution_config.resume_action in {"resume", "restart"}
                         and recovery_location is not None
                         and recovery_location.mode == "custom"
                     )
                     if not isinstance(graph, dict):
-                        if is_direct_custom_resume and graph is None:
+                        if is_direct_custom_recovery and graph is None:
                             graph = {}
                         else:
                             await websocket.send_json({
@@ -87,7 +91,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "message": "Received invalid graph",
                             })
                             continue
-                    if not graph and not is_direct_custom_resume:
+                    if not graph and not is_direct_custom_recovery:
                         await websocket.send_json({
                             "type": "error",
                             "message": "Received empty graph",
@@ -242,6 +246,33 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.info(f"Client WebSocket disconnected: {client_ip}")
                 else:
                     logger.warning(f"Client WebSocket disconnected (code={e.code}): {client_ip}")
+                break
+
+            except RuntimeError as e:
+                # Starlette may surface a completed disconnect as RuntimeError
+                # ("WebSocket is not connected") instead of WebSocketDisconnect
+                # when a heartbeat send and receive finish concurrently.
+                application_state = getattr(
+                    websocket,
+                    "application_state",
+                    websocket.client_state,
+                )
+                if (
+                    websocket.client_state != WebSocketState.CONNECTED
+                    or application_state != WebSocketState.CONNECTED
+                ):
+                    logger.info(
+                        "Client WebSocket was already disconnected: %s (%s)",
+                        client_ip,
+                        e,
+                    )
+                    break
+                logger.error(
+                    "WebSocket loop error for %s: %s",
+                    client_ip,
+                    e,
+                    exc_info=True,
+                )
                 break
 
             except Exception as e:

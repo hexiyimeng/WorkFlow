@@ -8,13 +8,17 @@ import type {
   ExecutionRuntimeState,
   WebSocketStatus,
   PluginDiagnostics,
-  ExecutionConfig,
   ExecutionPreflightResponse,
   RecoveredGraphView,
   RecoveryOpenResponse,
+  RecoveryDeleteResponse,
   RecoverySummary,
   ServerDirectoryListing,
+  WorkflowExecutionSettings,
+  WorkflowExecutionSettingsSource,
+  WorkflowExecutionSettingsValidation,
 } from '../types';
+import type { ParsedWorkflowDocument } from '../utils/workflowPersistence';
 
 export interface FlowContextType {
   // === State ===
@@ -28,7 +32,13 @@ export interface FlowContextType {
   theme: 'light' | 'dark';
   isConsoleOpen: boolean;
   workflows: Workflow[];
+  activeWorkflow: Workflow | null;
   activeWorkflowId: string;
+  activeWorkflowDocumentId: string;
+  executionSettingsByWorkflowId: Record<string, WorkflowExecutionSettings>;
+  activeExecutionSettings: WorkflowExecutionSettings;
+  activeExecutionSettingsConfigured: boolean;
+  activeExecutionSettingsSource: WorkflowExecutionSettingsSource;
   logs: LogEntry[];
   // --- Execution state (新增) ---
   executionState: ExecutionRuntimeState;
@@ -38,6 +48,8 @@ export interface FlowContextType {
   isCancelling: boolean;       // phase === 'cancelling'
   isPreflighting: boolean;
   executionPreflight: ExecutionPreflightResponse | null;
+  isExecutionSettingsOpen: boolean;
+  executionSettingsValidation: WorkflowExecutionSettingsValidation | null;
   isRecoveryBrowserOpen: boolean;
   recoveredGraphView: RecoveredGraphView | null;
   isRecoveryGraphReadOnly: boolean;
@@ -69,13 +81,21 @@ export interface FlowContextType {
 
   // === Execution ===
   runFlow: () => Promise<void>;
-  confirmExecution: (config: ExecutionConfig) => void;
-  cancelExecutionDialog: () => void;
+  openExecutionSettings: () => void;
+  closeExecutionSettings: () => void;
+  saveExecutionSettings: (settings: WorkflowExecutionSettings) => Promise<boolean>;
+  refreshExecutionSettingsPreflight: (
+    settings?: WorkflowExecutionSettings,
+  ) => Promise<void>;
   openRecoveryBrowser: () => void;
   closeRecoveryBrowser: () => void;
   browseServerDirectories: (path: string) => Promise<ServerDirectoryListing>;
   inspectRecoveryDirectory: (directory: string) => Promise<RecoverySummary>;
   openRecoveryDirectory: (directory: string) => Promise<RecoveryOpenResponse>;
+  deleteRecoveryDirectory: (
+    directory: string,
+    expectedExecutionId: string,
+  ) => Promise<RecoveryDeleteResponse>;
   executeRecoveryDirectory: (
     directory: string,
     action: 'resume' | 'restart',
@@ -101,6 +121,11 @@ export interface FlowContextType {
   deleteWorkflow: (id: string) => void;
   renameWorkflow: (id: string, name: string) => void;
   saveCurrentWorkflow: () => void;
+  loadWorkflowDocument: (
+    document: ParsedWorkflowDocument,
+    hydratedNodes: Node<NodeData>[],
+    hydratedEdges: Edge[],
+  ) => void;
 }
 
 export const FlowContext = React.createContext<FlowContextType | null>(null);

@@ -8,7 +8,12 @@ import type {
   ServerDirectoryListing,
 } from '../types';
 import type { SerializedFlow, SerializedNode } from './workflowPersistence';
-import { isValidOutputShape, isValidWindowShape } from './executionConfig.ts';
+import {
+  isAbsoluteServerPath,
+  isValidMaxInFlightWindows,
+  isValidOutputShape,
+  isValidWindowShape,
+} from './executionConfig.ts';
 
 type JsonObject = Record<string, unknown>;
 
@@ -74,6 +79,8 @@ export const normalizeRecoverySummary = (value: unknown): RecoverySummary => {
     value.found !== true
     || value.valid !== true
     || value.compatible !== true
+    || typeof value.executionId !== 'string'
+    || value.executionId.trim() === ''
     || typeof value.status !== 'string'
     || !RECOVERY_STATUSES.has(value.status)
     || typeof value.recoveryDirectory !== 'string'
@@ -93,6 +100,7 @@ export const normalizeRecoverySummary = (value: unknown): RecoverySummary => {
     found: true,
     valid: true,
     compatible: true,
+    executionId: value.executionId,
     status: value.status as RecoverySummary['status'],
     recoveryDirectory: value.recoveryDirectory,
     completedWindows,
@@ -331,3 +339,76 @@ export const normalizeRecoveryOpenResponse = (value: unknown): RecoveryOpenRespo
     recoverySummary: normalizeRecoverySummary(value.recoverySummary),
   };
 };
+
+export type RecoveryExecutionAction = 'resume' | 'restart';
+
+export interface RecoveryExecutionRequest {
+  /** Recovery graph selection is server-authoritative for both actions. */
+  graph: null;
+  executionConfig: ExecutionConfig;
+}
+
+/**
+ * Build a recovery-only execution configuration from the immutable recovery
+ * record. The action and selected custom directory are the only intentional
+ * overrides; Window shape and valid concurrency settings remain those saved
+ * with the recovery record.
+ */
+export const buildRecoveryExecutionConfig = (
+  opened: RecoveryOpenResponse,
+  recoveryDirectory: string,
+  action: RecoveryExecutionAction,
+): ExecutionConfig => {
+  const savedConfig = opened.executionConfig;
+  if (savedConfig.mode !== 'window') {
+    throw new Error('Recovery execution requires a saved Window configuration.');
+  }
+
+  const normalizedDirectory = recoveryDirectory.trim();
+  if (!isAbsoluteServerPath(normalizedDirectory)) {
+    throw new Error('Recovery execution requires an absolute server directory.');
+  }
+
+  const savedWindowShape = savedConfig.windowShape;
+  const manifestWindowShape = opened.recoverySummary.windowShape;
+  if (
+    !savedWindowShape
+    || !isValidWindowShape(opened.recoverySummary.outputShape, savedWindowShape)
+    || savedWindowShape.length !== manifestWindowShape.length
+    || savedWindowShape.some((size, index) => size !== manifestWindowShape[index])
+  ) {
+    throw new Error('Saved recovery Window shape does not match the recovery manifest.');
+  }
+
+  const maxInFlightWindows = savedConfig.maxInFlightWindows;
+  const common = {
+    mode: 'window' as const,
+    windowShape: [...savedWindowShape],
+    ...(maxInFlightWindows !== undefined
+      && isValidMaxInFlightWindows(maxInFlightWindows)
+      ? { maxInFlightWindows }
+      : {}),
+    recoveryLocation: {
+      mode: 'custom' as const,
+      directory: normalizedDirectory,
+    },
+  };
+
+  return action === 'resume'
+    ? { ...common, resumeAction: 'resume' }
+    : { ...common, resumeAction: 'restart' };
+};
+
+/** Ask the server to select the immutable saved graph, never the edited DAG. */
+export const buildRecoveryExecutionRequest = (
+  opened: RecoveryOpenResponse,
+  recoveryDirectory: string,
+  action: RecoveryExecutionAction,
+): RecoveryExecutionRequest => ({
+  graph: null,
+  executionConfig: buildRecoveryExecutionConfig(
+    opened,
+    recoveryDirectory,
+    action,
+  ),
+});

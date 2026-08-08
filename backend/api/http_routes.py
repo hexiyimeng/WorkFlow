@@ -13,6 +13,8 @@ from services.dask_service import dask_service
 from services.executor import preflight_graph
 from services.plugin_loader import reload_all_plugins
 from services.recovery_service import (
+    RecoveryRecordChangedError,
+    delete_recovery_record,
     inspect_recovery_directory,
     list_directories,
     open_recovery_directory,
@@ -100,6 +102,10 @@ def _recovery_error_response(exc: Exception) -> JSONResponse:
         status_code = 404
         code = "RECOVERY_NOT_FOUND"
         message = str(exc)
+    elif isinstance(exc, RecoveryRecordChangedError):
+        status_code = 409
+        code = "RECOVERY_CHANGED"
+        message = str(exc)
     elif isinstance(exc, RuntimeError):
         status_code = 409
         code = "RECOVERY_ACTIVE"
@@ -142,6 +148,22 @@ async def execution_recovery_open(payload: dict):
         directory = _recovery_directory_from_payload(payload)
         async with _reload_lock:
             return open_recovery_directory(directory)
+    except Exception as exc:
+        return _recovery_error_response(exc)
+
+
+@router.post("/execution/recovery/delete")
+async def execution_recovery_delete(payload: dict):
+    """Delete one inactive recovery record without deleting its outputs."""
+
+    try:
+        directory = _recovery_directory_from_payload(payload)
+        expected_execution_id = payload.get("expectedExecutionId")
+        async with _reload_lock:
+            return delete_recovery_record(
+                directory,
+                expected_execution_id=expected_execution_id,
+            )
     except Exception as exc:
         return _recovery_error_response(exc)
 

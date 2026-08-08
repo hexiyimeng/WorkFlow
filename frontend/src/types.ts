@@ -27,6 +27,65 @@ export type RecoveryLocation =
   | { mode: 'output_sidecar'; anchorNodeId: string }
   | { mode: 'custom'; directory: string };
 
+/**
+ * Informational result of the most recent successful, read-only preflight.
+ * This is safe to persist with a workflow; it is never used as a substitute
+ * for running preflight again before execution.
+ */
+export interface LastPreflightSummary {
+  outputShape?: number[];
+  totalWindows?: number;
+  cpuWorkers?: number;
+  gpuWorkers?: number;
+  validatedAt?: number;
+}
+
+/**
+ * Persistent settings for an ordinary execution of an editable workflow.
+ *
+ * Recovery actions and runtime state deliberately do not belong here.  In
+ * particular, this type must never grow a resumeAction or executionId field.
+ */
+export interface WorkflowExecutionSettings {
+  version: 1;
+  mode: ExecutionMode;
+  windowShape?: number[];
+  maxInFlightWindows?: number;
+  newRunRecoveryLocation?: RecoveryLocation;
+  lastPreflight?: LastPreflightSummary;
+}
+
+export interface WorkflowMetadata {
+  executionSettings?: WorkflowExecutionSettings;
+  /** Preserve unrelated/future workflow metadata when loading and saving. */
+  [key: string]: unknown;
+}
+
+export type WorkflowExecutionSettingsSource = 'metadata' | 'local' | 'default';
+
+export type WorkflowExecutionSettingsField =
+  | 'version'
+  | 'mode'
+  | 'windowShape'
+  | 'maxInFlightWindows'
+  | 'newRunRecoveryLocation'
+  | 'anchorNodeId'
+  | 'directory';
+
+export interface WorkflowExecutionSettingsValidation {
+  isValid: boolean;
+  fieldErrors: Partial<Record<WorkflowExecutionSettingsField, string>>;
+  generalError?: string;
+}
+
+export interface ResolvedWorkflowExecutionSettings {
+  settings: WorkflowExecutionSettings;
+  source: WorkflowExecutionSettingsSource;
+  /** False only when application defaults were used because nothing was saved. */
+  isConfigured: boolean;
+  validation: WorkflowExecutionSettingsValidation;
+}
+
 export type ExecutionConfig =
   | { mode: 'full_graph' }
   | {
@@ -122,6 +181,7 @@ export interface RecoverySummary {
   found: boolean;
   valid: boolean;
   compatible: boolean;
+  executionId: string;
   status: RecoveryManifestStatus;
   recoveryDirectory: string;
   completedWindows: number;
@@ -139,6 +199,15 @@ export interface RecoveryOpenResponse {
   readOnly: true;
   executionConfig: ExecutionConfig;
   recoverySummary: RecoverySummary;
+}
+
+export interface RecoveryDeleteResponse {
+  deleted: true;
+  recoveryDirectory: string;
+  deletedExecutionId: string;
+  outputsPreserved: string[];
+  cleanupPending: boolean;
+  cleanupDirectory?: string;
 }
 
 export interface ServerDirectoryEntry {
@@ -328,6 +397,13 @@ export interface WSMessage {
 
 export interface Workflow {
   id: string;
+  /**
+   * Stable persisted identity. Optional only while legacy in-memory workflows
+   * are being normalized by the workflow-loading layer.
+   */
+  workflowId?: string;
+  /** Workflow document metadata, including persistent execution settings. */
+  metadata?: WorkflowMetadata;
   name: string;
   nodes: Node<NodeData>[];
   edges: Edge[];

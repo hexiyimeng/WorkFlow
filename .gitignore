@@ -34,7 +34,6 @@ backend/models/
 backend/tests/*
 !backend/tests/
 !backend/tests/test_*.py
-backend/.checkpoints/
 backend/demo_data/
 backend/demo_output/
 backend/examples/

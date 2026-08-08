@@ -22,7 +22,6 @@ import threading
 import time
 from typing import Any, BinaryIO, Iterator, Literal, Mapping, Sequence
 import uuid
-import zipfile
 
 import numpy as np
 import psutil
@@ -42,13 +41,11 @@ RECOVERY_STATUSES = frozenset({
 MANIFEST_FILENAME = "manifest.json"
 GRAPH_FILENAME = "graph.json"
 EXECUTION_CONFIG_FILENAME = "execution_config.json"
-CHECKPOINT_FILENAME = "completed_windows.npy"
+CHECKPOINT_FILENAME = "completed_windows.bin"
 ACTIVE_LOCK_FILENAME = "active.lock"
 ACTIVE_LOCK_SCHEMA_VERSION = 2
 ACTIVE_LOCK_GUARD_OFFSET = 1 << 20
 ACTIVE_LOCK_MUTATION_GUARD_FILENAME = ".active.guard"
-LEGACY_CHECKPOINT_FILENAME = "resume_state.json"
-LEGACY_CHECKPOINT_SCHEMA_VERSION = 1
 
 ResumeAction = Literal["new", "resume", "restart"]
 RecoveryMode = Literal["output_sidecar", "custom"]
@@ -177,14 +174,9 @@ class ExecutionConfig:
                 allow_zero=False,
             )
             object.__setattr__(self, "window_shape", normalized_shape)
-        elif self.resume_action != "resume":
+        elif self.resume_action == "new":
             raise ValueError(
-                "Window Execution requires window_shape for new or restart execution."
-            )
-
-        if self.resume_action == "resume" and self.recovery_location is None:
-            raise ValueError(
-                "Window resume requires an explicit recoveryLocation."
+                "Window Execution requires window_shape for new execution."
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -307,6 +299,20 @@ def parse_execution_config(
         resume_action=resume_action,
         max_in_flight_windows=max_in_flight_windows,
     )
+
+
+def require_window_recovery_location(
+    config: Mapping[str, Any] | ExecutionConfig | None,
+) -> ExecutionConfig:
+    """Require durable Window runs to select one explicit recovery directory."""
+
+    selected = parse_execution_config(config)
+    if selected.mode == "window" and selected.recovery_location is None:
+        raise ValueError(
+            "Window execution requires an explicit recoveryLocation with mode "
+            "'output_sidecar' or 'custom'."
+        )
+    return selected
 
 
 def execution_config_to_dict(
@@ -570,13 +576,6 @@ def compute_plan_fingerprint(
     })
 
 
-def default_checkpoint_root() -> Path:
-    configured = os.getenv("WorkFlow_CHECKPOINT_DIR")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return Path(__file__).resolve().parents[1] / ".checkpoints"
-
-
 @dataclass(frozen=True)
 class RecoveryOutput:
     node_id: str
@@ -638,6 +637,29 @@ class RecoveryOutput:
         if include_path_input and self.path_input is not None:
             result["pathInput"] = self.path_input
         return result
+
+
+def validate_recovery_output_separation(
+    control_directory: str | os.PathLike[str],
+    outputs: Sequence[Mapping[str, Any] | RecoveryOutput],
+) -> None:
+    """Reject layouts where deleting recovery metadata could touch outputs."""
+
+    recovery_path = Path(control_directory).expanduser().resolve()
+    for output_value in outputs:
+        output = RecoveryOutput.from_mapping(output_value)
+        output_path = Path(output.path).expanduser().resolve()
+        if (
+            recovery_path == output_path
+            or recovery_path in output_path.parents
+            or output_path in recovery_path.parents
+        ):
+            raise ValueError(
+                "Recovery directory must not overlap a terminal output path "
+                "(it cannot equal, contain, or be contained by an output): "
+                f"recovery={recovery_path}, output={output_path} "
+                f"(node {output.node_id!r})."
+            )
 
 
 @dataclass(frozen=True)
@@ -900,10 +922,15 @@ class ExecutionLayout:
     control_directory: Path
 
     def __post_init__(self) -> None:
+        control_directory = Path(self.control_directory).expanduser().resolve()
+        if control_directory == Path(control_directory.anchor):
+            raise ValueError(
+                "A filesystem root cannot be used as a recovery directory."
+            )
         object.__setattr__(
             self,
             "control_directory",
-            Path(self.control_directory).expanduser().resolve(),
+            control_directory,
         )
 
     @classmethod
@@ -911,9 +938,6 @@ class ExecutionLayout:
         cls,
         config: Mapping[str, Any] | ExecutionConfig,
         outputs: Sequence[Mapping[str, Any] | RecoveryOutput],
-        *,
-        workflow_fingerprint: str | None = None,
-        plan_fingerprint: str | None = None,
     ) -> ExecutionLayout:
         selected = parse_execution_config(config)
         if selected.mode != "window":
@@ -921,25 +945,23 @@ class ExecutionLayout:
 
         location = selected.recovery_location
         if location is None:
-            # Backward-compatible clients use the existing fingerprint layout.
-            # New creation still refuses any persistent file already present.
-            workflow = _validate_fingerprint(
-                workflow_fingerprint,
-                name="workflow_fingerprint",
+            raise ValueError(
+                "Window execution requires an explicit recoveryLocation with mode "
+                "'output_sidecar' or 'custom'."
             )
-            plan = _validate_fingerprint(
-                plan_fingerprint,
-                name="plan_fingerprint",
-            )
-            return cls(default_checkpoint_root() / workflow / plan)
-
-        if location.mode == "custom":
-            return cls(Path(location.directory))
 
         normalized_outputs = tuple(
             RecoveryOutput.from_mapping(output)
             for output in outputs
         )
+        if location.mode == "custom":
+            layout = cls(Path(location.directory))
+            validate_recovery_output_separation(
+                layout.control_directory,
+                normalized_outputs,
+            )
+            return layout
+
         matches = [
             output
             for output in normalized_outputs
@@ -956,7 +978,12 @@ class ExecutionLayout:
                 f"Terminal OUTPUT node {matches[0].node_id!r} does not declare "
                 "OUTPUT_PATH_INPUT."
             )
-        return cls(Path(f"{matches[0].path}.workflow"))
+        layout = cls(Path(f"{matches[0].path}.workflow"))
+        validate_recovery_output_separation(
+            layout.control_directory,
+            normalized_outputs,
+        )
+        return layout
 
     @property
     def manifest_path(self) -> Path:
@@ -973,10 +1000,6 @@ class ExecutionLayout:
     @property
     def checkpoint_path(self) -> Path:
         return self.control_directory / CHECKPOINT_FILENAME
-
-    @property
-    def legacy_checkpoint_path(self) -> Path:
-        return self.control_directory / LEGACY_CHECKPOINT_FILENAME
 
     @property
     def lock_path(self) -> Path:
@@ -1427,13 +1450,6 @@ class CheckpointSummary:
         return self.total_windows - self.completed_windows
 
 
-@dataclass(frozen=True)
-class LegacyCheckpointSummary:
-    next_window_index: int
-    total_windows: int
-    phase: Literal["windows_running", "finalizing"]
-
-
 class WindowCheckpointStore:
     """Driver-side persistence for one recovery directory's Window bitmap."""
 
@@ -1451,257 +1467,77 @@ class WindowCheckpointStore:
     def checkpoint_path(self) -> Path:
         return self.layout.checkpoint_path
 
-    @property
-    def legacy_checkpoint_path(self) -> Path:
-        return self.layout.legacy_checkpoint_path
-
-    def _remove_legacy_files_unlocked(self) -> None:
-        for path in (
-            self.legacy_checkpoint_path,
-            self.legacy_checkpoint_path.with_name(
-                f"{self.legacy_checkpoint_path.name}.tmp"
-            ),
-        ):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                # The NumPy checkpoint is already durable and authoritative.
-                # A later writable load/restart will retry this cleanup.
-                pass
-
-    def _inspect_legacy_unlocked(
-        self,
+    @staticmethod
+    def _normalize_grid_shape(
+        window_grid_shape: Sequence[Any],
         *,
-        workflow_fingerprint: str,
-        plan_fingerprint: str,
-        output_shape: tuple[int, ...],
-        window_shape: tuple[int, ...],
-        expected_shape: tuple[int, ...],
-        total_windows: int,
-    ) -> LegacyCheckpointSummary | None:
-        if self.checkpoint_path.exists():
-            # Once the NumPy checkpoint exists, JSON is never an input source.
-            return None
-        path = self.legacy_checkpoint_path
-        if not path.exists():
-            return None
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                state = json.load(handle)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"Cannot read legacy Window checkpoint {path}: {exc}"
-            ) from exc
-        if not isinstance(state, Mapping):
-            raise ValueError(
-                f"Legacy Window checkpoint {path} must contain a JSON object."
-            )
-
-        schema_version = state.get("schema_version")
-        if (
-            isinstance(schema_version, bool)
-            or schema_version != LEGACY_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                "Unsupported legacy Window checkpoint schema_version="
-                f"{schema_version!r}."
-            )
-        if state.get("workflow_fingerprint") != workflow_fingerprint:
-            raise ValueError(
-                "Legacy Window checkpoint workflow fingerprint does not match "
-                "the submitted graph."
-            )
-        if state.get("plan_fingerprint") != plan_fingerprint:
-            raise ValueError(
-                "Legacy Window checkpoint plan fingerprint does not match the "
-                "submitted Window plan."
-            )
-
-        legacy_output_shape = _shape_tuple(
-            state.get("output_shape"),
-            name="legacy output_shape",
+        name: str,
+    ) -> tuple[int, ...]:
+        normalized_shape = _shape_tuple(
+            window_grid_shape,
+            name=name,
             allow_zero=True,
         )
-        legacy_window_shape = _shape_tuple(
-            state.get("window_shape"),
-            name="legacy window_shape",
-            allow_zero=False,
-        )
-        if legacy_output_shape != tuple(output_shape):
-            raise ValueError(
-                "Legacy Window checkpoint output_shape does not match the "
-                "current plan."
-            )
-        if legacy_window_shape != tuple(window_shape):
-            raise ValueError(
-                "Legacy Window checkpoint window_shape does not match the "
-                "current plan."
-            )
-
-        legacy_total = state.get("total_windows")
-        if (
-            isinstance(legacy_total, bool)
-            or not isinstance(legacy_total, int)
-            or legacy_total != total_windows
-        ):
-            raise ValueError(
-                "Legacy Window checkpoint total_windows does not match the "
-                "current plan."
-            )
-        normalized_expected_shape = _shape_tuple(
-            expected_shape,
-            name="expected_shape",
-            allow_zero=True,
-        )
-        if math.prod(normalized_expected_shape) != total_windows:
-            raise ValueError(
-                "Legacy Window checkpoint total_windows does not match the "
-                "Window-grid shape."
-            )
-
-        next_window_index = state.get("next_window_index")
-        if (
-            isinstance(next_window_index, bool)
-            or not isinstance(next_window_index, int)
-        ):
-            raise ValueError(
-                "Legacy Window checkpoint next_window_index must be an integer."
-            )
-        if next_window_index < 0 or next_window_index > total_windows:
-            raise ValueError(
-                "Legacy Window checkpoint next_window_index is out of range."
-            )
-
-        phase = state.get("phase")
-        expected_phase = (
-            "finalizing"
-            if next_window_index == total_windows
-            else "windows_running"
-        )
-        if phase != expected_phase:
-            raise ValueError(
-                "Legacy Window checkpoint phase is inconsistent with "
-                "next_window_index."
-            )
-        return LegacyCheckpointSummary(
-            next_window_index=next_window_index,
-            total_windows=total_windows,
-            phase=phase,
-        )
-
-    def inspect_legacy(
-        self,
-        *,
-        workflow_fingerprint: str,
-        plan_fingerprint: str,
-        output_shape: tuple[int, ...],
-        window_shape: tuple[int, ...],
-        expected_shape: tuple[int, ...],
-        total_windows: int,
-    ) -> LegacyCheckpointSummary | None:
-        with self._lock:
-            return self._inspect_legacy_unlocked(
-                workflow_fingerprint=workflow_fingerprint,
-                plan_fingerprint=plan_fingerprint,
-                output_shape=output_shape,
-                window_shape=window_shape,
-                expected_shape=expected_shape,
-                total_windows=total_windows,
-            )
-
-    def migrate_legacy(
-        self,
-        *,
-        workflow_fingerprint: str,
-        plan_fingerprint: str,
-        output_shape: tuple[int, ...],
-        window_shape: tuple[int, ...],
-        expected_shape: tuple[int, ...],
-        total_windows: int,
-    ) -> np.ndarray | None:
-        """Convert one validated continuous prefix to a C-order bitmap."""
-
-        with self._lock:
-            summary = self._inspect_legacy_unlocked(
-                workflow_fingerprint=workflow_fingerprint,
-                plan_fingerprint=plan_fingerprint,
-                output_shape=output_shape,
-                window_shape=window_shape,
-                expected_shape=expected_shape,
-                total_windows=total_windows,
-            )
-            if summary is None:
-                return None
-            completed_windows = np.zeros(expected_shape, dtype=np.uint8)
-            completed_windows.reshape(-1, order="C")[
-                :summary.next_window_index
-            ] = 1
-            self._save_unlocked(completed_windows)
-            # JSON is removed only after the authoritative NumPy file is durable.
-            self._remove_legacy_files_unlocked()
-            return completed_windows
+        if not normalized_shape:
+            raise ValueError("window_grid_shape must have at least one dimension.")
+        return normalized_shape
 
     @staticmethod
-    def _validate_completed_windows(
+    def _validate_bitmap_structure(
         completed_windows: np.ndarray,
         *,
-        path: Path | None = None,
-        expected_shape: Sequence[Any] | None = None,
+        expected_shape: tuple[int, ...] | None = None,
     ) -> None:
-        location = f" {path}" if path is not None else ""
         if not isinstance(completed_windows, np.ndarray):
-            raise ValueError(f"Window checkpoint{location} must contain a NumPy array.")
+            raise ValueError("Window checkpoint bitmap must be a NumPy array.")
         if completed_windows.ndim == 0:
             raise ValueError(
-                f"Window checkpoint{location} must have at least one dimension."
+                "Window checkpoint bitmap must have at least one dimension."
             )
         if completed_windows.dtype != np.dtype(np.uint8):
             raise ValueError(
-                f"Window checkpoint{location} must have dtype uint8, "
+                "Window checkpoint bitmap must have dtype uint8, "
                 f"got {completed_windows.dtype}."
             )
-        if expected_shape is not None:
-            normalized_shape = _shape_tuple(
-                expected_shape,
-                name="expected_shape",
-                allow_zero=True,
-            )
-            if completed_windows.shape != normalized_shape:
-                raise ValueError(
-                    f"Window checkpoint{location} has shape {completed_windows.shape}, "
-                    f"expected {normalized_shape}."
-                )
-        if not np.all((completed_windows == 0) | (completed_windows == 1)):
+        if (
+            expected_shape is not None
+            and completed_windows.shape != expected_shape
+        ):
             raise ValueError(
-                f"Window checkpoint{location} must contain only completion values 0 and 1."
+                "Window checkpoint bitmap has shape "
+                f"{completed_windows.shape}, expected {expected_shape}."
             )
 
-    @staticmethod
-    def _close_loaded(value: Any) -> None:
-        memory_map = getattr(value, "_mmap", None)
-        if memory_map is not None:
-            memory_map.close()
-            return
-        close = getattr(value, "close", None)
-        if callable(close):
-            close()
-
-    def _load_readonly(self) -> np.ndarray | None:
+    def _load_unlocked(
+        self,
+        *,
+        expected_shape: tuple[int, ...],
+    ) -> np.ndarray | None:
         path = self.checkpoint_path
         if not path.exists():
             return None
+
+        total_windows = math.prod(expected_shape)
         try:
-            loaded = np.load(
-                path,
-                mmap_mode="r",
-                allow_pickle=False,
-            )
-        except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:
+            payload = path.read_bytes()
+        except OSError as exc:
             raise ValueError(f"Cannot read Window checkpoint {path}: {exc}") from exc
-        if not isinstance(loaded, np.ndarray):
-            self._close_loaded(loaded)
-            raise ValueError(f"Window checkpoint {path} must contain a NumPy array.")
-        return loaded
+        if len(payload) != total_windows:
+            raise ValueError(
+                f"Window checkpoint {path} has byte size {len(payload)}, "
+                f"expected exactly {total_windows}."
+            )
+
+        completed_windows = np.frombuffer(
+            payload,
+            dtype=np.uint8,
+        ).copy().reshape(expected_shape, order="C")
+        if not np.all((completed_windows == 0) | (completed_windows == 1)):
+            raise ValueError(
+                f"Window checkpoint {path} is corrupt: completion bytes must "
+                "contain only 0 and 1."
+            )
+        return completed_windows
 
     def create(
         self,
@@ -1709,124 +1545,102 @@ class WindowCheckpointStore:
         *,
         overwrite: bool = False,
     ) -> np.ndarray:
-        normalized_shape = _shape_tuple(
+        normalized_shape = self._normalize_grid_shape(
             window_grid_shape,
             name="window_grid_shape",
-            allow_zero=True,
         )
         completed_windows = np.zeros(normalized_shape, dtype=np.uint8)
-        if not normalized_shape:
-            raise ValueError("window_grid_shape must have at least one dimension.")
+        path = self.checkpoint_path
+
         with self._lock:
-            if self.checkpoint_path.exists() and not overwrite:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and not overwrite:
                 raise FileExistsError(
-                    f"Window checkpoint already exists: {self.checkpoint_path}"
+                    f"Window checkpoint already exists: {path}"
                 )
-            self._save_unlocked(completed_windows)
-        return completed_windows
 
-    def remove_legacy_checkpoint(self) -> bool:
-        """Remove legacy JSON only when a valid NumPy checkpoint exists."""
-
-        with self._lock:
-            loaded = self._load_readonly()
-            if loaded is None:
-                return False
+            temporary_path = path.with_name(f".{uuid.uuid4().hex[:12]}.tmp")
+            payload = completed_windows.reshape(-1, order="C").tobytes(order="C")
             try:
-                self._validate_completed_windows(
-                    loaded,
-                    path=self.checkpoint_path,
-                )
+                with temporary_path.open("wb", buffering=0) as handle:
+                    written = handle.write(payload)
+                    if written != len(payload):
+                        raise OSError(
+                            "Could not initialize the complete Window checkpoint "
+                            f"({written} of {len(payload)} bytes written)."
+                        )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if path.exists() and not overwrite:
+                    raise FileExistsError(
+                        f"Window checkpoint already exists: {path}"
+                    )
+                os.replace(temporary_path, path)
             finally:
-                self._close_loaded(loaded)
-            existed = self.legacy_checkpoint_path.exists()
-            self._remove_legacy_files_unlocked()
-            return existed and not self.legacy_checkpoint_path.exists()
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return completed_windows
 
     def inspect(
         self,
         *,
-        expected_shape: tuple[int, ...] | None = None,
+        expected_shape: tuple[int, ...],
     ) -> CheckpointSummary | None:
-        loaded = self._load_readonly()
-        if loaded is None:
+        normalized_shape = self._normalize_grid_shape(
+            expected_shape,
+            name="expected_shape",
+        )
+        with self._lock:
+            completed_windows = self._load_unlocked(
+                expected_shape=normalized_shape,
+            )
+        if completed_windows is None:
             return None
-        try:
-            self._validate_completed_windows(
-                loaded,
-                path=self.checkpoint_path,
-                expected_shape=expected_shape,
-            )
-            completed_count = int(np.count_nonzero(loaded))
-            return CheckpointSummary(
-                shape=tuple(int(size) for size in loaded.shape),
-                dtype=loaded.dtype,
-                completed_windows=completed_count,
-                total_windows=int(loaded.size),
-            )
-        finally:
-            self._close_loaded(loaded)
+        completed_count = int(np.count_nonzero(completed_windows))
+        return CheckpointSummary(
+            shape=normalized_shape,
+            dtype=np.dtype(np.uint8),
+            completed_windows=completed_count,
+            total_windows=int(completed_windows.size),
+        )
 
     def load_writable(
         self,
         *,
         expected_shape: tuple[int, ...],
     ) -> np.ndarray | None:
-        loaded = self._load_readonly()
-        if loaded is None:
-            return None
-        try:
-            self._validate_completed_windows(
-                loaded,
-                path=self.checkpoint_path,
-                expected_shape=expected_shape,
-            )
-            completed_windows = np.array(
-                loaded,
-                dtype=np.uint8,
-                copy=True,
-                order="C",
-            )
-        finally:
-            self._close_loaded(loaded)
+        normalized_shape = self._normalize_grid_shape(
+            expected_shape,
+            name="expected_shape",
+        )
         with self._lock:
-            self._remove_legacy_files_unlocked()
-        return completed_windows
+            return self._load_unlocked(expected_shape=normalized_shape)
 
-    def save(
+    def _write_completion_unlocked(
         self,
-        completed_windows: np.ndarray,
-    ) -> Path:
-        with self._lock:
-            path = self._save_unlocked(completed_windows)
-            self._remove_legacy_files_unlocked()
-            return path
-
-    def _save_unlocked(
-        self,
-        completed_windows: np.ndarray,
-    ) -> Path:
-        self._validate_completed_windows(completed_windows)
+        *,
+        flat_index: int,
+        expected_size: int,
+    ) -> None:
         path = self.checkpoint_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = path.with_name(f"{path.name}.tmp")
-
-        try:
-            with temporary_path.open("wb") as handle:
-                np.save(
-                    handle,
-                    completed_windows,
-                    allow_pickle=False,
+        with path.open("r+b", buffering=0) as handle:
+            actual_size = os.fstat(handle.fileno()).st_size
+            if actual_size != expected_size:
+                raise ValueError(
+                    f"Window checkpoint {path} has byte size {actual_size}, "
+                    f"expected exactly {expected_size}."
                 )
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
-        finally:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        return path
+            handle.seek(flat_index)
+            written = handle.write(b"\x01")
+            if written != 1:
+                raise OSError(
+                    "Could not commit the Window completion byte "
+                    f"at offset {flat_index}."
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def mark_completed(
         self,
@@ -1834,7 +1648,7 @@ class WindowCheckpointStore:
         coordinates: tuple[int, ...],
     ) -> bool:
         with self._lock:
-            self._validate_completed_windows(completed_windows)
+            self._validate_bitmap_structure(completed_windows)
             normalized_coordinates = _shape_tuple(
                 coordinates,
                 name="coordinates",
@@ -1854,24 +1668,31 @@ class WindowCheckpointStore:
                         f"with size {axis_size}."
                     )
 
-            if completed_windows[normalized_coordinates] == 1:
+            current_value = completed_windows[normalized_coordinates]
+            if current_value == 1:
                 return False
+            if current_value != 0:
+                raise ValueError(
+                    "In-memory Window checkpoint bitmap must contain only 0 and 1."
+                )
 
+            flat_index = int(np.ravel_multi_index(
+                normalized_coordinates,
+                completed_windows.shape,
+                order="C",
+            ))
+            if flat_index < 0 or flat_index >= completed_windows.size:
+                raise ValueError(
+                    f"Window flat index {flat_index} is outside the checkpoint."
+                )
+
+            self._write_completion_unlocked(
+                flat_index=flat_index,
+                expected_size=int(completed_windows.size),
+            )
             completed_windows[normalized_coordinates] = 1
-            try:
-                self._save_unlocked(completed_windows)
-            except BaseException:
-                # The Driver may safely retry after a failed durability commit.
-                completed_windows[normalized_coordinates] = 0
-                raise
             return True
 
     def delete(self) -> None:
-        checkpoint_path = self.checkpoint_path
-        checkpoint_path.unlink(missing_ok=True)
-        try:
-            checkpoint_path.with_name(
-                f"{checkpoint_path.name}.tmp"
-            ).unlink(missing_ok=True)
-        except OSError:
-            pass
+        with self._lock:
+            self.checkpoint_path.unlink(missing_ok=True)

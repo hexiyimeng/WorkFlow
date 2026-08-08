@@ -1,16 +1,17 @@
 // src/components/layout/Header.tsx
 import { useRef, type ChangeEvent } from 'react';
 import { useReactFlow, getNodesBounds, getViewportForBounds } from '@xyflow/react';
-import { FolderClock, RefreshCw } from 'lucide-react';
+import { FolderClock, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 import { Button } from '../ui/Button';
 import { IconButton } from '../ui/IconButton';
 import { Pill } from '../ui/Pill';
 import {
-  serializeFlowForStorage,
-  parseStoredFlow,
+  serializeWorkflowDocument,
+  parseWorkflowDocument,
   hydrateFlowWithLatestSpecs,
 } from '../../utils/workflowPersistence';
+import { formatWorkflowExecutionSettingsSummary } from '../../utils/workflowExecutionSettings';
 
 const SunIcon = () => (
   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -87,15 +88,18 @@ const PHASE_PILL: Record<string, 'idle' | 'info' | 'running' | 'success' | 'dang
 export default function Header() {
   const {
     theme, toggleTheme,
-    workflows, activeWorkflowId,
+    workflows, activeWorkflow, activeWorkflowId,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow,
-    runFlow, stopFlow, reloadNodes, setNodes, setEdges,
+    loadWorkflowDocument,
+    activeExecutionSettings, activeExecutionSettingsConfigured,
+    openExecutionSettings,
+    runFlow, stopFlow, reloadNodes,
     nodeDefs,
     dashboardUrl,
     isReloadingNodes,
     executionState,
     isConnected, isExecuting, isPreflighting, isExecutionLocked, addLog,
-    recoveredGraphView, openRecoveryBrowser, executeRecoveryDirectory,
+    recoveredGraphView, openRecoveryBrowser,
     closeRecoveredGraph,
   } = useFlow();
 
@@ -111,14 +115,17 @@ export default function Header() {
     if (fileName === null) return;
     const finalName = fileName.trim() || defaultName;
 
-    // Use the serialized form (already stripped when saved to workflow tabs)
-    const serialized = serializeFlowForStorage(
-      reactFlowInstance.getNodes() as import('@xyflow/react').Node<import('../../types').NodeData>[],
-      reactFlowInstance.getEdges()
-    );
+    const serialized = serializeWorkflowDocument({
+      workflowId: activeWorkflow?.workflowId ?? activeWorkflow?.id ?? activeWorkflowId,
+      metadata: activeWorkflow?.metadata ?? {},
+      nodes: reactFlowInstance.getNodes() as import('@xyflow/react').Node<import('../../types').NodeData>[],
+      edges: reactFlowInstance.getEdges(),
+      workflowName: finalName,
+      timestamp: Date.now(),
+    });
 
     const blob = new Blob(
-      [JSON.stringify({ ...serialized, workflow_name: finalName, timestamp: Date.now() }, null, 2)],
+      [JSON.stringify(serialized, null, 2)],
       { type: 'application/json' }
     );
     const link = document.createElement('a');
@@ -150,8 +157,8 @@ export default function Header() {
         return;
       }
 
-      const flow = parseStoredFlow(parsed);
-      if (!flow || !Array.isArray(flow.nodes) || !Array.isArray(flow.edges)) {
+      const document = parseWorkflowDocument(parsed);
+      if (!document || !Array.isArray(document.nodes) || !Array.isArray(document.edges)) {
         alert('Invalid file format');
         return;
       }
@@ -161,22 +168,13 @@ export default function Header() {
         return;
       }
 
-      const result = hydrateFlowWithLatestSpecs(flow, nodeDefs);
-      setNodes(result.nodes);
-      setEdges(result.edges);
+      const result = hydrateFlowWithLatestSpecs(document, nodeDefs);
+      loadWorkflowDocument(document, result.nodes, result.edges);
 
       if (result.invalidNodeTypes.length > 0) {
         alert(`Loaded ${result.nodes.length} nodes (${result.invalidNodeTypes.length} unavailable node type(s) marked invalid)`);
       } else if (result.removedEdges > 0) {
         alert(`Loaded ${result.nodes.length} nodes, removed ${result.removedEdges} invalid connection(s)`);
-      }
-
-      if (parsed.workflow_name && activeWorkflowId) {
-        try {
-          renameWorkflow(activeWorkflowId, String(parsed.workflow_name));
-        } catch (err) {
-          console.warn('Failed to rename loaded workflow', err);
-        }
       }
 
       const bounds = getNodesBounds(result.nodes);
@@ -191,6 +189,9 @@ export default function Header() {
 
   const phase = executionState.phase;
   const phaseLabel = PHASE_LABELS[phase] ?? phase;
+  const executionSettingsSummary = formatWorkflowExecutionSettingsSummary(
+    activeExecutionSettings,
+  );
 
   return (
     <header
@@ -310,14 +311,6 @@ export default function Header() {
           <RefreshCw className={isReloadingNodes ? 'w-4 h-4 animate-spin' : 'w-4 h-4'} />
         </IconButton>
 
-        <IconButton
-          onClick={openRecoveryBrowser}
-          disabled={isExecutionLocked || isPreflighting || !isConnected}
-          title={isConnected ? 'Open recovery directory' : 'Reconnect to open recovery'}
-        >
-          <FolderClock className="h-4 w-4" />
-        </IconButton>
-
         {/* Theme */}
         <IconButton onClick={toggleTheme} title="Toggle Theme">
           {theme === 'dark' ? <MoonIcon /> : <SunIcon />}
@@ -344,58 +337,55 @@ export default function Header() {
           <SaveIcon />
         </IconButton>
 
-        {/* Run / Stop */}
+        {/* Primary execution controls: settings, recovery, then Run. */}
+        <div className="w-px h-5 mx-0.5" style={{ backgroundColor: 'var(--color-border-subtle)' }} />
+        <Button
+          variant="secondary"
+          size="md"
+          onClick={openExecutionSettings}
+          disabled={isExecuting || isPreflighting || recoveredGraphView !== null}
+          icon={<SlidersHorizontal className="h-3.5 w-3.5" />}
+          title={`Execution Settings: ${executionSettingsSummary}`}
+        >
+          <span>Execution Settings</span>
+          <span className="ml-1 text-[9px] font-normal" style={{ color: 'var(--color-text-muted)' }}>
+            {activeExecutionSettingsConfigured
+              ? executionSettingsSummary
+              : `Not configured · ${executionSettingsSummary}`}
+          </span>
+        </Button>
+        <Button
+          variant="secondary"
+          size="md"
+          onClick={openRecoveryBrowser}
+          disabled={isExecuting || isPreflighting || !isConnected}
+          icon={<FolderClock className="h-3.5 w-3.5" />}
+          title={isConnected ? 'Inspect or execute a recovery record' : 'Reconnect to open Recovery'}
+        >
+          Recovery
+        </Button>
+        {recoveredGraphView && !isExecuting && (
+          <Button
+            variant="secondary"
+            size="md"
+            onClick={closeRecoveredGraph}
+            disabled={executionState.phase === 'disconnected'}
+          >
+            Close Recovery
+          </Button>
+        )}
         {isExecuting ? (
-          <Button variant="danger" size="sm" onClick={stopFlow} icon={<StopIcon />} disabled={!isConnected}>
+          <Button variant="danger" size="md" onClick={stopFlow} icon={<StopIcon />} disabled={!isConnected}>
             Stop
           </Button>
-        ) : recoveredGraphView ? (
-          <>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={closeRecoveredGraph}
-              disabled={executionState.phase === 'disconnected'}
-            >
-              Close Recovery
-            </Button>
-            <Button
-              variant="warning"
-              size="sm"
-              disabled={!isConnected}
-              onClick={() => {
-                if (!window.confirm('Restart this recovery and rerun every Window?')) return;
-                void executeRecoveryDirectory(
-                  recoveredGraphView.recoveryDirectory,
-                  'restart',
-                ).catch(error => addLog(`Restart failed: ${(error as Error).message}`, 'error'));
-              }}
-            >
-              Restart
-            </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={!isConnected}
-              onClick={() => {
-                void executeRecoveryDirectory(
-                  recoveredGraphView.recoveryDirectory,
-                  'resume',
-                ).catch(error => addLog(`Resume failed: ${(error as Error).message}`, 'error'));
-              }}
-              icon={<RunIcon />}
-            >
-              Resume
-            </Button>
-          </>
         ) : (
           <Button
             variant="primary"
-            size="sm"
+            size="md"
             onClick={() => { void runFlow(); }}
             icon={<RunIcon />}
             loading={isPreflighting}
-            disabled={isExecutionLocked || !isConnected}
+            disabled={isExecutionLocked || !isConnected || recoveredGraphView !== null}
           >
             {isPreflighting ? 'Checking...' : 'Run'}
           </Button>

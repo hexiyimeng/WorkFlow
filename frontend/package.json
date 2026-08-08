@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test": "node --experimental-strip-types src/utils/inputVisibility.test.ts && node --experimental-strip-types src/utils/executionConfig.test.ts && node --experimental-strip-types src/utils/windowProgress.test.ts && node --experimental-strip-types src/utils/recovery.test.ts && node --experimental-strip-types src/utils/executionRuntime.test.ts && node --experimental-strip-types src/utils/workflowExecutionSettings.test.ts && node --experimental-strip-types src/utils/workflowPersistence.test.ts && node --experimental-strip-types src/utils/executionExperience.test.ts && node --experimental-strip-types src/utils/executionUiContract.test.ts && npm run test:components",
+    "test:components": "esbuild src/components/execution/executionComponents.test.tsx --bundle --platform=node --format=cjs --jsx=automatic --outfile=node_modules/.tmp/executionComponents.test.cjs && node node_modules/.tmp/executionComponents.test.cjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -27,6 +29,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
     "autoprefixer": "^10.4.23",
+    "esbuild": "^0.27.2",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
