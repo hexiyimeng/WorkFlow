@@ -14,7 +14,6 @@ services:
       WorkFlow_DASK_LOCAL_DIR: "/tmp/workflow_dask_spill"
       WorkFlow_DASHBOARD_HOST: "localhost:8787"
       WorkFlow_WORKERS: "1"
-      WorkFlow_WORKER_MEMORY_LIMIT_GB: "4"
     volumes:
       - ./backend/models:/app/backend/models
       - ./backend/demo_data:/app/backend/demo_data

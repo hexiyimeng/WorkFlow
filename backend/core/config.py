@@ -3,8 +3,10 @@ import math
 import multiprocessing
 import os
 import platform
+import re
 import socket
 from pathlib import Path
+from typing import Mapping
 
 from core.platform import dask_spill_dir
 
@@ -47,8 +49,89 @@ def _parse_gpu_ids(value: str, *, name: str = "WorkFlow_GPU_IDS") -> tuple[str, 
     return parts
 
 
-def _get_system_memory_gb():
-    """Return total physical memory in binary GiB, or None if detection fails."""
+_CGROUP_MEMORY_LIMIT_PATHS = (
+    Path("/sys/fs/cgroup/memory.max"),
+    Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+)
+
+
+def _positive_float(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _leading_positive_int(value: object) -> int | None:
+    """Parse Slurm values such as ``16`` or ``16(x2)``."""
+
+    match = re.match(r"\s*(\d+)", str(value or ""))
+    if match is None:
+        return None
+    parsed = int(match.group(1))
+    return parsed if parsed > 0 else None
+
+
+def _slurm_memory_limit_gb(
+    environment: Mapping[str, str] | None = None,
+) -> float | None:
+    """Return this node's Slurm memory allocation in binary GiB.
+
+    Slurm exports memory values in MiB.  ``--mem`` produces
+    ``SLURM_MEM_PER_NODE``; ``--mem-per-cpu`` produces
+    ``SLURM_MEM_PER_CPU`` and must be multiplied by the CPUs allocated on the
+    current node.  WorkFlow starts one local Dask cluster per allocated node,
+    so this is the memory ceiling relevant to its Nannies.
+    """
+
+    env = os.environ if environment is None else environment
+    per_node_mib = _positive_float(env.get("SLURM_MEM_PER_NODE"))
+    if per_node_mib is not None:
+        return per_node_mib / 1024.0
+
+    per_cpu_mib = _positive_float(env.get("SLURM_MEM_PER_CPU"))
+    if per_cpu_mib is None:
+        return None
+    allocated_cpus = (
+        _leading_positive_int(env.get("SLURM_CPUS_ON_NODE"))
+        or _leading_positive_int(env.get("SLURM_JOB_CPUS_PER_NODE"))
+        or _leading_positive_int(env.get("SLURM_CPUS_PER_TASK"))
+    )
+    if allocated_cpus is None:
+        return None
+    return per_cpu_mib * allocated_cpus / 1024.0
+
+
+def _cgroup_memory_limit_gb(
+    paths: tuple[Path, ...] = _CGROUP_MEMORY_LIMIT_PATHS,
+) -> float | None:
+    """Return the smallest finite cgroup v1/v2 memory ceiling, if present."""
+
+    limits: list[float] = []
+    for path in paths:
+        try:
+            raw_value = path.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        if not raw_value or raw_value.lower() == "max":
+            continue
+        try:
+            limit_bytes = int(raw_value)
+        except ValueError:
+            continue
+        # cgroup v1 uses huge sentinel values when memory is unlimited.
+        if limit_bytes <= 0 or limit_bytes >= (1 << 60):
+            continue
+        limits.append(limit_bytes / (1024.0 ** 3))
+    return min(limits) if limits else None
+
+
+def _physical_memory_gb() -> float | None:
+    """Return host physical memory in binary GiB, or None on failure."""
+
     try:
         import psutil
 
@@ -93,6 +176,28 @@ def _get_system_memory_gb():
         logger.debug(f"Failed to get system memory: {e}")
 
     return None
+
+
+def _get_system_memory_gb() -> float | None:
+    """Return the effective memory ceiling for this process in binary GiB.
+
+    A batch job can see the compute node's full RAM through ``/proc`` even
+    when Slurm or a container cgroup grants it only a fraction.  Dask memory
+    limits must therefore use the smallest known physical, Slurm, and cgroup
+    ceiling; otherwise the kernel can OOM-kill a Worker before its Nanny sees
+    pressure.
+    """
+
+    candidates = tuple(
+        value
+        for value in (
+            _physical_memory_gb(),
+            _slurm_memory_limit_gb(),
+            _cgroup_memory_limit_gb(),
+        )
+        if value is not None and value > 0
+    )
+    return min(candidates) if candidates else None
 
 
 def _is_main_process():
@@ -253,6 +358,19 @@ class AppConfig:
         if os.getenv("WorkFlow_DASHBOARD_HOST"):
             self.DASHBOARD_HOST = os.getenv("WorkFlow_DASHBOARD_HOST")
             _log_override(f"   -> [Override] WorkFlow_DASHBOARD_HOST={self.DASHBOARD_HOST}")
+
+        dashboard_address = os.getenv("WorkFlow_DASHBOARD_ADDRESS")
+        if dashboard_address is not None:
+            dashboard_address = dashboard_address.strip()
+            if not dashboard_address:
+                raise ValueError(
+                    "WorkFlow_DASHBOARD_ADDRESS must not be empty when provided."
+                )
+            self.DASHBOARD_ADDRESS = dashboard_address
+            _log_override(
+                "   -> [Override] WorkFlow_DASHBOARD_ADDRESS="
+                f"{self.DASHBOARD_ADDRESS}"
+            )
 
         cpu_mem_limit_str = (
             f"{self.CPU_WORKER_MEMORY_LIMIT_GB:.1f}GB"

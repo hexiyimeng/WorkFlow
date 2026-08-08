@@ -15,6 +15,11 @@ frontend/node_modules
 frontend/dist
 
 backend/models
+backend/demo_data
+backend/demo_output
+
+tmp
+output
 
 *.egg-info
 build
