@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import dask.config
 import numpy as np
 
 from core.registry import register_node
@@ -17,6 +18,25 @@ from nodes.base import BaseMapBlocksNode
 
 TOKEN_DTYPE = np.dtype("uint8")
 logger = logging.getLogger("WorkFlow.ZarrWriter")
+DEFAULT_LOCK_ACQUIRE_TIMEOUT_SECONDS = 300.0
+
+
+def _lock_acquire_timeout_seconds() -> float:
+    setting = "WorkFlow_ZARR_LOCK_ACQUIRE_TIMEOUT_SECONDS"
+    raw_value = os.getenv(setting)
+    if raw_value is None:
+        return DEFAULT_LOCK_ACQUIRE_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{setting} must be a positive number, got {raw_value!r}."
+        ) from exc
+    if not np.isfinite(timeout) or timeout <= 0:
+        raise RuntimeError(
+            f"{setting} must be a positive finite number, got {raw_value!r}."
+        )
+    return timeout
 
 
 def _normalize_output_path(value: str) -> str:
@@ -187,10 +207,28 @@ def _write_with_storage_chunk_locks(
     primary_error: BaseException | None = None
     try:
         for lock_name in lock_names:
-            lock = _make_distributed_lock(lock_name)
-            acquired = lock.acquire()
+            # Zarr partial compressed-chunk writes are read/modify/write
+            # operations.  Dask's default finite Lock lease may be declared
+            # expired while a long native/GIL-holding writer is still active,
+            # allowing a second writer into the same storage chunk and silently
+            # losing data.  Register this correctness lock without lease expiry.
+            # If a Worker dies while owning the lease, waiters remain blocked
+            # until execution/cluster cancellation instead of being admitted
+            # concurrently.  That liveness trade-off is required here: a false
+            # second owner can corrupt a compressed Zarr storage chunk.
+            with dask.config.set(
+                {"distributed.scheduler.locks.lease-timeout": "inf"}
+            ):
+                lock = _make_distributed_lock(lock_name)
+                acquired = lock.acquire(
+                    timeout=_lock_acquire_timeout_seconds()
+                )
             if acquired is False:
-                raise RuntimeError(f"Failed to acquire Zarr storage-chunk lock {lock_name!r}.")
+                raise RuntimeError(
+                    "Timed out acquiring Zarr storage-chunk lock "
+                    f"{lock_name!r}. The owning Worker may have exited; the "
+                    "execution will fail without performing an unsafe concurrent write."
+                )
             acquired_locks.append(lock)
         target[region] = array
     except BaseException as exc:

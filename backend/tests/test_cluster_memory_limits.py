@@ -74,3 +74,20 @@ def test_dask_role_limits_stay_within_slurm_allocation(monkeypatch) -> None:
     assert cpu_limit == "17.9GiB"
     assert gpu_limit == "53.7GiB"
     assert 2 * 17.9 + 53.7 <= 128.0 * 0.70
+
+
+def test_slurm_cuda_mask_is_counted_without_importing_torch(monkeypatch) -> None:
+    monkeypatch.setenv("WorkFlow_CUDA_MODE", "auto")
+    monkeypatch.setenv("WorkFlow_TRUST_SLURM_CUDA_MASK", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b")
+
+    assert dask_service._detect_cuda_for_cluster() == (True, 2)
+
+
+def test_trusted_slurm_cuda_mask_requires_allocation_mask(monkeypatch) -> None:
+    monkeypatch.setenv("WorkFlow_CUDA_MODE", "auto")
+    monkeypatch.setenv("WorkFlow_TRUST_SLURM_CUDA_MASK", "1")
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires CUDA_VISIBLE_DEVICES"):
+        dask_service._detect_cuda_for_cluster()

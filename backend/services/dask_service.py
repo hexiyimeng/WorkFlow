@@ -4,6 +4,7 @@ import logging
 import math
 import operator
 import os
+import asyncio
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +21,14 @@ from core.platform import current_platform, dask_spill_dir, should_schedule_mall
 
 CPU_RESOURCE_NAME = "CPU"
 GPU_RESOURCE_NAME = "GPU"
+
+# ``build_local_cluster_specs`` is deliberately a same-host cluster: the
+# Driver, Scheduler, Nannies, and Workers all live in one desktop process tree
+# (or in one single-node Slurm allocation).  Advertising a physical NIC here
+# makes a Windows Driver hairpin through firewall/VPN/RDP network policy merely
+# to reach its own Scheduler.  That became unreliable as the number of Nanny
+# connections grew.  Loopback is the only address these local processes need.
+LOCAL_CLUSTER_HOST = "127.0.0.1"
 
 # GPU inference Workers retain model state and large native/PyTorch workspaces
 # that Dask cannot spill.  Give them a larger share of the same bounded host
@@ -93,6 +102,13 @@ def _remaining_startup_time(deadline: float, *, stage: str) -> float:
     return remaining
 
 
+def _remaining_shutdown_time(deadline: float) -> float:
+    # Distributed rejects a non-positive callback timeout.  Once the shared
+    # graceful budget is exhausted, make only a minimal final close attempt and
+    # proceed to the process-handle fallback.
+    return max(0.1, deadline - time.monotonic())
+
+
 def _detect_cuda_for_cluster() -> tuple[bool, int]:
     """Lazily inspect CUDA only while the local cluster is being started."""
     cuda_mode = os.getenv("WorkFlow_CUDA_MODE", "auto").strip().lower()
@@ -105,6 +121,25 @@ def _detect_cuda_for_cluster() -> tuple[bool, int]:
     parent_mask = os.environ.get("CUDA_VISIBLE_DEVICES")
     if parent_mask is not None and parent_mask.strip() in {"", "-1"}:
         return False, 0
+
+
+    trust_slurm_mask = os.getenv("WorkFlow_TRUST_SLURM_CUDA_MASK", "").strip().lower()
+    if trust_slurm_mask in {"1", "true", "yes", "on"}:
+        if parent_mask is None:
+            raise RuntimeError(
+                "WorkFlow_TRUST_SLURM_CUDA_MASK requires CUDA_VISIBLE_DEVICES "
+                "to be set by the allocation."
+            )
+        visible_ids = _parse_device_list(
+            parent_mask,
+            setting_name="CUDA_VISIBLE_DEVICES",
+        )
+        logger.info(
+            "[Dask] Using the Slurm CUDA allocation mask without initializing "
+            "CUDA in the compute Driver: %s",
+            visible_ids,
+        )
+        return True, len(visible_ids)
 
     try:
         import torch
@@ -303,6 +338,15 @@ def _worker_resources(worker: Any) -> dict[str, float]:
     return {str(key): float(value) for key, value in dict(resources or {}).items()}
 
 
+def _set_windows_console_ctrl_c_ignore_flag() -> None:
+    """Ignore console Ctrl+C at the native Windows process boundary."""
+    import ctypes
+
+    set_console_ctrl_handler = ctypes.windll.kernel32.SetConsoleCtrlHandler
+    if not set_console_ctrl_handler(None, True):
+        raise ctypes.WinError()
+
+
 def _configure_worker_signal_handling() -> None:
     """Keep Windows Ctrl+C ownership in the Driver process.
 
@@ -315,11 +359,31 @@ def _configure_worker_signal_handling() -> None:
     if os.name != "nt" or os.getenv("WORKFLOW_DASK_WORKER_PROCESS") != "1":
         return
     try:
+        # Python's signal handler covers the interpreter, but native runtimes
+        # loaded by inference code (notably Intel Fortran/OpenMP) install their
+        # own Windows console handlers.  The process-level ignore flag prevents
+        # CTRL_C_EVENT from reaching those handlers as well.  Nanny still owns
+        # and can terminate the Worker through its process handle.
+        _set_windows_console_ctrl_c_ignore_flag()
+    except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "[Dask] Worker could not ignore Driver Ctrl+C at the native "
+            "console boundary: %s",
+            exc,
+        )
+
+    # Keep this independent from the native handler.  signal.signal() may be
+    # rejected outside the interpreter's main thread, but that must never skip
+    # the process-wide native protection used by Intel/CUDA runtimes.
+    try:
         import signal
 
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except (AttributeError, OSError, RuntimeError, ValueError) as exc:
-        logger.warning("[Dask] Worker could not ignore Driver Ctrl+C: %s", exc)
+        logger.warning(
+            "[Dask] Worker could not install the Python Ctrl+C ignore handler: %s",
+            exc,
+        )
 
 
 class WorkerDevicePlugin(WorkerPlugin):
@@ -427,7 +491,10 @@ def build_local_cluster_specs(
 
     scheduler_spec: dict[str, Any] = {
         "cls": Scheduler,
-        "options": {"dashboard_address": dashboard_address},
+        "options": {
+            "host": LOCAL_CLUSTER_HOST,
+            "dashboard_address": dashboard_address,
+        },
     }
     worker_specs: dict[str, dict[str, Any]] = {}
 
@@ -435,6 +502,7 @@ def build_local_cluster_specs(
         worker_specs[f"cpu-{index}"] = {
             "cls": Nanny,
             "options": {
+                "host": LOCAL_CLUSTER_HOST,
                 "nthreads": 1,
                 "resources": {CPU_RESOURCE_NAME: 1},
                 "env": {
@@ -456,6 +524,7 @@ def build_local_cluster_specs(
         worker_specs[f"gpu-{index}"] = {
             "cls": Nanny,
             "options": {
+                "host": LOCAL_CLUSTER_HOST,
                 "nthreads": 1,
                 "resources": {GPU_RESOURCE_NAME: 1},
                 "env": {
@@ -484,6 +553,86 @@ def build_local_cluster_specs(
         for worker_spec in worker_specs.values():
             worker_spec["options"]["death_timeout"] = worker_start_timeout
     return scheduler_spec, worker_specs
+
+
+def _cluster_nannies(cluster: Any) -> tuple[Any, ...]:
+    candidates = list(dict(getattr(cluster, "workers", {}) or {}).values())
+    candidates.extend(tuple(getattr(cluster, "_created", ()) or ()))
+    unique: dict[int, Any] = {}
+    for candidate in candidates:
+        unique[id(candidate)] = candidate
+    return tuple(unique.values())
+
+
+def _cluster_worker_processes_alive(cluster: Any) -> bool:
+    for nanny in _cluster_nannies(cluster):
+        worker_process = getattr(getattr(nanny, "process", None), "process", None)
+        if worker_process is not None:
+            try:
+                if worker_process.is_alive():
+                    return True
+            except (AssertionError, OSError, RuntimeError, ValueError):
+                return True
+    return False
+
+
+async def _force_kill_cluster_workers(cluster: Any, *, timeout: float) -> None:
+    """Close Nannies, then kill any child that resisted graceful shutdown."""
+    if cluster is None:
+        return
+
+    async def close_one(nanny: Any) -> BaseException | None:
+        try:
+            # Nanny.close sets status=closing before stopping its child.  That
+            # status is essential: killing the underlying AsyncProcess while
+            # the Nanny is still running makes _on_worker_exit immediately
+            # restart it.
+            await asyncio.wait_for(
+                nanny.close(
+                    timeout=max(0.1, timeout * 0.8),
+                    reason="workflow-emergency-cluster-close",
+                ),
+                timeout=max(0.2, timeout),
+            )
+            return None
+        except BaseException as close_exc:
+            worker_process = getattr(nanny, "process", None)
+            async_process = getattr(worker_process, "process", None)
+            if async_process is None:
+                return None
+            try:
+                # nanny.close has already transitioned the Nanny to closing,
+                # so this final OS-process kill cannot trigger a restart.
+                await async_process.kill()
+                await async_process.join(timeout=max(0.1, timeout))
+                if async_process.is_alive():
+                    raise RuntimeError("Dask Worker child is still alive after kill().")
+                return None
+            except BaseException as kill_exc:
+                return RuntimeError(
+                    f"Nanny close failed ({close_exc}); child kill failed ({kill_exc})."
+                )
+
+    results = await asyncio.gather(
+        *(close_one(nanny) for nanny in _cluster_nannies(cluster))
+    )
+    failures = [result for result in results if result is not None]
+    if failures:
+        raise RuntimeError(
+            f"Failed to force-stop {len(failures)} Dask Worker process(es)."
+        ) from failures[0]
+
+
+def _force_kill_cluster_workers_sync(cluster: Any, *, timeout: float) -> None:
+    """Run the emergency Worker-process finalizer on SpecCluster's IOLoop."""
+    cluster.sync(
+        _force_kill_cluster_workers,
+        cluster,
+        timeout=timeout,
+        callback_timeout=max(1.0, timeout * 2.0),
+    )
+    if _cluster_worker_processes_alive(cluster):
+        raise RuntimeError("One or more Dask Worker child processes survived cleanup.")
 
 
 def cluster_resource_summary_from_scheduler_info(
@@ -544,6 +693,7 @@ class DaskService:
     active_cpu_workers: int = 0
     active_gpu_workers: int = 0
     active_gpu_ids: tuple[str, ...] = ()
+    _cluster_poisoned: bool = False
     _cluster_lock = threading.RLock()
 
     def __new__(cls) -> DaskService:
@@ -599,6 +749,11 @@ class DaskService:
         Omitting both arguments preserves the former configuration-driven API.
         """
         with self._cluster_lock:
+            if self._cluster_poisoned:
+                logger.warning(
+                    "[Dask] Retrying cleanup of a previously poisoned local cluster."
+                )
+                self.stop_cluster()
             startup_started = time.monotonic()
             startup_timeout = _cluster_start_timeout()
             startup_deadline = startup_started + startup_timeout
@@ -753,10 +908,11 @@ class DaskService:
             )
 
             logger.info(
-                "[Dask] Startup plan: platform=%s scheduler=1 cpu_workers=%s "
+                "[Dask] Startup plan: platform=%s host=%s scheduler=1 cpu_workers=%s "
                 "gpu_workers=%s selected_gpu_ids=%s threads_per_worker=1 "
                 "cpu_memory_limit=%s gpu_memory_limit=%s local_directory=%s",
                 current_platform(),
+                LOCAL_CLUSTER_HOST,
                 requested_cpu_workers,
                 len(gpu_ids),
                 gpu_ids,
@@ -882,24 +1038,49 @@ class DaskService:
                     exc,
                     partial_workers,
                 )
+                cleanup_errors: list[BaseException] = []
+                cleanup_deadline = time.monotonic() + _cluster_close_timeout()
                 if client is not None:
                     try:
-                        client.close(timeout=_cluster_close_timeout())
+                        client.close(timeout=_remaining_shutdown_time(cleanup_deadline))
                     except Exception as close_exc:
+                        cleanup_errors.append(close_exc)
                         logger.warning(
                             "[Dask] Client cleanup after startup failure failed: %s",
                             close_exc,
                         )
                 if cluster is not None:
                     try:
-                        cluster.close(timeout=_cluster_close_timeout())
+                        cluster.close(timeout=_remaining_shutdown_time(cleanup_deadline))
                     except Exception as close_exc:
+                        cleanup_errors.append(close_exc)
                         logger.warning(
                             "[Dask] Cluster cleanup after startup failure failed: %s",
                             close_exc,
                         )
-                self.client = None
-                self.cluster = None
+                cleanup_unconfirmed = False
+                if cluster is not None and _cluster_worker_processes_alive(cluster):
+                    try:
+                        _force_kill_cluster_workers_sync(cluster, timeout=5.0)
+                    except Exception as kill_exc:
+                        logger.error(
+                            "[Dask] Emergency Worker cleanup after startup failure "
+                            "failed: %s",
+                            kill_exc,
+                            exc_info=True,
+                        )
+                        cleanup_unconfirmed = _cluster_worker_processes_alive(cluster)
+                if cleanup_unconfirmed:
+                    # Fail closed: retain the only handles capable of retrying
+                    # cleanup and forbid a second cluster beside possible
+                    # orphan GPU processes.
+                    self.client = client
+                    self.cluster = cluster
+                    self._cluster_poisoned = True
+                else:
+                    self.client = None
+                    self.cluster = None
+                    self._cluster_poisoned = False
                 self.active_cpu_workers = 0
                 self.active_gpu_workers = 0
                 self.active_gpu_ids = ()
@@ -1143,27 +1324,76 @@ class DaskService:
             )
         return summary
 
-    def stop_cluster(self) -> None:
+    def stop_cluster(self) -> bool:
+        """Stop the runtime and report whether shutdown was fully graceful.
+
+        Confirmed emergency process cleanup returns ``False``. If child exit
+        cannot be confirmed, the handles remain poisoned and this method raises
+        so a replacement cluster cannot start beside orphan GPU processes.
+        """
         with self._cluster_lock:
             client = self.client
             cluster = self.cluster
-            # Stop publishing the topology before any potentially slow close
-            # RPC. Worker process exit releases worker-local model caches.
-            self.client = None
-            self.cluster = None
-            self.active_cpu_workers = 0
-            self.active_gpu_workers = 0
-            self.active_gpu_ids = ()
+            close_errors: list[BaseException] = []
+            close_deadline = time.monotonic() + _cluster_close_timeout()
             if client:
                 try:
-                    client.close(timeout=_cluster_close_timeout())
+                    client.close(timeout=_remaining_shutdown_time(close_deadline))
                 except Exception as exc:
+                    close_errors.append(exc)
                     logger.warning("Error closing client: %s", exc)
             if cluster:
                 try:
-                    cluster.close(timeout=_cluster_close_timeout())
+                    cluster.close(timeout=_remaining_shutdown_time(close_deadline))
                 except Exception as exc:
+                    close_errors.append(exc)
                     logger.warning("Error closing cluster: %s", exc)
+
+            cleanup_unconfirmed = False
+            if cluster is not None and _cluster_worker_processes_alive(cluster):
+                if not close_errors:
+                    close_errors.append(
+                        RuntimeError(
+                            "Dask cluster close returned while Worker children were alive."
+                        )
+                    )
+                try:
+                    _force_kill_cluster_workers_sync(cluster, timeout=5.0)
+                except Exception as exc:
+                    close_errors.append(exc)
+                    logger.error(
+                        "[Dask] Emergency Worker-process cleanup failed: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    cleanup_unconfirmed = _cluster_worker_processes_alive(cluster)
+
+            if cleanup_unconfirmed:
+                # Preserve poisoned handles and fail closed.  start_cluster()
+                # retries this cleanup before it may provision any new Worker.
+                self.client = client
+                self.cluster = cluster
+                self._cluster_poisoned = True
+            else:
+                # Only discard handles after every child is confirmed stopped.
+                self.client = None
+                self.cluster = None
+                self._cluster_poisoned = False
+            self.active_cpu_workers = 0
+            self.active_gpu_workers = 0
+            self.active_gpu_ids = ()
+            if cleanup_unconfirmed:
+                raise RuntimeError(
+                    "Dask Worker exit could not be confirmed; the local cluster "
+                    "is poisoned and replacement Workers are blocked."
+                ) from close_errors[-1]
+            if close_errors:
+                logger.warning(
+                    "[Dask] Graceful cluster close failed, but every Worker "
+                    "child process was confirmed stopped."
+                )
+                return False
+            return True
 
 
 dask_service = DaskService()

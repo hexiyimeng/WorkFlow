@@ -4,7 +4,7 @@ import inspect
 import logging
 import operator
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import dask
 import dask.array as da
@@ -44,6 +44,7 @@ from core.window_execution import (
 from core.workflow_resources import (
     WorkflowResourcePlan,
     build_workflow_resource_plan,
+    ensure_executable_resource_plan,
     validate_workflow_resource_plan,
 )
 from core.worker_cache import force_clear_worker_cache
@@ -333,6 +334,62 @@ def _release_futures(futures: list) -> None:
                 logger.debug("[Cleanup] Future release failed: %s", exc)
 
 
+async def _clear_worker_caches_with_timeout(
+    client,
+    *,
+    timeout_seconds: float = 15.0,
+) -> dict[str, dict]:
+    """Clear caches through ordinary pinned tasks, not ``Client.run`` RPCs.
+
+    ``Client.run`` broadcasts code onto Worker control/event-loop threads.  A
+    timed-out synchronous broadcast continues running in its background thread
+    and can emit communication failures minutes after an execution has already
+    finished.  Normal Dask tasks are schedulable, observable, and cancellable;
+    pinning one task to every currently registered Worker preserves the intended
+    process-local cache cleanup without blocking Worker control threads.
+    """
+    # Dask defaults scheduler_info() to at most five Workers.  Large GPU
+    # topologies must enumerate the complete pool or model caches survive on
+    # every omitted process.
+    scheduler_info = client.scheduler_info(n_workers=-1)
+    worker_addresses = tuple(sorted(dict(scheduler_info.get("workers", {}))))
+    if not worker_addresses:
+        return {}
+
+    futures = []
+    try:
+        for index, worker_address in enumerate(worker_addresses):
+            futures.append(
+                client.submit(
+                    force_clear_worker_cache,
+                    key=f"workflow-cache-clear-{uuid.uuid4().hex}-{index}",
+                    workers=[worker_address],
+                    allow_other_workers=False,
+                    pure=False,
+                )
+            )
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while not all(future.done() for future in futures):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Timed out waiting for Worker cache-clear tasks."
+                )
+            await asyncio.sleep(min(0.05, remaining))
+
+        # done() makes these local state reads non-blocking while preserving
+        # any Worker exception.  This avoids an uncancellable synchronous
+        # client.gather() thread entirely.
+        values = [future.result(timeout=0) for future in futures]
+        return dict(zip(worker_addresses, values))
+    finally:
+        # The caller resets the local cluster on any exception.  release() is
+        # asynchronous/non-blocking and avoids replacing one stuck RPC with an
+        # equally unbounded synchronous client.cancel() call.
+        _release_futures(futures)
+
+
 def _remove_futures(tracked_futures: list, completed_futures: list) -> None:
     for future in completed_futures:
         try:
@@ -400,33 +457,9 @@ def _resource_plan_for_execution_mode(
     plan: WorkflowResourcePlan,
     execution_config: ExecutionConfig | None,
 ) -> WorkflowResourcePlan:
-    """Validate constrained pools and provide capacity for an all-any DAG."""
+    """Compatibility wrapper for the backend-neutral plan normalizer."""
     del execution_config
-
-    has_cpu_nodes = any(node.resource == "cpu" for node in plan.nodes)
-    has_gpu_nodes = any(node.resource == "gpu" for node in plan.nodes)
-    if has_cpu_nodes and plan.cpu_workers == 0:
-        raise ValueError(
-            "The workflow contains CPU-constrained node(s), but their aggregate "
-            "EXECUTION_WORKERS count is 0. Declare at least one CPU Worker."
-        )
-    if has_gpu_nodes and plan.gpu_workers == 0:
-        raise ValueError(
-            "The workflow contains GPU-constrained node(s), but their aggregate "
-            "EXECUTION_WORKERS count is 0. Declare at least one GPU Worker."
-        )
-
-    if plan.cpu_workers > 0 or plan.gpu_workers > 0:
-        return plan
-
-    # An all-any graph has no typed pool from which to derive cluster capacity.
-    # One CPU Worker is the minimal executable topology and is reflected in
-    # preflight so the confirmation dialog matches formal execution.
-    return replace(
-        plan,
-        requires_cpu=True,
-        cpu_workers=1,
-    )
+    return ensure_executable_resource_plan(plan)
 
 
 def _requires_resource_boundary_preservation(
@@ -2090,18 +2123,52 @@ async def execute_graph(
                             exc,
                         )
 
-        if client:
+        if client and should_cancel_dask_objects:
+            # A failed/cancelled task may have died while owning a no-expiry
+            # Zarr storage-chunk lease.  Rebuild the fixed local cluster before
+            # another execution instead of either deadlocking on that stale
+            # lease or weakening it into an unsafe expiring lock.
             try:
-                stats = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.run,
-                        force_clear_worker_cache,
-                    ),
-                    timeout=15.0,
+                graceful = await asyncio.to_thread(dask_service.stop_cluster)
+                log_method = logger.info if graceful else logger.warning
+                log_method(
+                    "[Cleanup] Dask cluster stopped after unsuccessful execution%s",
+                    "" if graceful else " using emergency Worker cleanup",
+                )
+            except Exception as exc:
+                logger.error(
+                    "[Cleanup] Dask cluster reset failed after unsuccessful execution: %s",
+                    exc,
+                    exc_info=True,
+                )
+            client = None
+        elif client:
+            try:
+                stats = await _clear_worker_caches_with_timeout(
+                    client,
+                    timeout_seconds=15.0,
                 )
                 logger.info("[Cleanup] Worker cache cleared: %s", stats)
             except Exception as exc:
-                logger.debug("[Cleanup] Worker cache clear failed: %s", exc)
+                # Reusing a partially cleared mixed cluster can retain large
+                # Cellpose/CUDA allocations on just the omitted or unreachable
+                # Workers and make the next otherwise-valid execution OOM.
+                # Computation has already reached its terminal state, so reset
+                # only the disposable local Dask runtime here.
+                logger.warning(
+                    "[Cleanup] Worker cache clear failed; resetting the Dask "
+                    "cluster before the next execution: %s",
+                    exc,
+                )
+                try:
+                    await asyncio.to_thread(dask_service.stop_cluster)
+                except Exception as reset_exc:
+                    logger.error(
+                        "[Cleanup] Dask cluster reset after cache failure failed: %s",
+                        reset_exc,
+                        exc_info=True,
+                    )
+                client = None
 
         # Failed, interrupted, and cancelled executions keep ownership until
         # outstanding Dask work and node cleanup finish, then expose recovery.

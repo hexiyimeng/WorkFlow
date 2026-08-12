@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 from core.execution_resources import (
@@ -220,6 +220,41 @@ def build_workflow_resource_plan(
         any_node_ids=any_node_ids,
         cpu_workers=cpu_workers,
         gpu_workers=gpu_workers,
+    )
+
+
+def ensure_executable_resource_plan(
+    plan: WorkflowResourcePlan,
+) -> WorkflowResourcePlan:
+    """Validate constrained pools and give an all-``any`` graph one Worker.
+
+    This normalization is deliberately independent of the execution backend.
+    Local desktop execution and Slurm submission must derive exactly the same
+    CPU/GPU topology from a workflow graph.
+    """
+
+    has_cpu_nodes = any(node.resource == "cpu" for node in plan.nodes)
+    has_gpu_nodes = any(node.resource == "gpu" for node in plan.nodes)
+    if has_cpu_nodes and plan.cpu_workers == 0:
+        raise ValueError(
+            "The workflow contains CPU-constrained node(s), but their aggregate "
+            "EXECUTION_WORKERS count is 0. Declare at least one CPU Worker."
+        )
+    if has_gpu_nodes and plan.gpu_workers == 0:
+        raise ValueError(
+            "The workflow contains GPU-constrained node(s), but their aggregate "
+            "EXECUTION_WORKERS count is 0. Declare at least one GPU Worker."
+        )
+
+    if plan.cpu_workers > 0 or plan.gpu_workers > 0:
+        return plan
+
+    # An all-any graph has no typed pool from which to derive cluster capacity.
+    # One CPU Worker is the minimal executable topology.
+    return replace(
+        plan,
+        requires_cpu=True,
+        cpu_workers=1,
     )
 
 
