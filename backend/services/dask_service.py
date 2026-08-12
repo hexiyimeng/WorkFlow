@@ -7,12 +7,14 @@ import os
 import asyncio
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 import dask.config
 from dask.distributed import Client, Nanny, Scheduler, SpecCluster
 from distributed import WorkerPlugin, get_worker
+from distributed.core import Status
 
 from core.config import _get_system_memory_gb, _is_main_process, config
 from core.logger import logger
@@ -53,6 +55,37 @@ class TransientClusterTopologyError(RuntimeError):
     """A topology mismatch that may resolve after a Nanny restart."""
 
 
+class WorkflowClient(Client):
+    """Client whose independently owned IOLoop cannot leak on connect failure."""
+
+    _failed_start_clients: list[WorkflowClient] = []
+
+    def start(self, **kwargs: Any) -> Any:
+        try:
+            return super().start(**kwargs)
+        except BaseException:
+            loop_runner = getattr(self, "_loop_runner", None)
+            loop_thread = getattr(loop_runner, "_loop_thread", None)
+            if loop_runner is not None:
+                try:
+                    loop_runner.stop(timeout=5.0)
+                except Exception:
+                    logger.error(
+                        "[Dask] Failed to stop Driver Client IOLoop after "
+                        "connection failure.",
+                        exc_info=True,
+                    )
+            if loop_thread is not None and _loop_thread_is_alive(loop_thread):
+                setattr(self, "_workflow_lingering_loop_thread", loop_thread)
+                self.__class__._failed_start_clients.append(self)
+                logger.critical(
+                    "[Dask] Driver Client IOLoop survived connection failure; "
+                    "replacement cluster startup is blocked until it exits."
+                )
+            self.status = "closed"
+            raise
+
+
 def _normalize_worker_count(value: object, *, name: str) -> int:
     """Return a non-negative integral Worker count."""
     if isinstance(value, bool):
@@ -84,8 +117,19 @@ def _positive_timeout_from_env(name: str, default: float) -> float:
 def _cluster_start_timeout() -> float:
     return _positive_timeout_from_env(
         "WorkFlow_DASK_CLUSTER_START_TIMEOUT_SECONDS",
-        120.0,
+        600.0,
     )
+
+
+def _worker_batch_start_timeout() -> float:
+    return _positive_timeout_from_env(
+        "WorkFlow_DASK_WORKER_BATCH_START_TIMEOUT_SECONDS",
+        180.0,
+    )
+
+
+def _bounded_phase_deadline(overall_deadline: float, phase_timeout: float) -> float:
+    return min(overall_deadline, time.monotonic() + phase_timeout)
 
 
 def _cluster_close_timeout() -> float:
@@ -552,10 +596,9 @@ def build_local_cluster_specs(
     if worker_start_timeout is not None:
         if worker_start_timeout <= 0:
             raise ValueError("worker_start_timeout must be positive when provided.")
-        # Unlike Client.wait_for_workers, this timeout covers the synchronous
-        # SpecCluster constructor, including Windows process spawn and Worker
-        # registration.  Without it, one stuck Nanny can block startup forever
-        # before Client.wait_for_workers is ever reached.
+        # Bound each Nanny in a Worker-start batch independently from the
+        # longer, whole-cluster startup deadline.  Without this, one stuck
+        # Nanny can block its batch forever.
         for worker_spec in worker_specs.values():
             worker_spec["options"]["death_timeout"] = worker_start_timeout
     return scheduler_spec, worker_specs
@@ -564,10 +607,208 @@ def build_local_cluster_specs(
 def _cluster_nannies(cluster: Any) -> tuple[Any, ...]:
     candidates = list(dict(getattr(cluster, "workers", {}) or {}).values())
     candidates.extend(tuple(getattr(cluster, "_created", ()) or ()))
+    pending = dict(
+        getattr(cluster, "_workflow_pending_worker_starts", {}) or {}
+    )
+    candidates.extend(nanny for nanny, _start_task in pending.values())
     unique: dict[int, Any] = {}
     for candidate in candidates:
         unique[id(candidate)] = candidate
     return tuple(unique.values())
+
+
+def _safe_runtime_attribute(value: Any, name: str) -> str:
+    try:
+        return str(getattr(value, name, "") or "")
+    except Exception as exc:
+        return f"<unavailable:{type(exc).__name__}>"
+
+
+def _nanny_startup_diagnostic(nanny: Any) -> dict[str, object]:
+    return {
+        "name": _safe_runtime_attribute(nanny, "name"),
+        "status": _safe_runtime_attribute(nanny, "status") or "unknown",
+        "nannyAddress": _safe_runtime_attribute(nanny, "address"),
+        "workerAddress": _safe_runtime_attribute(nanny, "worker_address"),
+    }
+
+
+def _cluster_startup_diagnostics(cluster: Any) -> dict[str, object]:
+    workers = dict(getattr(cluster, "workers", {}) or {})
+    pending = dict(
+        getattr(cluster, "_workflow_pending_worker_starts", {}) or {}
+    )
+    known_ids = {id(nanny) for nanny in workers.values()}
+    known_ids.update(id(nanny) for nanny, _task in pending.values())
+    created_only = [
+        nanny
+        for nanny in tuple(getattr(cluster, "_created", ()) or ())
+        if id(nanny) not in known_ids
+    ]
+    return {
+        "workers": {
+            str(name): _nanny_startup_diagnostic(nanny)
+            for name, nanny in workers.items()
+        },
+        "pending": {
+            str(name): {
+                **_nanny_startup_diagnostic(nanny),
+                "taskDone": bool(start_task.done()),
+                "taskCancelled": bool(start_task.cancelled()),
+            }
+            for name, (nanny, start_task) in pending.items()
+        },
+        "createdOnly": [
+            _nanny_startup_diagnostic(nanny) for nanny in created_only
+        ],
+    }
+
+
+_TERMINAL_NANNY_STATUSES = frozenset({Status.closed, Status.failed})
+
+
+def _nanny_shutdown_confirmed(nanny: Any) -> bool:
+    """Return True only when a Nanny cannot create a late Worker child."""
+    startup_lock = getattr(nanny, "_startup_lock", None)
+    if startup_lock is not None:
+        try:
+            if startup_lock.locked():
+                return False
+        except (AttributeError, RuntimeError):
+            return False
+
+    if getattr(nanny, "status", None) not in _TERMINAL_NANNY_STATUSES:
+        return False
+
+    worker_process = getattr(getattr(nanny, "process", None), "process", None)
+    if worker_process is None:
+        return True
+    try:
+        return not worker_process.is_alive()
+    except (AssertionError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def _cluster_nanny_shutdown_confirmed(cluster: Any) -> bool:
+    return all(_nanny_shutdown_confirmed(nanny) for nanny in _cluster_nannies(cluster))
+
+
+def _control_loop_shutdown_confirmed(owner: Any) -> bool:
+    if owner is None:
+        return True
+    lingering_thread = getattr(owner, "_workflow_lingering_loop_thread", None)
+    if lingering_thread is not None:
+        # Even after this thread dies, the owner still needs one finalization
+        # pass to clear the marker and set a terminal status.  Otherwise a
+        # timed-out Client remains discoverable through Client.current().
+        return False
+    loop_runner = getattr(owner, "_loop_runner", None)
+    if loop_runner is None:
+        # Lightweight test doubles and already-detached runtimes have no loop.
+        return True
+    try:
+        return not bool(loop_runner.is_started())
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _loop_thread_is_alive(loop_thread: Any) -> bool:
+    native_thread = getattr(loop_thread, "_thread", loop_thread)
+    try:
+        return bool(native_thread.is_alive())
+    except (AttributeError, RuntimeError):
+        return True
+
+
+def _capture_control_loop_thread(owner: Any) -> Any | None:
+    if owner is None:
+        return None
+    loop_runner = getattr(owner, "_loop_runner", None)
+    if loop_runner is None:
+        return None
+    loop = getattr(loop_runner, "_loop", None)
+    real_runner = loop_runner
+    all_loops = getattr(type(loop_runner), "_all_loops", {})
+    try:
+        _count, registered_runner = all_loops.get(loop, (0, loop_runner))
+    except (AttributeError, RuntimeError):
+        registered_runner = loop_runner
+    if registered_runner is not None:
+        real_runner = registered_runner
+    return getattr(real_runner, "_loop_thread", None)
+
+
+def _record_lingering_control_thread(owner: Any, loop_thread: Any | None) -> None:
+    if owner is not None and loop_thread is not None and _loop_thread_is_alive(loop_thread):
+        setattr(owner, "_workflow_lingering_loop_thread", loop_thread)
+
+
+def _mark_runtime_owner_closed(owner: Any) -> None:
+    if isinstance(owner, Client):
+        owner.status = "closed"
+    elif isinstance(owner, SpecCluster):
+        owner.status = Status.closed
+
+
+def _force_stop_control_loop(owner: Any, *, timeout: float, label: str) -> None:
+    if _control_loop_shutdown_confirmed(owner):
+        return
+    loop_runner = getattr(owner, "_loop_runner", None)
+    lingering_thread = getattr(owner, "_workflow_lingering_loop_thread", None)
+    if lingering_thread is not None:
+        try:
+            lingering_thread.join(timeout=max(0.1, timeout))
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError(f"Failed to join the {label} control thread.") from exc
+        if _loop_thread_is_alive(lingering_thread):
+            raise RuntimeError(f"The {label} control thread remained active.")
+        delattr(owner, "_workflow_lingering_loop_thread")
+        if _control_loop_shutdown_confirmed(owner):
+            _mark_runtime_owner_closed(owner)
+            return
+
+    loop_thread = _capture_control_loop_thread(owner)
+    stop_error: BaseException | None = None
+    try:
+        loop_runner.stop(timeout=max(0.1, timeout))
+    except BaseException as exc:
+        # Distributed clears LoopRunner._started and its thread reference in a
+        # finally block even when the bounded join times out.  Inspect the
+        # thread captured above before deciding the loop has stopped.
+        stop_error = exc
+    if loop_thread is not None and _loop_thread_is_alive(loop_thread):
+        _record_lingering_control_thread(owner, loop_thread)
+        raise RuntimeError(
+            f"The {label} control thread remained active after stop()."
+        ) from stop_error
+    _mark_runtime_owner_closed(owner)
+    if stop_error is not None:
+        raise RuntimeError(f"Failed to stop the {label} control loop.") from stop_error
+    if not _control_loop_shutdown_confirmed(owner):
+        raise RuntimeError(f"The {label} control loop remained active after stop().")
+    # A timed-out Distributed close may leave its status at ``closing`` even
+    # after the independently owned loop is gone.  Mark the now-inert handle
+    # terminal so Client.current() cannot rediscover it as an unmanaged client.
+    _mark_runtime_owner_closed(owner)
+
+
+def _cleanup_failed_workflow_clients() -> None:
+    retained: list[WorkflowClient] = []
+    for failed_client in tuple(WorkflowClient._failed_start_clients):
+        try:
+            _force_stop_control_loop(
+                failed_client,
+                timeout=5.0,
+                label="failed Dask Client",
+            )
+        except Exception:
+            retained.append(failed_client)
+    WorkflowClient._failed_start_clients[:] = retained
+    if retained:
+        raise RuntimeError(
+            "A failed Dask Client control thread is still alive; replacement "
+            "cluster startup is blocked. Restart the backend if it does not exit."
+        )
 
 
 def _cluster_worker_processes_alive(cluster: Any) -> bool:
@@ -587,7 +828,19 @@ async def _force_kill_cluster_workers(cluster: Any, *, timeout: float) -> None:
     if cluster is None:
         return
 
+    pending = dict(
+        getattr(cluster, "_workflow_pending_worker_starts", {}) or {}
+    )
+    pending_tasks = tuple(start_task for _nanny, start_task in pending.values())
+    for start_task in pending_tasks:
+        if not start_task.done():
+            start_task.cancel()
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
     async def close_one(nanny: Any) -> BaseException | None:
+        if _nanny_shutdown_confirmed(nanny):
+            return None
         try:
             # Nanny.close sets status=closing before stopping its child.  That
             # status is essential: killing the underlying AsyncProcess while
@@ -627,6 +880,14 @@ async def _force_kill_cluster_workers(cluster: Any, *, timeout: float) -> None:
         raise RuntimeError(
             f"Failed to force-stop {len(failures)} Dask Worker process(es)."
         ) from failures[0]
+    if not _cluster_nanny_shutdown_confirmed(cluster):
+        raise RuntimeError(
+            "One or more Dask Nannies remained in a non-terminal startup state."
+        )
+
+    workflow_pending = getattr(cluster, "_workflow_pending_worker_starts", None)
+    if isinstance(workflow_pending, dict):
+        workflow_pending.clear()
 
 
 def _force_kill_cluster_workers_sync(cluster: Any, *, timeout: float) -> None:
@@ -639,6 +900,8 @@ def _force_kill_cluster_workers_sync(cluster: Any, *, timeout: float) -> None:
     )
     if _cluster_worker_processes_alive(cluster):
         raise RuntimeError("One or more Dask Worker child processes survived cleanup.")
+    if not _cluster_nanny_shutdown_confirmed(cluster):
+        raise RuntimeError("One or more Dask Nannies survived cleanup.")
 
 
 def cluster_resource_summary_from_scheduler_info(
@@ -727,6 +990,219 @@ dask.config.set(
 )
 
 
+def _worker_start_batch_size() -> int:
+    raw_value = os.getenv("WorkFlow_DASK_WORKER_START_BATCH_SIZE", "2")
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "WorkFlow_DASK_WORKER_START_BATCH_SIZE must be a positive integer, "
+            f"got {raw_value!r}."
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            "WorkFlow_DASK_WORKER_START_BATCH_SIZE must be a positive integer, "
+            f"got {raw_value!r}."
+        )
+    return value
+
+
+async def _add_worker_spec_batch(
+    cluster: SpecCluster,
+    worker_specs: Mapping[str, Mapping[str, Any]],
+    *,
+    start_timeout: float,
+    cleanup_timeout: float,
+) -> None:
+    """Start one transactional Worker batch on the SpecCluster control loop.
+
+    Distributed's normal ``SpecCluster`` reconciliation creates Nanny-start
+    Tasks and awaits them before publishing ``cluster.workers``. Cancelling its
+    outer coroutine can leave those Tasks running only through
+    ``cluster._created``. This project-owned adapter owns every Task explicitly,
+    rolls the spec back, and closes every Nanny before propagating an error.
+    """
+    duplicate_names = set(worker_specs).intersection(cluster.worker_spec)
+    if duplicate_names:
+        raise RuntimeError(
+            "Dask Worker batch contains duplicate names: "
+            f"{tuple(sorted(duplicate_names))!r}."
+        )
+
+    pending: dict[str, tuple[Any, asyncio.Task[Any]]] = getattr(
+        cluster,
+        "_workflow_pending_worker_starts",
+        None,
+    )
+    if pending is None:
+        pending = {}
+        setattr(cluster, "_workflow_pending_worker_starts", pending)
+
+    batch_specs = {name: dict(spec) for name, spec in worker_specs.items()}
+    batch_nannies: dict[str, Any] = {}
+    batch_tasks: dict[str, asyncio.Task[Any]] = {}
+    cluster.worker_spec.update(batch_specs)
+    try:
+        scheduler_address = (
+            getattr(cluster.scheduler, "contact_address", None)
+            or cluster.scheduler.address
+        )
+        for name, spec in batch_specs.items():
+            worker_class = spec.get("cls")
+            if not isinstance(worker_class, type):
+                raise RuntimeError(
+                    "WorkFlow batched startup requires a concrete Worker class, "
+                    f"got {worker_class!r} for {name!r}."
+                )
+            options = dict(spec.get("options", {}) or {})
+            options.setdefault("name", name)
+            nanny = worker_class(scheduler_address, **options)
+            cluster._created.add(nanny)
+            batch_nannies[name] = nanny
+
+        for name, nanny in batch_nannies.items():
+            start_task = asyncio.create_task(nanny.start())
+            batch_tasks[name] = start_task
+            pending[name] = (nanny, start_task)
+
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *batch_tasks.values(),
+                return_exceptions=True,
+            ),
+            timeout=start_timeout,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} Dask Nanny process(es) failed to start in batch."
+            ) from failures[0]
+
+        cluster.workers.update(batch_nannies)
+        for nanny in batch_nannies.values():
+            nanny._cluster = weakref.ref(cluster)
+        for name in batch_nannies:
+            pending.pop(name, None)
+    except BaseException:
+        for name in batch_specs:
+            cluster.worker_spec.pop(name, None)
+            cluster.workers.pop(name, None)
+
+        for start_task in batch_tasks.values():
+            if not start_task.done():
+                start_task.cancel()
+        if batch_tasks:
+            await asyncio.gather(*batch_tasks.values(), return_exceptions=True)
+
+        async def close_one(nanny: Any) -> BaseException | None:
+            if _nanny_shutdown_confirmed(nanny):
+                return None
+            try:
+                await asyncio.wait_for(
+                    nanny.close(
+                        timeout=max(0.1, cleanup_timeout * 0.8),
+                        reason="workflow-worker-batch-start-failed",
+                    ),
+                    timeout=max(0.2, cleanup_timeout),
+                )
+                return None
+            except BaseException as close_exc:
+                return close_exc
+
+        close_results = await asyncio.gather(
+            *(close_one(nanny) for nanny in batch_nannies.values())
+        )
+        for name, nanny in batch_nannies.items():
+            if _nanny_shutdown_confirmed(nanny):
+                pending.pop(name, None)
+        close_failures = [result for result in close_results if result is not None]
+        if close_failures:
+            logger.error(
+                "[Dask] %s Nanny process(es) did not close cleanly after a "
+                "Worker batch startup failure.",
+                len(close_failures),
+            )
+        raise
+
+
+def _provision_worker_specs_in_batches(
+    cluster: SpecCluster,
+    client: Client,
+    worker_specs: Mapping[str, Mapping[str, Any]],
+    *,
+    deadline: float,
+    batch_size: int,
+    batch_timeout: float,
+) -> None:
+    """Provision Workers incrementally after the Driver Client is connected."""
+    items = tuple(worker_specs.items())
+    registered = 0
+    provisioning_started = time.monotonic()
+    batch_count = math.ceil(len(items) / batch_size)
+    for offset in range(0, len(items), batch_size):
+        batch_number = offset // batch_size + 1
+        batch = dict(items[offset : offset + batch_size])
+        batch_started = time.monotonic()
+        logger.info(
+            "[Dask] Starting Worker batch %s/%s: names=%s progress=%s/%s",
+            batch_number,
+            batch_count,
+            tuple(batch),
+            registered,
+            len(items),
+        )
+        batch_deadline = _bounded_phase_deadline(deadline, batch_timeout)
+        remaining = _remaining_startup_time(
+            batch_deadline,
+            stage=f"starting Worker batch {batch_number}",
+        )
+        cluster.sync(
+            _add_worker_spec_batch,
+            cluster,
+            batch,
+            start_timeout=remaining,
+            cleanup_timeout=min(15.0, batch_timeout),
+            # The outer callback must leave room for the coroutine's bounded
+            # transactional rollback.  Otherwise Distributed.sync() returns to
+            # the caller while Nanny cleanup is still running on the cluster
+            # IOLoop, racing the whole-cluster shutdown path.
+            callback_timeout=remaining + min(15.0, batch_timeout) + 5.0,
+        )
+        registered += len(batch)
+        client.wait_for_workers(
+            registered,
+            timeout=_remaining_startup_time(
+                batch_deadline,
+                stage="observing Worker registration",
+            ),
+        )
+        scheduler_info = get_fresh_scheduler_info(
+            client,
+            timeout=_remaining_startup_time(
+                batch_deadline,
+                stage="validating Worker batch registration",
+            ),
+        )
+        observed = len(dict(scheduler_info.get("workers", {})))
+        if observed < registered:
+            raise TransientClusterTopologyError(
+                "Scheduler lost a Worker during batched startup: "
+                f"expected at least {registered}, found {observed}."
+            )
+        logger.info(
+            "[Dask] Worker batch %s/%s registered: names=%s progress=%s/%s "
+            "observed=%s batch_elapsed=%.1fs total_elapsed=%.1fs",
+            batch_number,
+            batch_count,
+            tuple(batch),
+            registered,
+            len(items),
+            observed,
+            time.monotonic() - batch_started,
+            time.monotonic() - provisioning_started,
+        )
+
+
 class DaskService:
     _instance: DaskService | None = None
     client: Client | None = None
@@ -790,6 +1266,7 @@ class DaskService:
         Omitting both arguments preserves the former configuration-driven API.
         """
         with self._cluster_lock:
+            _cleanup_failed_workflow_clients()
             if self._cluster_poisoned:
                 logger.warning(
                     "[Dask] Retrying cleanup of a previously poisoned local cluster."
@@ -847,6 +1324,10 @@ class DaskService:
             total_workers = requested_cpu_workers + len(gpu_ids)
             if total_workers <= 0:
                 raise ValueError("At least one CPU or GPU Worker must be configured.")
+            # Parse startup policy before creating any Scheduler or Client so a
+            # bad deployment value has no process or socket side effects.
+            batch_size = min(_worker_start_batch_size(), total_workers)
+            worker_batch_timeout = _worker_batch_start_timeout()
 
             desired_topology = (
                 requested_cpu_workers,
@@ -948,16 +1429,15 @@ class DaskService:
                 gpu_memory_limit=gpu_memory_limit,
                 local_directory=local_directory,
                 dashboard_address=config.DASHBOARD_ADDRESS,
-                worker_start_timeout=_remaining_startup_time(
-                    startup_deadline,
-                    stage="preparing Worker processes",
-                ),
+                worker_start_timeout=worker_batch_timeout,
             )
 
             logger.info(
                 "[Dask] Startup plan: platform=%s host=%s scheduler=1 cpu_workers=%s "
                 "gpu_workers=%s selected_gpu_ids=%s threads_per_worker=1 "
-                "cpu_memory_limit=%s gpu_memory_limit=%s local_directory=%s",
+                "cpu_memory_limit=%s gpu_memory_limit=%s local_directory=%s "
+                "worker_batch_size=%s worker_batch_timeout=%.1fs "
+                "total_startup_timeout=%.1fs",
                 current_platform(),
                 LOCAL_CLUSTER_HOST,
                 requested_cpu_workers,
@@ -966,66 +1446,94 @@ class DaskService:
                 cpu_memory_limit,
                 gpu_memory_limit,
                 local_directory,
+                batch_size,
+                worker_batch_timeout,
+                startup_timeout,
             )
 
             cluster: SpecCluster | None = None
             client: Client | None = None
-            startup_stage = "creating Scheduler and Worker processes"
+            startup_stage = "creating the Dask Scheduler"
             try:
+                # Start the Scheduler with no Workers, then connect an
+                # independently looped Driver Client before any Nanny spawn.
+                # Client(cluster) reuses SpecCluster's control IOLoop; on the
+                # remote Windows host, creating 14 Nannies first left that loop
+                # unable to complete the subsequent Client handshake even
+                # though all Workers had already registered.  A separate Client
+                # loop plus bounded Worker batches prevents that thundering
+                # herd from blocking the only Driver connection.
                 cluster = SpecCluster(
-                    workers=worker_specs,
+                    workers={},
                     scheduler=scheduler_spec,
                     asynchronous=False,
                     silence_logs=logging.WARNING,
                     name="WorkFlow local mixed cluster",
                 )
-                # SpecCluster synchronously starts every Nanny.  On Windows,
-                # process creation is substantially serialized and the total
-                # constructor time may exceed one Nanny's death_timeout even
-                # though every Worker starts successfully.  The remote 18-
-                # Worker case took 206 seconds and returned all 18 Workers in
-                # Status.running.  Give Client connection and atomic topology
-                # validation their own phase budget instead of rejecting that
-                # already-started cluster with an expired pre-spawn deadline.
-                cluster_constructed_at = time.monotonic()
-                post_spawn_deadline = cluster_constructed_at + startup_timeout
                 logger.info(
-                    "[Dask] Scheduler and Nannies constructed: requested=%s "
+                    "[Dask] Scheduler constructed before Workers: address=%s "
                     "elapsed=%.1fs",
-                    total_workers,
-                    cluster_constructed_at - startup_started,
+                    cluster.scheduler.address,
+                    time.monotonic() - startup_started,
                 )
                 startup_stage = "connecting the Dask Client"
-                client = Client(
-                    cluster,
+                client_deadline = _bounded_phase_deadline(startup_deadline, 60.0)
+                client = WorkflowClient(
+                    cluster.scheduler.address,
+                    security=cluster.security,
                     timeout=_remaining_startup_time(
-                        post_spawn_deadline,
+                        client_deadline,
                         stage="connecting the Dask Client",
                     ),
                 )
-                startup_stage = "waiting for initial Worker registration"
-                client.wait_for_workers(
-                    total_workers,
+                initial_scheduler_info = get_fresh_scheduler_info(
+                    client,
                     timeout=_remaining_startup_time(
-                        post_spawn_deadline,
-                        stage="waiting for Worker registration",
+                        client_deadline,
+                        stage="checking the Scheduler before Worker startup",
                     ),
+                )
+                if initial_scheduler_info.get("workers"):
+                    raise RuntimeError(
+                        "A newly created Dask Scheduler unexpectedly reported "
+                        "Workers before local provisioning began."
+                    )
+                logger.info(
+                    "[Dask] Driver Client connected before Worker startup: "
+                    "scheduler=%s elapsed=%.1fs",
+                    initial_scheduler_info.get("address", cluster.scheduler.address),
+                    time.monotonic() - startup_started,
+                )
+
+                startup_stage = "starting Worker processes in bounded batches"
+                _provision_worker_specs_in_batches(
+                    cluster,
+                    client,
+                    worker_specs,
+                    deadline=startup_deadline,
+                    batch_size=batch_size,
+                    batch_timeout=worker_batch_timeout,
                 )
                 workers_ready_at = time.monotonic()
                 logger.info(
                     "[Dask] Worker processes and role metadata registered: "
-                    "total=%s elapsed=%.1fs",
+                    "total=%s batch_size=%s elapsed=%.1fs",
                     total_workers,
+                    batch_size,
                     workers_ready_at - startup_started,
                 )
 
                 startup_stage = "waiting for a stable validated topology"
+                validation_deadline = _bounded_phase_deadline(
+                    startup_deadline,
+                    30.0,
+                )
                 summary = self._wait_for_stable_topology(
                     expected_cpu_workers=requested_cpu_workers,
                     expected_gpu_workers=len(gpu_ids),
                     expected_gpu_ids=gpu_ids,
                     expected_total_workers=total_workers,
-                    deadline=post_spawn_deadline,
+                    deadline=validation_deadline,
                     client=client,
                 )
                 # Publish the client only after every Worker has passed role,
@@ -1064,30 +1572,21 @@ class DaskService:
                 )
                 return client
             except Exception as exc:
-                partial_workers = {}
+                startup_diagnostics: dict[str, object] = {}
                 if cluster is not None:
-                    partial_workers = {
-                        str(name): {
-                            "nannyStatus": str(getattr(worker, "status", "unknown")),
-                            "workerAddress": str(
-                                getattr(worker, "worker_address", "") or ""
-                            ),
-                        }
-                        for name, worker in dict(
-                            getattr(cluster, "workers", {}) or {}
-                        ).items()
-                    }
+                    startup_diagnostics = _cluster_startup_diagnostics(cluster)
                 logger.error(
                     "[Dask] Start failed after %.1fs during %s: %s | "
-                    "partial_workers=%s",
+                    "startup_diagnostics=%s",
                     time.monotonic() - startup_started,
                     startup_stage,
                     exc,
-                    partial_workers,
+                    startup_diagnostics,
                 )
                 cleanup_errors: list[BaseException] = []
                 cleanup_deadline = time.monotonic() + _cluster_close_timeout()
                 if client is not None:
+                    client_loop_thread = _capture_control_loop_thread(client)
                     try:
                         client.close(timeout=_client_close_timeout(cleanup_deadline))
                     except Exception as close_exc:
@@ -1096,7 +1595,13 @@ class DaskService:
                             "[Dask] Client cleanup after startup failure failed: %s",
                             close_exc,
                         )
+                    finally:
+                        _record_lingering_control_thread(
+                            client,
+                            client_loop_thread,
+                        )
                 if cluster is not None:
+                    cluster_loop_thread = _capture_control_loop_thread(cluster)
                     try:
                         cluster.close(timeout=_remaining_shutdown_time(cleanup_deadline))
                     except Exception as close_exc:
@@ -1105,8 +1610,16 @@ class DaskService:
                             "[Dask] Cluster cleanup after startup failure failed: %s",
                             close_exc,
                         )
+                    finally:
+                        _record_lingering_control_thread(
+                            cluster,
+                            cluster_loop_thread,
+                        )
                 cleanup_unconfirmed = False
-                if cluster is not None and _cluster_worker_processes_alive(cluster):
+                if (
+                    cluster is not None
+                    and not _cluster_nanny_shutdown_confirmed(cluster)
+                ):
                     try:
                         _force_kill_cluster_workers_sync(cluster, timeout=5.0)
                     except Exception as kill_exc:
@@ -1116,7 +1629,35 @@ class DaskService:
                             kill_exc,
                             exc_info=True,
                         )
-                        cleanup_unconfirmed = _cluster_worker_processes_alive(cluster)
+                if cluster is not None:
+                    cleanup_unconfirmed = not _cluster_nanny_shutdown_confirmed(
+                        cluster
+                    )
+                if not cleanup_unconfirmed:
+                    for owner, label in (
+                        (client, "Dask Client"),
+                        (cluster, "SpecCluster"),
+                    ):
+                        if not _control_loop_shutdown_confirmed(owner):
+                            try:
+                                _force_stop_control_loop(
+                                    owner,
+                                    timeout=5.0,
+                                    label=label,
+                                )
+                            except Exception as loop_exc:
+                                cleanup_errors.append(loop_exc)
+                                logger.error(
+                                    "[Dask] %s loop cleanup after startup failure "
+                                    "failed: %s",
+                                    label,
+                                    loop_exc,
+                                    exc_info=True,
+                                )
+                    cleanup_unconfirmed = not all(
+                        _control_loop_shutdown_confirmed(owner)
+                        for owner in (client, cluster)
+                    )
                 if cleanup_unconfirmed:
                     # Fail closed: retain the only handles capable of retrying
                     # cleanup and forbid a second cluster beside possible
@@ -1400,24 +1941,34 @@ class DaskService:
             close_errors: list[BaseException] = []
             close_deadline = time.monotonic() + _cluster_close_timeout()
             if client:
+                client_loop_thread = _capture_control_loop_thread(client)
                 try:
                     client.close(timeout=_client_close_timeout(close_deadline))
                 except Exception as exc:
                     close_errors.append(exc)
                     logger.warning("Error closing client: %s", exc)
+                finally:
+                    _record_lingering_control_thread(client, client_loop_thread)
             if cluster:
+                cluster_loop_thread = _capture_control_loop_thread(cluster)
                 try:
                     cluster.close(timeout=_remaining_shutdown_time(close_deadline))
                 except Exception as exc:
                     close_errors.append(exc)
                     logger.warning("Error closing cluster: %s", exc)
+                finally:
+                    _record_lingering_control_thread(cluster, cluster_loop_thread)
 
             cleanup_unconfirmed = False
-            if cluster is not None and _cluster_worker_processes_alive(cluster):
+            if (
+                cluster is not None
+                and not _cluster_nanny_shutdown_confirmed(cluster)
+            ):
                 if not close_errors:
                     close_errors.append(
                         RuntimeError(
-                            "Dask cluster close returned while Worker children were alive."
+                            "Dask cluster close returned before every Nanny reached "
+                            "a terminal state."
                         )
                     )
                 try:
@@ -1429,7 +1980,32 @@ class DaskService:
                         exc,
                         exc_info=True,
                     )
-                    cleanup_unconfirmed = _cluster_worker_processes_alive(cluster)
+            if cluster is not None:
+                cleanup_unconfirmed = not _cluster_nanny_shutdown_confirmed(cluster)
+            if not cleanup_unconfirmed:
+                for owner, label in (
+                    (client, "Dask Client"),
+                    (cluster, "SpecCluster"),
+                ):
+                    if not _control_loop_shutdown_confirmed(owner):
+                        try:
+                            _force_stop_control_loop(
+                                owner,
+                                timeout=5.0,
+                                label=label,
+                            )
+                        except Exception as exc:
+                            close_errors.append(exc)
+                            logger.error(
+                                "[Dask] %s loop cleanup failed: %s",
+                                label,
+                                exc,
+                                exc_info=True,
+                            )
+                cleanup_unconfirmed = not all(
+                    _control_loop_shutdown_confirmed(owner)
+                    for owner in (client, cluster)
+                )
 
             if cleanup_unconfirmed:
                 # Preserve poisoned handles and fail closed.  start_cluster()
@@ -1447,8 +2023,8 @@ class DaskService:
             self.active_gpu_ids = ()
             if cleanup_unconfirmed:
                 raise RuntimeError(
-                    "Dask Worker exit could not be confirmed; the local cluster "
-                    "is poisoned and replacement Workers are blocked."
+                    "Dask runtime shutdown could not be confirmed; the local "
+                    "cluster is poisoned and replacement Workers are blocked."
                 ) from close_errors[-1]
             if close_errors:
                 logger.warning(

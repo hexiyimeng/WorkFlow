@@ -1605,8 +1605,8 @@ dev = [
 requires-dist = [
     { name = "bokeh", specifier = ">=3.1.0" },
     { name = "cellpose", specifier = "~=4.0.8" },
-    { name = "dask", extras = ["array"], specifier = ">=2024.0.0" },
-    { name = "distributed", specifier = ">=2024.0.0" },
+    { name = "dask", extras = ["array"], specifier = "==2026.3.0" },
+    { name = "distributed", specifier = "==2026.3.0" },
     { name = "fastapi", specifier = ">=0.100.0" },
     { name = "numcodecs", specifier = ">=0.12,<0.16" },
     { name = "numpy", specifier = ">=1.24.0" },

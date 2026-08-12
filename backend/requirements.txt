@@ -4,8 +4,8 @@
 fastapi>=0.100.0
 uvicorn[standard]>=0.20.0
 
-dask[array]>=2024.0.0
-distributed>=2024.0.0
+dask[array]==2026.3.0
+distributed==2026.3.0
 bokeh>=3.1.0
 
 numpy>=1.24.0

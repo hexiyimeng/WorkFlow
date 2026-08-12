@@ -1450,6 +1450,22 @@ async def execute_graph(
             build_workflow_resource_plan(graph, execution_roots),
             selected_config,
         )
+        logger.info(
+            "[Dask] Graph resource plan: cpu_workers=%s gpu_workers=%s "
+            "contributors=%s",
+            resource_plan.cpu_workers,
+            resource_plan.gpu_workers,
+            tuple(
+                (
+                    node.node_id,
+                    node.node_type,
+                    node.resource,
+                    node.workers,
+                )
+                for node in resource_plan.nodes
+                if node.workers
+            ),
+        )
         client = await asyncio.to_thread(
             dask_service.ensure_client,
             cpu_workers=resource_plan.cpu_workers,
