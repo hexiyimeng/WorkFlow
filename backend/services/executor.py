@@ -48,7 +48,7 @@ from core.workflow_resources import (
     validate_workflow_resource_plan,
 )
 from core.worker_cache import force_clear_worker_cache
-from services.dask_service import dask_service
+from services.dask_service import dask_service, get_fresh_scheduler_info
 from services.memory_monitor import get_memory_monitor
 from services.recovery_service import (
     discover_terminal_outputs,
@@ -351,7 +351,13 @@ async def _clear_worker_caches_with_timeout(
     # Dask defaults scheduler_info() to at most five Workers.  Large GPU
     # topologies must enumerate the complete pool or model caches survive on
     # every omitted process.
-    scheduler_info = client.scheduler_info(n_workers=-1)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    scheduler_info = get_fresh_scheduler_info(client, timeout=timeout_seconds)
+    if loop.time() >= deadline:
+        raise TimeoutError(
+            "Timed out while enumerating Workers for cache cleanup."
+        )
     worker_addresses = tuple(sorted(dict(scheduler_info.get("workers", {}))))
     if not worker_addresses:
         return {}
@@ -359,6 +365,10 @@ async def _clear_worker_caches_with_timeout(
     futures = []
     try:
         for index, worker_address in enumerate(worker_addresses):
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    "Timed out while submitting Worker cache-clear tasks."
+                )
             futures.append(
                 client.submit(
                     force_clear_worker_cache,
@@ -369,9 +379,8 @@ async def _clear_worker_caches_with_timeout(
                 )
             )
 
-        deadline = asyncio.get_running_loop().time() + timeout_seconds
         while not all(future.done() for future in futures):
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 raise TimeoutError(
                     "Timed out waiting for Worker cache-clear tasks."

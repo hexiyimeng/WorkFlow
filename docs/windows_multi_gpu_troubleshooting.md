@@ -2,6 +2,18 @@
 
 ## 本次日志结论
 
+最新的 6 CPU + 8 GPU 日志证明上一版 loopback 修复已经生效：Scheduler 和全部
+14 个 Worker 都在 36.3 秒内注册到 `127.0.0.1`。这次失败发生在随后的拓扑校验。
+校验反复只看到 3 CPU + 2 GPU（总数恰好为 5），原因是 Distributed 2026.3 的
+`Client.scheduler_info()` 使用共享缓存；周期刷新会按默认上限 5 覆盖一次完整查询的
+结果。因此，即使传入 `n_workers=-1`，也不能把这个 Client 缓存用于容量正确性判断。
+现在所有拓扑、资源、诊断和缓存清理都直接调用 Scheduler 的
+`identity(n_workers=-1)` RPC，并使用该次调用的原子返回值。
+
+本机压力复现把周期刷新间隔缩短到 1 ms：旧接口 1000 次中有 263 次仅返回 5 个
+Worker；新接口 1000 次全部返回 14 个。这说明最新失败不是 9 个 Worker 掉线，也
+不是 CUDA 启动失败。
+
 8 GPU + 4 CPU 的失败不是 GPU 枚举失败。日志显示 12 个 Nanny/Worker 均为
 `Status.running`，失败发生在 Driver 连接 Scheduler 公布的
 `tcp://10.10.8.35:*` 地址时。对于同一台主机内的 `SpecCluster`，让 Driver、
@@ -24,12 +36,14 @@ Scheduler 和 Worker 绕物理网卡会受到 Windows 防火墙、VPN、RDP 及�
   Nanny 仍可通过进程句柄有序终止 Worker。
 - Worker cache 清理改为每个 Worker 一个可取消、定向的普通 Dask task；不再使用
   超时后仍可在后台继续运行的 `Client.run` 广播。
-- 查询 Worker 列表必须使用 `scheduler_info(n_workers=-1)`；Dask 默认只返回五个。
+- 完整 Worker 列表通过直接 Scheduler `identity(n_workers=-1)` RPC 获取；不再用会被
+  周期刷新截断为五个 Worker 的 `Client.scheduler_info()` 共享缓存。
 - Zarr partial-chunk correctness lock 使用不失效的租约，获取等待设为 300 秒；
   Worker 崩溃时选择失败而不是允许第二个写入者并发进入。失败/取消后重建本地
   Dask cluster，清除可能残留的无期限锁。
-- 正常关闭失败时对 Nanny 子进程执行最终强制清理，避免旧 GPU 进程占用显存后又
-  启动一套新集群。
+- 正常关闭时限制 Client 阶段最多占用 10 秒，为 Cluster/Nanny 清理保留主要时间
+  预算；若仍不能确认所有 Worker 退出，则保留 poisoned cluster 句柄并禁止启动第二套
+  集群，避免两套 GPU 进程并存。此时需要完整重启后端再执行。
 
 ## 验证方法
 
@@ -39,9 +53,9 @@ Scheduler 和 Worker 绕物理网卡会受到 Windows 防火墙、VPN、RDP 及�
 .venv\Scripts\python.exe -m pytest tests\test_local_cluster_loopback.py -vv
 ```
 
-该测试会实际启动 12 个 Windows 子进程：4 CPU Worker 和 8 个具有互异 GPU
+该测试会实际启动 14 个 Windows 子进程：6 CPU Worker 和 8 个具有互异 GPU
 可见性掩码的 GPU Worker。它验证 Scheduler/Worker 地址全部为
-`tcp://127.0.0.1:*`、角色及掩码正确，然后有序关闭。
+`tcp://127.0.0.1:*`、生产拓扑校验识别完整 6+8、角色及掩码正确，然后有序关闭。
 
 这个测试故意不导入 PyTorch/CUDA；它验证的是本次日志已证明发生在 CUDA 初始化
 之前的进程和 TCP 拓扑故障。最终硬件验收必须在 8 GPU 目标机上执行一次真实

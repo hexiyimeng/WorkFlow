@@ -109,6 +109,12 @@ def _remaining_shutdown_time(deadline: float) -> float:
     return max(0.1, deadline - time.monotonic())
 
 
+def _client_close_timeout(deadline: float) -> float:
+    """Bound Client shutdown so Cluster/Nanny cleanup keeps most of the budget."""
+    remaining = max(0.1, deadline - time.monotonic())
+    return max(0.1, min(10.0, remaining * 0.25))
+
+
 def _detect_cuda_for_cluster() -> tuple[bool, int]:
     """Lazily inspect CUDA only while the local cluster is being started."""
     cuda_mode = os.getenv("WorkFlow_CUDA_MODE", "auto").strip().lower()
@@ -629,7 +635,7 @@ def _force_kill_cluster_workers_sync(cluster: Any, *, timeout: float) -> None:
         _force_kill_cluster_workers,
         cluster,
         timeout=timeout,
-        callback_timeout=max(1.0, timeout * 2.0),
+        callback_timeout=max(1.0, timeout * 3.0),
     )
     if _cluster_worker_processes_alive(cluster):
         raise RuntimeError("One or more Dask Worker child processes survived cleanup.")
@@ -661,6 +667,41 @@ def cluster_resource_summary_from_scheduler_info(
         total_cpu_slots=total_cpu_slots,
         total_gpu_slots=total_gpu_slots,
     )
+
+
+def get_fresh_scheduler_info(
+    client: Client,
+    *,
+    timeout: float | None = None,
+) -> Mapping[str, Any]:
+    """Fetch an atomic, untruncated Scheduler identity without Client cache races.
+
+    ``Client.scheduler_info(n_workers=-1)`` looks correct, but Distributed stores
+    the response in one shared ``Client._scheduler_identity`` cache and then
+    returns that cache.  Its periodic scheduler-info callback concurrently
+    refreshes the same cache with the method default of five Workers.  On the
+    14-Worker Windows host this raced into repeatable 3-CPU/2-GPU snapshots even
+    though all 14 Nannies were running.  Calling the Scheduler identity RPC
+    directly returns this request's value and also propagates communication
+    errors instead of silently returning a stale cache.
+    """
+    scheduler_rpc = getattr(client, "scheduler", None)
+    identity = getattr(scheduler_rpc, "identity", None)
+    if not callable(identity):
+        raise RuntimeError("Dask Client has no live Scheduler identity RPC.")
+    kwargs: dict[str, Any] = {"n_workers": -1}
+    sync_kwargs: dict[str, Any] = {}
+    if timeout is not None:
+        if timeout <= 0:
+            raise TimeoutError("No time remains for Dask Scheduler identity RPC.")
+        sync_kwargs["callback_timeout"] = timeout
+    scheduler_info = client.sync(identity, **kwargs, **sync_kwargs)
+    if not isinstance(scheduler_info, Mapping):
+        raise RuntimeError(
+            "Dask Scheduler returned an invalid identity payload: "
+            f"{type(scheduler_info).__name__}."
+        )
+    return scheduler_info
 
 
 _memory_thresholds = _get_dask_memory_thresholds()
@@ -815,7 +856,13 @@ class DaskService:
             if self.client is not None:
                 try:
                     scheduler_summary = cluster_resource_summary_from_scheduler_info(
-                        self.client.scheduler_info(n_workers=-1)
+                        get_fresh_scheduler_info(
+                            self.client,
+                            timeout=_remaining_startup_time(
+                                startup_deadline,
+                                stage="querying the existing Scheduler",
+                            ),
+                        )
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1042,7 +1089,7 @@ class DaskService:
                 cleanup_deadline = time.monotonic() + _cluster_close_timeout()
                 if client is not None:
                     try:
-                        client.close(timeout=_remaining_shutdown_time(cleanup_deadline))
+                        client.close(timeout=_client_close_timeout(cleanup_deadline))
                     except Exception as close_exc:
                         cleanup_errors.append(close_exc)
                         logger.warning(
@@ -1094,7 +1141,7 @@ class DaskService:
         if active_client is None:
             raise RuntimeError("No live Dask client is available for resource inspection.")
         return cluster_resource_summary_from_scheduler_info(
-            active_client.scheduler_info(n_workers=-1)
+            get_fresh_scheduler_info(active_client)
         )
 
     def count_cpu_workers(self, client: Client | None = None) -> int:
@@ -1110,7 +1157,7 @@ class DaskService:
         active_client = client or self.get_client()
         if active_client is None:
             raise RuntimeError("No live Dask client is available for Worker diagnostics.")
-        scheduler_info = active_client.scheduler_info(n_workers=-1)
+        scheduler_info = get_fresh_scheduler_info(active_client)
         return {
             str(address): dict(worker_info.get("workflowDevice") or {})
             for address, worker_info in dict(
@@ -1148,12 +1195,18 @@ class DaskService:
                     expected_total_workers,
                     timeout=remaining,
                 )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Worker registration completed after the startup deadline."
+                    )
                 first = self.validate_cluster_topology(
                     expected_cpu_workers=expected_cpu_workers,
                     expected_gpu_workers=expected_gpu_workers,
                     expected_gpu_ids=expected_gpu_ids,
                     verify_device_isolation=True,
                     client=client,
+                    rpc_timeout=remaining,
                 )
 
                 remaining = deadline - time.monotonic()
@@ -1164,12 +1217,20 @@ class DaskService:
                     )
                     break
                 time.sleep(min(0.2, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_error = TransientClusterTopologyError(
+                        "Topology validated once but did not remain observable "
+                        "for the stability interval."
+                    )
+                    break
                 second = self.validate_cluster_topology(
                     expected_cpu_workers=expected_cpu_workers,
                     expected_gpu_workers=expected_gpu_workers,
                     expected_gpu_ids=expected_gpu_ids,
                     verify_device_isolation=True,
                     client=client,
+                    rpc_timeout=remaining,
                 )
                 if time.monotonic() > deadline:
                     last_error = TransientClusterTopologyError(
@@ -1208,13 +1269,15 @@ class DaskService:
         expected_gpu_ids: tuple[str, ...] | None = None,
         verify_device_isolation: bool = True,
         client: Client | None = None,
+        rpc_timeout: float | None = None,
     ) -> ClusterResourceSummary:
         active_client = client or self.get_client()
         if active_client is None:
             raise RuntimeError("No live Dask client is available for topology validation.")
-        # Client.scheduler_info() defaults to only five Workers. Topology and
-        # capacity checks must always inspect the complete heterogeneous pool.
-        scheduler_info = active_client.scheduler_info(n_workers=-1)
+        scheduler_info = get_fresh_scheduler_info(
+            active_client,
+            timeout=rpc_timeout,
+        )
         summary = cluster_resource_summary_from_scheduler_info(scheduler_info)
         membership_errors: list[str] = []
         contract_errors: list[str] = []
@@ -1338,7 +1401,7 @@ class DaskService:
             close_deadline = time.monotonic() + _cluster_close_timeout()
             if client:
                 try:
-                    client.close(timeout=_remaining_shutdown_time(close_deadline))
+                    client.close(timeout=_client_close_timeout(close_deadline))
                 except Exception as exc:
                     close_errors.append(exc)
                     logger.warning("Error closing client: %s", exc)

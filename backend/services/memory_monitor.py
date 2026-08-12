@@ -14,6 +14,8 @@ import os
 import time
 from typing import Any
 
+from services.dask_service import get_fresh_scheduler_info
+
 logger = logging.getLogger("WorkFlow.MemoryMonitor")
 
 
@@ -62,10 +64,17 @@ def _scheduler_worker_memory(
     }
 
 
-def query_worker_memory(client: Any) -> dict[str, dict[str, Any]]:
+def query_worker_memory(
+    client: Any,
+    *,
+    timeout_seconds: float = 10.0,
+) -> dict[str, dict[str, Any]]:
     """Return best-effort Worker RSS without executing code on Workers."""
     try:
-        scheduler_info = client.scheduler_info(n_workers=-1)
+        scheduler_info = get_fresh_scheduler_info(
+            client,
+            timeout=timeout_seconds,
+        )
         return {
             str(address): _scheduler_worker_memory(address, dict(info or {}))
             for address, info in dict(

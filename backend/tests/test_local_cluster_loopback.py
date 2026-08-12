@@ -169,6 +169,8 @@ def test_stop_cluster_reports_graceful_failure_after_emergency_cleanup(
         "cluster-close",
         "force-kill",
     ]
+    assert calls[0][1] <= 10.0
+    assert calls[1][1] > 40.0
 
 
 def test_stop_cluster_retains_poisoned_handles_when_child_exit_is_unconfirmed(
@@ -217,7 +219,7 @@ def test_stop_cluster_retains_poisoned_handles_when_child_exit_is_unconfirmed(
     assert service.active_gpu_ids == ()
 
 
-def test_real_eight_gpu_four_cpu_nannies_connect_over_loopback() -> None:
+def test_real_eight_gpu_six_cpu_nannies_validate_over_loopback() -> None:
     """Exercise the failing Windows topology without importing CUDA/PyTorch."""
     backend_dir = Path(__file__).resolve().parents[1]
     probe = Path(__file__).with_name("test_support_local_cluster_loopback_probe.py")
@@ -242,13 +244,15 @@ def test_real_eight_gpu_four_cpu_nannies_connect_over_loopback() -> None:
     result = json.loads(result_lines[-1].split("=", 1)[1])
 
     assert result["schedulerAddress"].startswith("tcp://127.0.0.1:")
-    assert len(result["workerAddresses"]) == 12
+    assert len(result["workerAddresses"]) == 14
+    assert result["validatedCpuWorkers"] == 6
+    assert result["validatedGpuWorkers"] == 8
     assert all(
         address.startswith("tcp://127.0.0.1:")
         for address in result["workerAddresses"]
     )
     roles = [entry["role"] for entry in result["taskResults"].values()]
-    assert roles.count("cpu") == 4
+    assert roles.count("cpu") == 6
     assert roles.count("gpu") == 8
     gpu_masks = sorted(
         entry["cudaVisibleDevices"]
