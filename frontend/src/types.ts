@@ -354,6 +354,8 @@ export type WSMessageType =
   | 'window_progress'
   | 'execution_control_ack'
   | 'cluster_ready'
+  | 'slurm_job_submitted'
+  | 'slurm_job_state'
   | 'subscribed'
   | 'ping'
   | 'pong';
@@ -363,6 +365,11 @@ export interface WSMessage {
   message?: string;
   taskId?: string;
   executionId?: string;
+  jobId?: string;
+  state?: string;
+  node?: string | null;
+  reason?: string | null;
+  resources?: Record<string, unknown>;
 
   runState?: RunState;
   waitingFor?: string[];

@@ -1,5 +1,9 @@
 import asyncio
+import ipaddress
+import os
 import uuid
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
@@ -9,15 +13,117 @@ from core.window_execution import (
     parse_execution_config,
     require_window_recovery_location,
 )
-from services.executor import execute_graph
+from services.execution_dispatcher import (
+    execute_graph,
+    uses_slurm_execution_backend,
+)
 from services.dask_service import dask_service
 
 router = APIRouter()
+
+_DEFAULT_ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:5174"
+
+
+def _origin_identity(value: str) -> tuple[str, str, int | None] | None:
+    """Normalize an HTTP Origin for exact allow-list comparison."""
+
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return None
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    return scheme, parsed.hostname.lower(), port
+
+
+def _host_authority(
+    value: str,
+    *,
+    origin_scheme: str,
+) -> tuple[str, int | None] | None:
+    """Normalize a Host header without trusting forwarded-host headers."""
+
+    try:
+        parsed = urlsplit(f"//{value.strip()}")
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    if (origin_scheme == "http" and port == 80) or (
+        origin_scheme == "https" and port == 443
+    ):
+        port = None
+    return parsed.hostname.lower(), port
+
+
+def _is_loopback_client(websocket: WebSocket) -> bool:
+    client = getattr(websocket, "client", None)
+    host = getattr(client, "host", "") if client is not None else ""
+    if str(host).lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(str(host)).is_loopback
+    except ValueError:
+        return False
+
+
+def _websocket_origin_allowed(websocket: WebSocket) -> bool:
+    headers = getattr(websocket, "headers", None)
+    origin = headers.get("origin") if headers is not None else None
+    if not origin:
+        # Browser clients always send Origin. Keep local health checks and CLI
+        # clients usable through the loopback-only control-plane endpoint,
+        # while denying a remote no-Origin bypass.
+        return _is_loopback_client(websocket)
+
+    origin_identity = _origin_identity(origin)
+    if origin_identity is None:
+        return False
+
+    host = headers.get("host") if headers is not None else None
+    host_authority = (
+        _host_authority(host, origin_scheme=origin_identity[0])
+        if host
+        else None
+    )
+    if host_authority == origin_identity[1:]:
+        return True
+
+    configured_origins = os.getenv(
+        "WorkFlow_ALLOWED_ORIGINS",
+        _DEFAULT_ALLOWED_ORIGINS,
+    )
+    allowed_identities = {
+        identity
+        for configured in configured_origins.split(",")
+        if (identity := _origin_identity(configured)) is not None
+    }
+    return origin_identity in allowed_identities
 
 
 @router.websocket("/ws/run")
 async def websocket_endpoint(websocket: WebSocket):
     client_ip = websocket.client.host if websocket.client else "unknown"
+
+    if not _websocket_origin_allowed(websocket):
+        headers = getattr(websocket, "headers", None)
+        origin = headers.get("origin") if headers is not None else None
+        logger.warning(
+            "Rejected WebSocket origin %r from %s.",
+            origin,
+            client_ip,
+        )
+        await websocket.close(code=1008, reason="WebSocket origin is not allowed.")
+        return
 
     # ========== accept 连接 ==========
     try:
@@ -42,13 +148,22 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # 1. 连接初始化
     try:
-        # 发送 Dask 服务状态
-        client = dask_service.get_client()
-        if client and websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_json({
-                "type": "log",
-                "message": f"[System] Dask Cluster Connected: {client.dashboard_link}"
-            })
+        # A Slurm control plane never owns the per-execution Dask cluster.
+        # The compute-node runner reports its cluster state through relayed
+        # execution events instead.
+        if uses_slurm_execution_backend():
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json({
+                    "type": "log",
+                    "message": "[System] Slurm execution control plane ready."
+                })
+        else:
+            client = dask_service.get_client()
+            if client and websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json({
+                    "type": "log",
+                    "message": f"[System] Dask Cluster Connected: {client.dashboard_link}"
+                })
     except Exception as e:
         logger.warning(f"WebSocket initialization failed for {client_ip}: {e}")
         state_manager.unsubscribe_client(websocket)

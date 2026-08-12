@@ -496,6 +496,27 @@ export const useFlowEngine = (
 
         const msgType = msg.type;
 
+        if (msgType === 'slurm_job_submitted') {
+          dispatchExecution({ type: 'SET_PHASE', phase: 'submitted' });
+          addLog(
+            msg.message || `Slurm job ${msg.jobId ?? ''} submitted.`,
+            'info',
+          );
+          return;
+        }
+
+        if (msgType === 'slurm_job_state') {
+          const state = (msg.state || 'UNKNOWN').toUpperCase();
+          if (state === 'PENDING' || state === 'CONFIGURING') {
+            dispatchExecution({ type: 'SET_PHASE', phase: 'submitted' });
+          }
+          addLog(
+            msg.message || `Slurm job ${msg.jobId ?? ''}: ${state}.`,
+            'info',
+          );
+          return;
+        }
+
         if (msgType === 'cluster_ready') {
           setDashboardUrl(normalizeDashboardUrl(msg.dashboardUrl));
           const cpuWorkers = Number.isSafeInteger(msg.cpuWorkers)

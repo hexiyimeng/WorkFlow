@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import subprocess
 import threading
 import time
 from typing import Any, BinaryIO, Iterator, Literal, Mapping, Sequence
@@ -46,6 +47,22 @@ ACTIVE_LOCK_FILENAME = "active.lock"
 ACTIVE_LOCK_SCHEMA_VERSION = 2
 ACTIVE_LOCK_GUARD_OFFSET = 1 << 20
 ACTIVE_LOCK_MUTATION_GUARD_FILENAME = ".active.guard"
+SLURM_COMMAND_TIMEOUT_SECONDS = 3.0
+
+_SLURM_JOB_ID_PATTERN = re.compile(r"[1-9][0-9]*\Z")
+_SLURM_TERMINAL_JOB_STATES = frozenset({
+    "BOOT_FAIL",
+    "CANCELLED",
+    "COMPLETED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "SPECIAL_EXIT",
+    "TIMEOUT",
+})
 
 ResumeAction = Literal["new", "resume", "restart"]
 RecoveryMode = Literal["output_sidecar", "custom"]
@@ -1118,6 +1135,97 @@ def _normalized_hostname() -> str:
     return socket.gethostname().strip().casefold()
 
 
+def _validated_slurm_job_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not _SLURM_JOB_ID_PATTERN.fullmatch(normalized):
+        return None
+    return normalized
+
+
+def _slurm_executable(environment_name: str, default: str) -> str | None:
+    value = os.environ.get(environment_name, default).strip()
+    if not value or any(character in value for character in "\x00\r\n"):
+        return None
+    return value
+
+
+def _run_slurm_status_command(
+    argv: Sequence[str],
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one bounded scheduler query without involving a command shell."""
+
+    try:
+        return subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=SLURM_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _slurm_job_owner_state(job_id: str) -> Literal["alive", "stale", "unknown"]:
+    """Classify a foreign Slurm owner only from authoritative scheduler state.
+
+    Absence from ``squeue`` is not proof that a job ended: it can also reflect
+    accounting delay or a scheduler/query failure.  Reclamation therefore
+    additionally requires the allocation row in ``sacct`` to report a known
+    terminal state.
+    """
+
+    squeue = _slurm_executable("WorkFlow_SLURM_SQUEUE", "squeue")
+    sacct = _slurm_executable("WorkFlow_SLURM_SACCT", "sacct")
+    if squeue is None or sacct is None:
+        return "unknown"
+
+    queue_result = _run_slurm_status_command((
+        squeue,
+        "--noheader",
+        "--jobs",
+        job_id,
+        "--format=%T",
+    ))
+    if queue_result is None or queue_result.returncode != 0:
+        return "unknown"
+    if any(line.strip() for line in queue_result.stdout.splitlines()):
+        return "alive"
+
+    accounting_result = _run_slurm_status_command((
+        sacct,
+        "--noheader",
+        "--parsable2",
+        "--jobs",
+        job_id,
+        "--format=JobIDRaw%40,State%40",
+    ))
+    if accounting_result is None or accounting_result.returncode != 0:
+        return "unknown"
+
+    allocation_states: list[str] = []
+    for raw_line in accounting_result.stdout.splitlines():
+        fields = raw_line.split("|")
+        if len(fields) < 2 or fields[0].strip() != job_id:
+            continue
+        state_text = fields[1].strip()
+        if not state_text:
+            return "unknown"
+        state = state_text.split(None, 1)[0].split("+", 1)[0].upper()
+        allocation_states.append(state)
+
+    if not allocation_states:
+        return "unknown"
+    if all(state in _SLURM_TERMINAL_JOB_STATES for state in allocation_states):
+        return "stale"
+    return "unknown"
+
+
 def _is_proven_local_filesystem(path: Path) -> bool:
     """Return true only for storage that is clearly local to this host."""
 
@@ -1189,17 +1297,16 @@ def _active_lock_owner_state(
         return "unknown"
 
     hostname = payload.get("hostname")
+    foreign_hostname = False
     if hostname is None:
         # Locks written by the previous format can be reclaimed only when the
         # storage itself proves that a remote host cannot own the PID.
         if not _is_proven_local_filesystem(lock_path):
             return "unknown"
-    elif (
-        not isinstance(hostname, str)
-        or not hostname.strip()
-        or hostname.strip().casefold() != _normalized_hostname()
-    ):
+    elif not isinstance(hostname, str) or not hostname.strip():
         return "unknown"
+    else:
+        foreign_hostname = hostname.strip().casefold() != _normalized_hostname()
 
     expected_create_time = payload.get("processCreateTime")
     if schema_version == ACTIVE_LOCK_SCHEMA_VERSION and (
@@ -1213,6 +1320,14 @@ def _active_lock_owner_state(
         or float(expected_create_time) <= 0
     ):
         return "unknown"
+
+    if foreign_hostname:
+        if schema_version != ACTIVE_LOCK_SCHEMA_VERSION:
+            return "unknown"
+        slurm_job_id = _validated_slurm_job_id(payload.get("slurmJobId"))
+        if slurm_job_id is None:
+            return "unknown"
+        return _slurm_job_owner_state(slurm_job_id)
 
     try:
         process = psutil.Process(pid)
@@ -1381,6 +1496,14 @@ class ActiveExecutionLock:
             "lockId": self._lock_id,
             "createdAt": datetime.now(timezone.utc).isoformat(),
         }
+        raw_slurm_job_id = os.environ.get("SLURM_JOB_ID")
+        if raw_slurm_job_id is not None:
+            slurm_job_id = _validated_slurm_job_id(raw_slurm_job_id)
+            if slurm_job_id is None:
+                raise RecoveryLockError(
+                    "SLURM_JOB_ID must contain a positive decimal job identifier."
+                )
+            payload["slurmJobId"] = slurm_job_id
 
         with _active_lock_mutation_guard(self.layout):
             if self.path.exists() and not _cleanup_stale_active_lock_unlocked(

@@ -10,7 +10,7 @@ from core.plugin_diagnostics import get_plugin_diagnostics
 from core.registry import get_node_info
 from core.state_manager import state_manager
 from services.dask_service import dask_service
-from services.executor import preflight_graph
+from services.execution_dispatcher import preflight_graph
 from services.plugin_loader import reload_all_plugins
 from services.recovery_service import (
     RecoveryRecordChangedError,

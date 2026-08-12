@@ -169,6 +169,9 @@ async def _run(graph: dict[str, object], recovery_path: Path, execution_id: str)
         raise RuntimeError(f"Plugin loading failed: {failed}")
     config = {
         "mode": "window",
+        # Terminal Writers expose one token element per source Dask block.
+        # A 1x1 token Window therefore executes one source block and produces
+        # four recoverable Windows for the default 512x512 / 256x256 fixture.
         "windowShape": [1, 1],
         "maxInFlightWindows": 1,
         "resumeAction": "new",

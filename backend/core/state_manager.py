@@ -1,10 +1,11 @@
 import asyncio
+import inspect
 import logging
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 
 from starlette.websockets import WebSocketState
 
@@ -90,8 +91,84 @@ class GlobalStateManager:
         self.client_execution_map: Dict = {}
         self._failed_execution_logs: deque = deque(maxlen=self.MAX_FAILED_EXECUTION_LOGS)
         self._lock = threading.RLock()
+        self._broadcast_observers: dict[
+            int,
+            tuple[str | None, Callable[[str, dict[str, Any]], Any]],
+        ] = {}
+        self._next_broadcast_observer_id = 1
         self.active_execution_id: Optional[str] = None
         self.active_task: Optional[asyncio.Task] = None
+
+    def register_broadcast_observer(
+        self,
+        observer: Callable[[str, dict[str, Any]], Any],
+        *,
+        execution_id: str | None = None,
+    ) -> int:
+        """Register a best-effort observer for execution wire events.
+
+        Observers are independent of WebSocket subscriptions and may be
+        synchronous or asynchronous.  The returned opaque integer is used to
+        remove exactly this registration.
+        """
+        if not callable(observer):
+            raise TypeError("broadcast observer must be callable")
+        if execution_id is not None and (
+            not isinstance(execution_id, str) or not execution_id.strip()
+        ):
+            raise ValueError("execution_id must be a non-empty string when provided")
+
+        with self._lock:
+            observer_id = self._next_broadcast_observer_id
+            self._next_broadcast_observer_id += 1
+            self._broadcast_observers[observer_id] = (execution_id, observer)
+        return observer_id
+
+    def remove_broadcast_observer(self, observer_id: int) -> bool:
+        """Remove a previously registered observer without affecting sockets."""
+        with self._lock:
+            return self._broadcast_observers.pop(observer_id, None) is not None
+
+    async def _notify_broadcast_observers(
+        self,
+        execution_id: str,
+        message_dict: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            observers = tuple(self._broadcast_observers.items())
+
+        for observer_id, (selected_execution_id, observer) in observers:
+            if (
+                selected_execution_id is not None
+                and selected_execution_id != execution_id
+            ):
+                continue
+            try:
+                result = observer(execution_id, dict(message_dict))
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    # Preserve cancellation of the workflow task itself.  A
+                    # callback that independently returns/raises cancellation
+                    # is merely a failed observer like any other.
+                    raise
+                logger.exception(
+                    "[StateManager] Broadcast observer %s cancelled itself for "
+                    "execution %s",
+                    observer_id,
+                    execution_id,
+                )
+            except Exception:
+                # Event spooling and other observers are observational.  A
+                # broken observer must never turn a valid workflow into a
+                # failed execution.
+                logger.exception(
+                    "[StateManager] Broadcast observer %s failed for execution %s",
+                    observer_id,
+                    execution_id,
+                )
 
     def create_execution(self, execution_id: str) -> ExecutionSession:
         with self._lock:
@@ -349,12 +426,18 @@ class GlobalStateManager:
         return entry
 
     async def broadcast(self, execution_id: str, message_dict: dict):
+        if "executionId" not in message_dict:
+            message_dict["executionId"] = execution_id
+        message_dict = dict(message_dict)
+
+        # Notify process-local observers even when no browser is connected.
+        # Compute-node runners use this path to durably spool progress for the
+        # login-node control plane.
+        await self._notify_broadcast_observers(execution_id, message_dict)
+
         session = self.executions.get(execution_id)
         if not session or not session.subscribers:
             return
-
-        if "executionId" not in message_dict:
-            message_dict["executionId"] = execution_id
 
         async def send_one(ws):
             try:

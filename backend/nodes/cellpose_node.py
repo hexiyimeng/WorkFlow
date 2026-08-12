@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from core.model_registry import list_models
+from core.model_registry import get_provider_model_dir, list_models
 from core.registry import register_node
 from nodes.base import BaseMapOverlapNode
 
@@ -79,9 +79,11 @@ def create_cellpose_model(model_ref: str, device: str):
 
 def validate_cellpose_model(model_ref: str, requested_name: str) -> None:
     if not Path(model_ref).exists():
+        configured_directory = get_provider_model_dir("cellpose")
         raise FileNotFoundError(
-            f"Cellpose model {requested_name!r} is not installed under "
-            "backend/models/cellpose."
+            f"Cellpose model {requested_name!r} is not installed in the "
+            f"configured Cellpose model directory {configured_directory}. "
+            "Configure the shared model root with WorkFlow_MODELS_DIR when needed."
         )
 
 
@@ -109,7 +111,8 @@ def cellpose_block(
     model_name = str(model_name or "").strip()
     if not model_name:
         raise ValueError(
-            "Cellpose requires a model selected from backend/models/cellpose."
+            "Cellpose requires a model selected from the configured shared "
+            "Cellpose model directory."
         )
 
     resources = ctx.resources or {}

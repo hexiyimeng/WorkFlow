@@ -60,6 +60,9 @@ export UV_CACHE_DIR
   .venv/bin/python -m compileall -q .
   .venv/bin/python -c \
     "import dask, distributed, fastapi, zarr; print('backend imports: OK')"
+  .venv/bin/python \
+    "$WORKFLOW_ROOT/deploy/hpc/validate_frontend_dist.py" \
+    "$WORKFLOW_ROOT/backend/dist"
 )
 
 if [[ -f "$MODEL_PATH" ]]; then

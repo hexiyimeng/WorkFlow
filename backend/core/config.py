@@ -217,7 +217,8 @@ class AppConfig:
 
     This module intentionally does not configure provider-specific model cache
     paths such as Cellpose, StarDist, SAM, etc. Model storage is handled by
-    core.model_registry using a generic provider layout:
+    core.model_registry using a generic provider layout beneath the configured
+    model root (``WorkFlow_MODELS_DIR``), which defaults to:
 
         backend/models/{provider}/
 

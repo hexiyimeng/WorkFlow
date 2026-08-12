@@ -9,6 +9,11 @@ from fastapi.responses import FileResponse, Response
 
 # 引入项目核心组件
 from services.dask_service import dask_service
+from services.execution_dispatcher import (
+    detach_execution_backend,
+    reconcile_execution_backend,
+    uses_slurm_execution_backend,
+)
 from services.plugin_loader import load_all_plugins
 from core.state_manager import ExecutionStatus, state_manager
 
@@ -17,6 +22,33 @@ from api.http_routes import router as http_router
 from api.websocket import router as ws_router
 
 from core.logger import logger
+
+
+def _direct_run_bind() -> tuple[str, int]:
+    """Return the explicit bind address used by ``python main.py``.
+
+    Direct execution is primarily a development and single-user entry point.
+    Defaulting it to loopback prevents an accidental unauthenticated network
+    exposure; deployments that intentionally use a reverse proxy can opt in to
+    another address with ``WORKFLOW_WEB_HOST``.
+    """
+
+    host = os.getenv("WORKFLOW_WEB_HOST", "127.0.0.1").strip()
+    if not host:
+        raise ValueError("WORKFLOW_WEB_HOST must not be empty.")
+
+    raw_port = os.getenv("WORKFLOW_WEB_PORT", "8000").strip()
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError(
+            "WORKFLOW_WEB_PORT must be an integer between 1 and 65535."
+        ) from exc
+    if port < 1 or port > 65535:
+        raise ValueError(
+            "WORKFLOW_WEB_PORT must be an integer between 1 and 65535."
+        )
+    return host, port
 
 
 # ==========================================
@@ -41,6 +73,40 @@ class TypedStaticFiles(StaticFiles):
 # ==========================================
 # 2. 生命周期管理 (lifespan)
 # ==========================================
+async def _shutdown_execution_runtime() -> None:
+    """Release process-local runtime resources without killing remote jobs."""
+    active_execution_id = state_manager.active_execution_id
+    active_task = state_manager.current_task
+
+    if uses_slurm_execution_backend():
+        # Cancelling only the local monitor task while the session remains
+        # RUNNING is intentionally different from cancel_execution(). The
+        # Slurm adapter interprets CANCELLING as an explicit user stop and
+        # would otherwise send scancel to a compute job during routine control
+        # plane maintenance.
+        if active_task is not None and not active_task.done():
+            if active_execution_id is not None:
+                detach_execution_backend(active_execution_id)
+            active_task.cancel()
+            await asyncio.gather(active_task, return_exceptions=True)
+        if active_execution_id is not None:
+            state_manager.clear_active_execution(active_execution_id)
+        return
+
+    # The local executor must persist interruption state and release its
+    # active.lock before Scheduler and Workers are stopped.
+    if active_execution_id is not None:
+        session = state_manager.get_execution(active_execution_id)
+        if session is not None and session.status in {
+            ExecutionStatus.RUNNING,
+            ExecutionStatus.CANCELLING,
+        }:
+            state_manager.cancel_execution(active_execution_id)
+    if active_task is not None and not active_task.done():
+        await asyncio.gather(active_task, return_exceptions=True)
+    await asyncio.to_thread(dask_service.stop_cluster)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时：初始化系统状态
@@ -76,31 +142,29 @@ async def lifespan(app: FastAPI):
 
     # A workflow's resource plan determines its Worker topology. Starting a
     # fixed pool here would happen before any DAG is available.
-    state_manager.add_log(
-        "Dask Cluster will start when a workflow is executed.",
-        "info",
-    )
-    logger.info("Dask cluster startup deferred until workflow execution.")
+    if uses_slurm_execution_backend():
+        startup_message = (
+            "Slurm control plane ready; compute resources will be requested "
+            "from each workflow Graph."
+        )
+    else:
+        startup_message = "Dask Cluster will start when a workflow is executed."
+    state_manager.add_log(startup_message, "info")
+    logger.info(startup_message)
+
+    if uses_slurm_execution_backend():
+        reconciled_execution_id = await reconcile_execution_backend()
+        if reconciled_execution_id is not None:
+            logger.info(
+                "Reattached Slurm execution %s after control-plane restart.",
+                reconciled_execution_id,
+            )
 
     try:
         yield
     finally:
-        # Let the executor persist interrupted recovery state, release its
-        # active.lock, and finish Future cleanup while the cluster is still
-        # available. Only then tear down Scheduler and Workers.
         state_manager.add_log("<<< Backend Shutting down...", "warning")
-        active_execution_id = state_manager.active_execution_id
-        active_task = state_manager.current_task
-        if active_execution_id is not None:
-            session = state_manager.get_execution(active_execution_id)
-            if session is not None and session.status in {
-                ExecutionStatus.RUNNING,
-                ExecutionStatus.CANCELLING,
-            }:
-                state_manager.cancel_execution(active_execution_id)
-        if active_task is not None and not active_task.done():
-            await asyncio.gather(active_task, return_exceptions=True)
-        await asyncio.to_thread(dask_service.stop_cluster)
+        await _shutdown_execution_runtime()
 
 
 # ==========================================
@@ -162,5 +226,6 @@ if __name__ == "__main__":
     # 在 Windows 上设置 MALLOC_TRIM_THRESHOLD_ 环境变量（虽然主要针对 Linux 内存回收）
     os.environ["MALLOC_TRIM_THRESHOLD_"] = "0"
 
-    # 运行服务
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 运行服务。默认仅监听 loopback；网络暴露必须显式配置。
+    web_host, web_port = _direct_run_bind()
+    uvicorn.run(app, host=web_host, port=web_port)
