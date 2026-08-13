@@ -544,7 +544,7 @@ class ZarrWriter(BaseMapBlocksNode):
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr Writer"
     EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 2
+    EXECUTION_WORKERS = 6
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_path"
 

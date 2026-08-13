@@ -1410,23 +1410,42 @@ def _active_lock_owner_state(
             lock_created_at=payload["createdAt"],
         )
 
+    slurm_job_id = (
+        _validated_slurm_job_id(payload.get("slurmJobId"))
+        if schema_version == ACTIVE_LOCK_SCHEMA_VERSION
+        else None
+    )
+
+    local_process_state = "alive"
     try:
         process = psutil.Process(pid)
         if process.status() == psutil.STATUS_ZOMBIE:
-            return "stale"
-        actual_create_time = process.create_time()
+            local_process_state = "stale"
+        else:
+            actual_create_time = process.create_time()
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return "stale"
+        local_process_state = "stale"
     except (psutil.AccessDenied, OSError):
         return "unknown"
+    else:
+        if local_process_state != "stale" and (
+            expected_create_time is not None
+            and abs(actual_create_time - float(expected_create_time)) > 1e-3
+        ):
+            # The PID has been reused by a different process.
+            local_process_state = "stale"
+        elif local_process_state != "stale":
+            return "alive"
 
-    if (
-        expected_create_time is not None
-        and abs(actual_create_time - float(expected_create_time)) > 1e-3
-    ):
-        # The PID has been reused by a different process.
-        return "stale"
-    return "alive"
+    # A service-node Driver may die while its separately allocated Slurm
+    # Workers are still writing.  Local PID death alone must not reclaim that
+    # lock; scheduler state remains the final ownership authority.
+    if slurm_job_id is not None:
+        return _slurm_job_owner_state(
+            slurm_job_id,
+            lock_created_at=payload["createdAt"],
+        )
+    return "stale"
 
 
 def _try_lock_active_handle(handle: BinaryIO) -> bool:
@@ -1578,6 +1597,8 @@ class ActiveExecutionLock:
             "createdAt": datetime.now(timezone.utc).isoformat(),
         }
         raw_slurm_job_id = os.environ.get("SLURM_JOB_ID")
+        if raw_slurm_job_id is None:
+            raw_slurm_job_id = os.environ.get("WorkFlow_SLURM_WORKER_JOB_ID")
         if raw_slurm_job_id is not None:
             slurm_job_id = _validated_slurm_job_id(raw_slurm_job_id)
             if slurm_job_id is None:

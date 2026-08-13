@@ -22,9 +22,9 @@ async def preflight_graph(
 ) -> dict[str, Any]:
     """Run read-only graph preflight for the selected execution backend.
 
-    A Slurm control plane has no local Dask cluster to compare with.  Instead,
-    validate the Graph-derived Worker counts against the configured single-node
-    Slurm policy without creating a runtime directory or submitting a job.
+    A Slurm control plane has no active Dask cluster during preflight. Instead,
+    validate Graph-derived Worker counts against the configured multi-node
+    placement policy without creating a Scheduler, directory, or Slurm job.
     """
     result = await preflight_graph_locally(graph, execution_config)
     if not uses_slurm_execution_backend():
@@ -64,16 +64,15 @@ async def execute_graph(
 
 
 async def reconcile_execution_backend() -> str | None:
-    """Reattach durable remote monitoring after a control-plane restart."""
+    """Cancel orphan Workers left by a dead service-node Driver."""
     if not uses_slurm_execution_backend():
         return None
     return await slurm_execution_service.reconcile_active_job()
 
 
 def detach_execution_backend(execution_id: str) -> None:
-    """Detach a remote monitor during process shutdown without cancelling it."""
-    if uses_slurm_execution_backend():
-        slurm_execution_service.request_monitor_detach(execution_id)
+    """Deprecated: a local Driver cannot detach while remote Workers continue."""
+    del execution_id
 
 
 __all__ = [

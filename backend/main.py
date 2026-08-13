@@ -10,7 +10,6 @@ from fastapi.responses import FileResponse, Response
 # 引入项目核心组件
 from services.dask_service import dask_service
 from services.execution_dispatcher import (
-    detach_execution_backend,
     reconcile_execution_backend,
     uses_slurm_execution_backend,
 )
@@ -74,23 +73,21 @@ class TypedStaticFiles(StaticFiles):
 # 2. 生命周期管理 (lifespan)
 # ==========================================
 async def _shutdown_execution_runtime() -> None:
-    """Release process-local runtime resources without killing remote jobs."""
+    """Stop the local Driver and prove remote Workers terminal before exit."""
     active_execution_id = state_manager.active_execution_id
     active_task = state_manager.current_task
 
     if uses_slurm_execution_backend():
-        # Cancelling only the local monitor task while the session remains
-        # RUNNING is intentionally different from cancel_execution(). The
-        # Slurm adapter interprets CANCELLING as an explicit user stop and
-        # would otherwise send scancel to a compute job during routine control
-        # plane maintenance.
+        # The Driver lives in this service process. It is unsafe to detach its
+        # task and leave compute-node Workers running without an owner.
         if active_task is not None and not active_task.done():
-            if active_execution_id is not None:
-                detach_execution_backend(active_execution_id)
+            # This is an interruption, not a user Stop request. The service
+            # controller consumes the cancellation only long enough to
+            # scancel/confirm its Worker allocation and close the Scheduler.
             active_task.cancel()
             await asyncio.gather(active_task, return_exceptions=True)
-        if active_execution_id is not None:
-            state_manager.clear_active_execution(active_execution_id)
+        elif dask_service.get_client() is not None:
+            await asyncio.to_thread(dask_service.stop_cluster)
         return
 
     # The local executor must persist interruption state and release its

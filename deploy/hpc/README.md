@@ -1,217 +1,133 @@
-# WorkFlow 的 Slurm 部署方式
+# WorkFlow 的 Slurm 多节点部署
 
-生产部署分为控制面和计算作业两部分。Uvicorn/FastAPI 是常驻的轻量控制面；
-Dask Scheduler、Nanny 和 Worker 只在 Slurm 分配的 compute node 上启动。
+## 最终进程位置与生命周期
+
+WorkFlow 在 HPC 上分成“服务进程”和“按工作流申请的计算资源”，两者不能混在一起：
 
 ```text
-浏览器
-  │ SSH 隧道
-  ▼
-登录/服务节点：Uvicorn 控制面（127.0.0.1）
-  │ Graph JSON → 资源计划 → 动态 sbatch
-  ▼
-单个 compute node：execution runner → Dask Scheduler + CPU/GPU Workers
+浏览器（SSH loopback 隧道）
+  ↓
+登录/管理/专用 service node
+  ├─ Uvicorn/FastAPI：常驻
+  ├─ workflow Driver：在一次执行期间运行
+  └─ Dask Scheduler：有工作流时按需启动，执行结束立即关闭
+       ↓ TCP/TLS（集群内网）
+Slurm allocation（由当前 Graph 的 resourcePlan 动态决定）
+  ├─ compute node 0：一个 Worker agent → CPU/GPU Nannies/Workers
+  ├─ compute node 1：一个 Worker agent → CPU/GPU Nannies/Workers
+  └─ ...
 ```
 
-控制面不会预先申请固定的 CPU、内存或 GPU。每次正式执行前，后端根据该次
-Graph JSON 的资源计划构造独立的 `sbatch` 请求。普通 Full Graph 与 Window
-执行使用同一套作业隔离方式；恢复执行仍从恢复目录中的不可变图和配置启动。
+因此 Scheduler **不是常驻服务**。常驻的只有 Web 项目主进程；每次正式执行才在同一服务进程中建立一个 Scheduler，等待 Slurm 分配的 compute-node Workers 注册，Driver 再提交当前图。执行成功、失败或取消后，Worker allocation 被取消，Scheduler 被关闭。
 
-## 集群前提与管理员许可
+只有 Nanny/Worker 进程运行在 compute node（CN）。Driver 不在 CN 执行，Uvicorn 也不通过 `sbatch` 启动。应用一次只允许一个正式 execution，所以可以使用一个固定 Scheduler 端口。
 
-开始部署前应由集群管理员确认：
+## Slurm 怎样申请一个或多个 CN
 
-- 允许在登录节点长期运行轻量 Web 服务；如果禁止，应将控制面部署在指定的
-  management/service node，或由管理员提供 systemd/容器服务。
-- 控制面账号可以执行 `sbatch`、查询和取消自己提交的作业。
-- 代码目录和 runtime 目录是 compute node 可见的共享绝对路径。
-- Slurm GRES 已正确配置 GPU，并在作业内设置 `CUDA_VISIBLE_DEVICES`。
-- 允许用户通过 SSH 将控制面的 loopback 端口转发到客户端。
+后端只分析当前 terminal outputs 可达的 Graph 节点。节点类通过 `EXECUTION_RESOURCE` 和 `EXECUTION_WORKERS` 声明 CPU/GPU Worker 需求。资源策略把全图 Worker 总数装箱到最少的可行节点数：
 
-控制面只监听 `127.0.0.1`，不应直接暴露到集群网络。这里的脚本不会生成、
-安装或修改任何 SSH 密钥，也不需要从登录节点 SSH 到 compute node。
+1. 先尝试一个 CN。
+2. 如果该节点的 GPU、CPU 或内存容量装不下，就依次尝试 2、3……个 CN。
+3. 节点数不能超过 `WorkFlow_SLURM_MAX_NODES`，每个节点不能超过配置的 per-node envelope。
+4. 找到布局后，提交一个包含 N 个节点的 Slurm allocation。
+5. `srun --ntasks-per-node=1` 在每个已分配 CN 上启动一个 Worker agent；agent 按持久化布局启动该节点应有的 CPU/GPU Workers。
 
-当前正式执行仍是**单节点 Dask**：一次 execution 的 Scheduler 和全部 Workers
-位于同一个 Slurm compute node。`workflow_execution.sbatch` 固定的是单节点
-拓扑（`--nodes=1 --ntasks=1`），但没有写死 CPU、GPU、内存或时限。若一个图
-超出单节点容量，作业会等待合适节点或被 Slurm 拒绝；跨节点 Dask 尚未实现。
+Slurm 19.05 的 `--gres=gpu:N` 是同构的每节点申请。若最后一个节点只需较少 GPU，allocation 可能保守地多申请少量 GPU，但 Worker agent 不会把多余设备暴露给任何任务。例如 10 个 GPU Workers、每节点最多 4 张卡会形成逻辑布局 `4 + 3 + 3`，Slurm 同构申请为 3 个节点、每节点 4 张卡。
 
-## 安装或更新
+Graph 不能注入任意 `sbatch` 参数。partition、时限和容量均由管理员环境变量控制。若在 `MAX_NODES` 内仍装不下，preflight/提交会明确失败；不会把 Worker 回退到服务节点。
 
-默认目录：
+## 集群前提
 
-- 代码：`$HOME/apps/WorkFlow`
-- 运行数据、模型、输出和恢复记录：`$HOME/workflow-runtime`
-- Python 环境：`$HOME/apps/WorkFlow/backend/.venv`
+部署前由管理员确认：
 
-`workflow-runtime` 是代码仓库之外、compute node 也能访问的共享运行目录。常见
-子目录用途如下：
+- 允许在指定登录/管理节点运行轻量 Web 服务和 workflow Driver；若登录节点不允许守护进程，必须改用管理员批准的 service node/systemd/容器服务。
+- 服务账号可执行 `sbatch`、`srun`、`squeue`、`scontrol` 和 `scancel`。
+- checkout 与 `$HOME/workflow-runtime` 是所有目标 CN 可见的共享绝对路径。
+- CN 能解析并连接 `WorkFlow_DASK_SCHEDULER_HOST:WorkFlow_DASK_SCHEDULER_PORT`。
+- 服务节点与 CN 之间允许配置的 Worker/Nanny TCP 端口范围；多节点之间也允许 Dask 所需流量。
+- Slurm GRES 正确设置每个 job step 的 `CUDA_VISIBLE_DEVICES`。
+- 站点的 partition/account/QoS 允许所配置的节点、CPU、内存和 GPU 数量。
 
-- `data/demo_images.zip`：仅是 `prepare_test_data.sh` 下载的 Cellpose 官方示例
-  压缩包缓存，供端到端 smoke test 使用；它不是生产输入，也不是 Zarr 输出。
-  测试脚本从压缩包读取 PNG，并在本次 `test-runs/<UUID>/` 中建立真正的 Zarr。
-- `models/`：共享模型缓存。HPC 作业通过 `WorkFlow_MODELS_DIR` 使用这里的模型，
-  因而模型不会随代码更新被删除，也不必在每个 compute node 或 `backend/` 下
-  重复保存。Cellpose 的默认文件是 `models/cellpose/cpsam`。
-- `test-runs/`：仅保存集成 smoke test 的一次性输入、Zarr/Parquet 输出、恢复记录
-  和结果摘要；正常页面执行不会把生产输出自动放到这里。不再需要某次测试时，
-  可在确认对应 Slurm 作业已经结束后删除选定的 UUID 子目录。
-- `output/` 与 `recovery/`：正式执行可使用的默认输出/恢复根目录；不要把它们与
-  `test-runs/` 一并清理。
-- `requests/`、`jobs/`、`state/`、`logs/`：控制面与 compute job 之间的请求、
-  状态、事件和日志记录。
+Web 端口仍只监听 `127.0.0.1`，从外部通过 SSH loopback 隧道访问。Scheduler 地址则必须是 CN 可达的服务节点 IPv4 地址或 DNS 名，不能是 `127.0.0.1`、`localhost`、`0.0.0.0` 或 wildcard。
 
-在 Slurm submit host 上运行：
+## 安全边界
+
+Dask Scheduler 跨节点通信不应暴露到公网或非可信共享网络。生产环境应同时使用：
+
+- 网络 ACL/防火墙，仅允许本服务节点与本账户 Slurm CN 访问 Scheduler、Worker、Nanny 端口；
+- Dask mutual TLS，CA、证书和私钥由集群管理员提供并轮换；
+- 共享 request/job 目录权限为用户私有。
+
+TLS 文件配置必须三项同时存在：
+
+```bash
+export WorkFlow_DASK_TLS_CA=/absolute/private/dask-ca.pem
+export WorkFlow_DASK_TLS_CERT=/absolute/private/dask-service.pem
+export WorkFlow_DASK_TLS_KEY=/absolute/private/dask-service.key
+```
+
+启动脚本会拒绝缺项、相对路径、symlink 或不可读文件。证书文件“已配置”不等于 mTLS 已验收；必须在实际 deployment 中确认 Scheduler 地址为 `tls://`，并完成 Worker 注册和计算测试。
+
+当前目标集群尚未提供并实测 mTLS 证书。只在管理员确认的可信隔离内网和严格 ACL 下进行临时验收时，才可显式使用：
+
+```bash
+export WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1
+```
+
+该开关不会让明文 TCP 变安全，生产环境不应依赖它。
+
+## 安装与 runtime 目录
+
+默认路径：
+
+- checkout：`$HOME/apps/WorkFlow`
+- Python：`$HOME/apps/WorkFlow/backend/.venv`
+- 共享 runtime：`$HOME/workflow-runtime`
+
+安装或更新：
 
 ```bash
 bash "$HOME/apps/WorkFlow/deploy/hpc/install.sh"
 ```
 
-代码和 runtime 必须使用 compute node 也能访问的共享文件系统路径。安装过程会
-核验仓库已经包含 `backend/dist/index.html` 以及该页面引用的所有本地静态资源；
-集群节点不需要安装 Node.js，也不会在生产安装时临时构建前端。
+`workflow-runtime` 与源码分开，原因是模型、输入、输出和恢复记录需要跨代码升级保留且被 CN 共享：
 
-## 启动控制面
+- `data/demo_images.zip`：`prepare_test_data.sh` 下载的 Cellpose 示例 PNG 压缩包，只是测试输入缓存，不是 Zarr 输出。
+- `models/`：共享模型缓存，如 `models/cellpose/cpsam`。大模型不应随 backend 源码更新重复下载。
+- `test-runs/`：smoke/probe 的一次性输入、Zarr/Parquet 输出、日志和结果；不是页面运行的默认生产输出。
+- `jobs/`、`requests/`、`state/`、`logs/`：Driver 与 Slurm Worker allocation 的持久化控制记录。
+- `output/`、`recovery/`：正式执行可使用的输出与 Window recovery 根目录。
 
-脚本以前台方式启动，不会自行转入后台：
+## 必要配置
 
-```bash
-cd "$HOME/apps/WorkFlow"
-WorkFlow_SLURM_PARTITION=compute \
-  bash deploy/hpc/start_control_plane.sh
-```
-
-默认监听 `127.0.0.1:8000`。可配置项示例：
+下面是一个站点配置示例，具体容量必须由管理员根据 partition 实际节点填写：
 
 ```bash
-WORKFLOW_RUNTIME_DIR=/shared/song/workflow-runtime \
-WORKFLOW_WEB_PORT=8000 \
-WorkFlow_SLURM_PARTITION=compute \
-WorkFlow_SLURM_TIME_LIMIT=1-00:00:00 \
-  bash /shared/song/apps/WorkFlow/deploy/hpc/start_control_plane.sh
+export WorkFlow_SLURM_PARTITION=compute
+export WorkFlow_SLURM_MAX_NODES=8
+export WorkFlow_SLURM_CPUS_PER_NODE=64
+export WorkFlow_SLURM_GPUS_PER_NODE=8
+export WorkFlow_SLURM_MEMORY_GIB_PER_NODE=512
+
+# 必填：必须从 compute node 可解析、可达，不能写 localhost。
+export WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example
+export WorkFlow_DASK_SCHEDULER_PORT=8786
+export WorkFlow_DASK_WORKER_PORT_RANGE=20000:20999
+export WorkFlow_DASK_NANNY_PORT_RANGE=21000:21999
 ```
 
-`start_control_plane.sh` 设置：
+默认值为 `MAX_NODES=8`、`CPUS_PER_NODE=64`、`GPUS_PER_NODE=8`、`MEMORY_GIB_PER_NODE=512`、Scheduler 端口 `8786`、Worker 端口 `20000:20999`、Nanny 端口 `21000:21999`。`WorkFlow_DASK_SCHEDULER_HOST` 没有默认值，必须显式设置。
+每个端口范围的宽度至少要覆盖“单个 CN 上可能启动的最大 Worker 数”，不同 CN 可以复用同一范围。
 
-- `WorkFlow_EXECUTION_BACKEND=slurm`
-- `WorkFlow_SLURM_EXECUTION_SCRIPT=<repo>/deploy/hpc/slurm/workflow_execution.sbatch`
-- `WorkFlow_SLURM_RUNTIME_DIR=<runtime>`
-
-partition、时限以及 CPU/GPU/内存上限应通过环境或管理员配置提供，而不是重新在
-生产 `.sbatch` 文件里写死资源。当前版本使用提交账号的默认 account/QoS；若站点
-强制要求显式 account 或 QoS，应先在后端增加经过 allowlist 校验的显式策略参数，
-不要通过 `SBATCH_*` 环境变量绕过资源策略。需要长期常驻时，可在
-管理员许可下使用 tmux 或由管理员创建服务；脚本本身始终保持前台生命周期。
-
-管理员允许用户级 `tmux` 常驻时，可以用只管理 Web 控制面的辅助脚本；它不会申请
-Slurm 资源，也不会在登录节点启动 Dask：
-
-```bash
-bash "$HOME/apps/WorkFlow/deploy/hpc/control_plane.sh" start
-bash "$HOME/apps/WorkFlow/deploy/hpc/control_plane.sh" status
-bash "$HOME/apps/WorkFlow/deploy/hpc/control_plane.sh" logs
-```
-
-修改了 Slurm 策略环境变量后，应执行 `control_plane.sh restart`，使新的控制面进程读取
-这些设置。若站点禁止登录节点常驻进程，必须改由管理员批准的 service node 或系统服务
-托管，不能用 `tmux` 绕过站点规定。
-
-## 从客户端访问
-
-先在客户端按照集群指南连接 OpenVPN，再建立 SSH 本地端口转发。VPN 配置文件、
-私钥和口令都属于敏感凭据，不要复制到仓库、日志或聊天中；不用页面时应关闭
-VPN。以下是西丽集群管理/登录节点的示例（替换实际账号）：
-
-```bash
-ssh -N \
-  -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=30 \
-  -o ServerAliveCountMax=3 \
-  -L 127.0.0.1:8000:127.0.0.1:8000 \
-  cluster-user@10.200.201.2
-```
-
-然后打开 `http://127.0.0.1:8000`。如果设置了其他 `WORKFLOW_WEB_PORT`，隧道
-远端端口必须一致；本地端口可以换成空闲端口，例如使用
-`-L 127.0.0.1:18000:127.0.0.1:8000` 后访问 `http://127.0.0.1:18000`。
-
-不要把 `-L` 的本地监听地址或 Uvicorn 的监听地址改成 `0.0.0.0`。这套服务目前
-不是可以直接公开到互联网的多用户认证网关。如果需要多人长期访问，应由集群
-管理员在 service node 前部署带 TLS 和身份认证的反向代理，而不是开放 8000
-端口。直接运行 `python backend/main.py` 时也默认监听 `127.0.0.1:8000`；只有
-经过安全评审的部署才应显式设置 `WORKFLOW_WEB_HOST` 和 `WORKFLOW_WEB_PORT`。
-
-## 每次执行时发生什么
-
-1. 控制面读取当前 Graph JSON，并完成只读 preflight 和资源分析。
-2. 后端在共享 runtime 中原子写入本次 execution request。
-3. 后端用计算出的 CPU/GPU/内存参数调用 `sbatch --export=NONE`，并将 request
-   文件和 runtime 目录作为绝对位置参数传给
-   `slurm/workflow_execution.sbatch`。
-4. Slurm 分配 compute node 后，脚本设置模型目录、作业级 Dask scratch 和
-   Slurm 管理的 CUDA 可见性，并将执行后端明确切回 `local` 以防止嵌套提交，
-   然后启动
-   `python -m services.slurm_execution_runner`。
-5. runner 在 compute node 内建立本地 Dask Scheduler/Workers，执行结束后退出，
-   Slurm 随即释放资源。控制面不会在登录节点建立 Dask 集群。
-
-`workflow_execution.sbatch` 应只由后端提交。手工调试时也必须由 `sbatch`
-动态提供资源，并保证工作目录是仓库根目录，例如：
-
-```bash
-sbatch --export=NONE \
-  --chdir="$HOME/apps/WorkFlow" \
-  --cpus-per-task=8 --mem=128G --gres=gpu:1 --time=01:00:00 \
-  "$HOME/apps/WorkFlow/deploy/hpc/slurm/workflow_execution.sbatch" \
-  /shared/song/workflow-runtime/jobs/example-execution/request.json \
-  /shared/song/workflow-runtime \
-  8 64 \
-  "$(command -v squeue)" \
-  "$(command -v sacct || printf '%s' '-')" \
-  "$(command -v scontrol)"
-```
-
-上面的资源和 Worker 内存数字只是一次手工调试请求，不是生产默认值。正常
-运行时由 Graph 资源计划与管理员策略生成这些参数。CPU/GPU Worker 内存上限
-会显式传入 compute job，避免 Dask 误把整台物理节点内存当成本次 allocation
-可用内存。
-
-`sacct` 是可选的终态历史来源。旧集群未运行 `slurmdbd` 时，控制面不会因
-`sacct: Connection refused` 而停止：它优先读取 Slurm 19.05 已支持的
-`scontrol show job -o` 根作业记录。若控制器已按 `MinJobAge` 清除了记录，
-则只在两次精确 `squeue` 查询均成功且持续找不到同一根 job、同时没有 runner
-的原子 `result.json` 后，才把作业判为丢失并失败结束。任何命令错误、错误 job
-编号、歧义输出或明确的非终态记录都会继续保持 active，避免误回收正在运行的
-Window recovery lock。
-
-## Graph 如何决定 Worker 和 Slurm 资源
-
-资源分析只遍历 terminal output 可达的节点。每个节点类型通过
-`EXECUTION_RESOURCE` 声明 `cpu`、`gpu` 或 `any`，并通过
-`EXECUTION_WORKERS` 向相应共享 Worker 池贡献数量：
+全局上限和每 Worker 换算仍可配置：
 
 ```text
-cpuWorkers = 所有可达 cpu/any 节点贡献数量之和
-gpuWorkers = 所有可达 gpu 节点贡献数量之和
-Slurm GPU  = gpuWorkers（每个 GPU Worker 只看一张获配 GPU）
-Slurm CPU  = base + cpuWorkers × cpu配额 + gpuWorkers × gpu配额
-Slurm 内存 = base + cpuWorkers × cpu内存 + gpuWorkers × gpu内存
-```
-
-因此，当前一个 Cellpose 节点声明 1 个 GPU Worker，它不会仅因为节点上物理
-存在 8 张卡就自动申请 8 张卡；只有 Graph 资源计划实际得到 8 个 GPU Worker
-时才会生成 `--gres=gpu:8`。`maxInFlightWindows` 是执行背压设置，不会偷偷改变
-Slurm 资源申请。这样可以避免普通小图无条件占满整台 GPU 节点。
-
-资源换算属于管理员策略，不由 Graph 注入任意 `sbatch` 参数。主要环境项为：
-
-```text
-WorkFlow_SLURM_PARTITION
+WorkFlow_SLURM_ALLOWED_PARTITIONS
 WorkFlow_SLURM_TIME_LIMIT
 WorkFlow_SLURM_BASE_CPUS
+WorkFlow_SLURM_BASE_MEMORY_GIB
 WorkFlow_SLURM_CPUS_PER_CPU_WORKER
 WorkFlow_SLURM_CPUS_PER_GPU_WORKER
-WorkFlow_SLURM_BASE_MEMORY_GIB
 WorkFlow_SLURM_CPU_WORKER_MEMORY_GIB
 WorkFlow_SLURM_GPU_WORKER_MEMORY_GIB
 WorkFlow_SLURM_MAX_CPU_WORKERS
@@ -221,59 +137,89 @@ WorkFlow_SLURM_MAX_GPUS
 WorkFlow_SLURM_MAX_MEMORY_GIB
 ```
 
-控制面会在提交前检查这些上限；超出单节点策略时明确拒绝，而不是把 Worker
-放到登录节点，也不会伪装成已经支持多节点 Dask。
+全局 `MAX_CPUS/MAX_GPUS/MAX_MEMORY_GIB` 限制整个 execution；per-node 变量定义单个 CN 装箱容量。生产 Worker launcher 是：
 
-## 固定资源 smoke tests
-
-以下脚本故意保留固定资源，仅用于验证集群 CUDA 和端到端测试；它们不是
-生产服务器或正式 execution 的提交入口。
-
-真实多 Worker 进程 smoke test（资源由 Worker 数量动态计算）：
-
-```bash
-# 两个 CPU Worker，不申请 GPU
-bash "$HOME/apps/WorkFlow/deploy/hpc/submit_multi_worker_smoke.sh" 2 0
-
-# 两个 CPU Worker + 两个 GPU Worker，动态申请两张 GPU
-bash "$HOME/apps/WorkFlow/deploy/hpc/submit_multi_worker_smoke.sh" 2 2
+```text
+WorkFlow_SLURM_EXECUTION_SCRIPT=<repo>/deploy/hpc/slurm/workflow_workers.sbatch
 ```
 
-这个提交器固定单 compute node，但不在 `.sbatch` 中写死 CPU、GPU 或内存；
-它根据测试参数生成 `--cpus-per-task`、`--mem` 和（需要时）`--gres=gpu:N`。
-作业会通过生产 `DaskService` 启动指定数量的真实 Nanny/Worker 进程，将一个
-确定性计算任务精确绑定到每个 Worker，并验证地址、PID、主机和资源角色均
-正确且唯一。只要 GPU Worker 数大于零，每个 GPU Worker 还必须实际执行一个
-PyTorch CUDA kernel，并且只能看到一张获配 GPU；CPU-only 测试结果会明确记录
-`cudaComputeValidated=false`，不能作为 CUDA 验证结果。日志位于
-`workflow-runtime/logs/multi-worker-smoke-<jobId>.log`，机器可读结果位于
-`workflow-runtime/test-runs/multi-worker-smoke-<jobId>.json`。
+不要再将旧的 `workflow_execution.sbatch` 用作正式页面执行入口；它把 Driver/Scheduler 放入 CN，与本架构不符。
 
-这组手工 smoke 参数只验证集群进程拓扑。页面正式执行仍然由 Graph 的
-`resourcePlan` 自动决定 Worker 数量并通过同一 `DaskService` 启动，不会读取
-smoke test 的 Worker 参数。
+## 启动控制面
 
-GPU smoke test：
+配置环境变量后启动：
 
 ```bash
-mkdir -p "$HOME/workflow-runtime/logs"
-sbatch \
-  --output="$HOME/workflow-runtime/logs/gpu-smoke-%j.log" \
-  --chdir="$HOME/apps/WorkFlow" \
-  "$HOME/apps/WorkFlow/deploy/hpc/slurm/gpu_smoke.sbatch"
+cd "$HOME/apps/WorkFlow"
+WorkFlow_SLURM_SACCT='' \
+WorkFlow_SLURM_PARTITION=compute \
+WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example \
+WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1 \
+  bash deploy/hpc/control_plane.sh restart
 ```
 
-真实图像 Window 集成 smoke test：
+上例 `ALLOW_INSECURE_CLUSTER=1` 只适合目标集群当前无证书的受控验收；生产应替换为 TLS 三文件。`control_plane.sh` 对 tmux 环境使用显式 allowlist，并会先 unset 所有受管变量，因此操作者取消某个变量后，旧 tmux server 不会偷偷恢复它。
+
+检查：
 
 ```bash
-bash "$HOME/apps/WorkFlow/deploy/hpc/prepare_test_data.sh"
-sbatch \
-  --output="$HOME/workflow-runtime/logs/integration-%j.log" \
-  --chdir="$HOME/apps/WorkFlow" \
-  "$HOME/apps/WorkFlow/deploy/hpc/slurm/integration_smoke.sbatch"
+bash deploy/hpc/control_plane.sh status
+curl -fsS http://127.0.0.1:8000/plugin_status
+bash deploy/hpc/control_plane.sh logs
 ```
 
-集成 smoke test 执行 OME-Zarr Reader → Cellpose → Zarr Writer + Parquet
-Writer。Writer 的 terminal token 网格是一块输入 Dask block 对应一个元素；测试
-使用 `windowShape=[1,1]`，因此默认 2×2 block 输入会形成 4 个可恢复 Window，
-并检查输出、Parquet 行数、recovery manifest 和 completion bitmap。
+启动日志应明确显示：Driver 位于 service process，Scheduler 是 `on-demand:<host>:<port>`，Workers 位于 `slurm-compute-nodes`。
+
+## 先验证 Scheduler 网络
+
+在没有活动 execution、固定 Scheduler 端口空闲时运行：
+
+```bash
+cd "$HOME/apps/WorkFlow"
+WorkFlow_SLURM_PARTITION=compute \
+WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example \
+WorkFlow_DASK_SCHEDULER_PORT=8786 \
+  bash deploy/hpc/probe_scheduler_connectivity.sh
+```
+
+该 probe 在服务节点临时监听同一 TCP 地址，用 `srun` 申请一个 CN，让 CN 回连并使用随机 nonce 验证响应。结果保存在 `workflow-runtime/test-runs/scheduler-connectivity-*/result.json`。它只证明“CN → 服务节点固定端口”路由/防火墙可达，不证明 Dask、mTLS、GPU、多 Worker 或反向 Worker 端口已经通过。
+
+## 页面执行过程
+
+一次普通 Run 的顺序是：
+
+1. 服务节点序列化当前 editor Graph，并进行只读 preflight/resource planning。
+2. Driver 在服务进程内按需启动固定 host/port 的 Scheduler。
+3. 后端持久化 execution/request/layout，再按 Graph 计划提交 `workflow_workers.sbatch`。
+4. Slurm 选择满足同构请求的一个或多个 CN；`srun` 每节点启动一个 Worker agent。
+5. 所有预期 CPU/GPU Workers 注册且身份、资源、设备拓扑验证通过后，Driver 才提交图。
+6. terminal output Futures 成功后，Driver 更新 Window completion bitmap。
+7. 成功、失败或取消都先停止计算并 `scancel` Worker allocation，再关闭 Scheduler。
+
+Window resume/restart 仍由 Recovery 界面显式发起，并使用 recovery 目录中的不可变 Graph。服务进程重启时无法让已经消失的 Driver 继续计算；启动清理必须取消孤儿 Worker allocation，之后由用户显式 Resume。普通 New Run 不会静默变成 Resume。
+
+## 外部访问页面
+
+先连接管理员提供的 OpenVPN，然后在 Windows checkout 中运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
+  -User YOUR_CLUSTER_USER `
+  -ClusterHost 10.200.201.2
+```
+
+打开 `http://127.0.0.1:18000/`。脚本使用已有 SSH 认证，不生成、读取或保存密码/私钥。不要把 Uvicorn 改成监听公网 `0.0.0.0`；多人生产访问应由管理员在 service node 前部署带 TLS 和身份认证的反向代理。
+
+## 测试边界
+
+`submit_multi_worker_smoke.sh` 是旧的单 CN Dask 进程/GPU 基础设施检查，不等于最终跨节点 Driver/Scheduler 架构验收。最终验收至少应真实执行：
+
+- Scheduler connectivity probe；
+- 1 个 CN、多个 CPU Workers；
+- 1 个 CN、至少 1 个 GPU Worker 并执行 CUDA kernel；
+- 2 个或更多 CN，验证 Worker hostname 分布和跨节点任务；
+- 页面 Full Graph 与 Window New Run；
+- Window Resume/Restart；
+- 取消和服务进程异常后的 orphan allocation 回收。
+
+没有真实获得两个 CN 并运行上述任务时，不得声称“多节点已通过”。

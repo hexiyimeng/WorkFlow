@@ -27,13 +27,17 @@ def _policy() -> SlurmPolicy:
         max_cpus=64,
         max_gpus=8,
         max_memory_gib=512,
+        max_nodes=8,
+        cpus_per_node=64,
+        gpus_per_node=8,
+        memory_gib_per_node=512,
         allowed_partitions=("compute",),
     )
 
 
 def _runtime_config(tmp_path: Path) -> service_module.SlurmRuntimeConfig:
     root = tmp_path / "checkout"
-    script = root / "deploy" / "hpc" / "slurm" / "workflow_execution.sbatch"
+    script = root / "deploy" / "hpc" / "slurm" / "workflow_workers.sbatch"
     script.parent.mkdir(parents=True)
     script.write_text("#!/bin/bash\n", encoding="utf-8")
     backend = root / "backend"
@@ -78,6 +82,7 @@ def test_runtime_config_finds_checkout_above_deploy_directory(tmp_path):
     config = _runtime_config(tmp_path)
     environment = {
         "WorkFlow_SLURM_RUNTIME_DIR": str(config.runtime_directory),
+        "WorkFlow_DASK_SCHEDULER_HOST": "mn02.internal",
         "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
         "WorkFlow_SLURM_SQUEUE": config.squeue_executable,
         "WorkFlow_SLURM_SACCT": config.sacct_executable,
@@ -97,6 +102,7 @@ def test_runtime_config_rejects_missing_status_command(tmp_path):
     config = _runtime_config(tmp_path)
     environment = {
         "WorkFlow_SLURM_RUNTIME_DIR": str(config.runtime_directory),
+        "WorkFlow_DASK_SCHEDULER_HOST": "mn02.internal",
         "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
         "WorkFlow_SLURM_SQUEUE": str(tmp_path / "missing-squeue"),
         "WorkFlow_SLURM_SACCT": config.sacct_executable,
@@ -107,10 +113,28 @@ def test_runtime_config_rejects_missing_status_command(tmp_path):
         service_module.SlurmRuntimeConfig.from_environment(environment)
 
 
+def test_runtime_config_rejects_legacy_compute_runner_script(tmp_path):
+    config = _runtime_config(tmp_path)
+    legacy = config.execution_script.with_name("workflow_execution.sbatch")
+    legacy.write_text("#!/bin/bash\n", encoding="utf-8")
+    environment = {
+        "WorkFlow_SLURM_RUNTIME_DIR": str(config.runtime_directory),
+        "WorkFlow_DASK_SCHEDULER_HOST": "mn02.internal",
+        "WorkFlow_SLURM_EXECUTION_SCRIPT": str(legacy),
+        "WorkFlow_SLURM_SQUEUE": config.squeue_executable,
+        "WorkFlow_SLURM_SACCT": config.sacct_executable,
+        "WorkFlow_SLURM_SCONTROL": config.scontrol_executable,
+    }
+
+    with pytest.raises(ValueError, match="Worker-only"):
+        service_module.SlurmRuntimeConfig.from_environment(environment)
+
+
 def test_slurm_policy_from_environment_is_pure_and_honors_limits(tmp_path):
     absent_runtime = tmp_path / "must-not-be-created"
     policy = service_module.slurm_policy_from_environment({
         "WorkFlow_SLURM_RUNTIME_DIR": str(absent_runtime),
+        "WorkFlow_DASK_SCHEDULER_HOST": "mn02.internal",
         "WorkFlow_SLURM_PARTITION": "gpu-old",
         "WorkFlow_SLURM_ALLOWED_PARTITIONS": "gpu-old,cpu-old",
         "WorkFlow_SLURM_MAX_CPU_WORKERS": "12",
@@ -318,6 +342,7 @@ def test_runtime_config_allows_missing_optional_sacct(tmp_path):
     environment = {
         "PATH": str(empty_path),
         "WorkFlow_SLURM_RUNTIME_DIR": str(config.runtime_directory),
+        "WorkFlow_DASK_SCHEDULER_HOST": "mn02.internal",
         "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
         "WorkFlow_SLURM_SQUEUE": config.squeue_executable,
         "WorkFlow_SLURM_SCONTROL": config.scontrol_executable,
@@ -333,6 +358,7 @@ def test_runtime_config_explicit_empty_sacct_disables_autodiscovery(tmp_path):
     environment = {
         "PATH": str(Path(config.sacct_executable).parent),
         "WorkFlow_SLURM_RUNTIME_DIR": str(config.runtime_directory),
+        "WorkFlow_DASK_SCHEDULER_HOST": "mn02.internal",
         "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
         "WorkFlow_SLURM_SQUEUE": config.squeue_executable,
         "WorkFlow_SLURM_SCONTROL": config.scontrol_executable,
@@ -770,6 +796,38 @@ def test_execute_submits_graph_derived_resources_and_worker_memory(
         classmethod(lambda cls: config),
     )
     monkeypatch.setattr(service_module, "_git_revision", lambda root: "a" * 40)
+    monkeypatch.setattr(
+        service_module.SlurmExecutionService,
+        "_worker_security_payload",
+        staticmethod(lambda selected: None),
+    )
+    client = SimpleNamespace(
+        scheduler=SimpleNamespace(address="tcp://mn02.internal:8786")
+    )
+    monkeypatch.setattr(
+        service_module.dask_service,
+        "start_external_scheduler",
+        lambda **kwargs: client,
+    )
+    monkeypatch.setattr(
+        service_module.dask_service,
+        "activate_external_workers",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        service_module.dask_service,
+        "stop_cluster",
+        lambda: True,
+    )
+
+    async def execute_on_service(graph_arg, execution_id, selected, **kwargs):
+        state_manager.set_execution_status(
+            execution_id, ExecutionStatus.SUCCEEDED, release_active=False
+        )
+
+    monkeypatch.setattr(
+        service_module, "execute_graph_on_service_node", execute_on_service
+    )
 
     captured = {}
     service = service_module.SlurmExecutionService()
@@ -778,18 +836,16 @@ def test_execute_submits_graph_derived_resources_and_worker_memory(
         captured["argv"] = tuple(argv)
         return subprocess.CompletedProcess(argv, 0, "123;test-cluster\n", "")
 
-    async def monitor(**kwargs):
-        return {
-            "schemaVersion": 1,
-            "executionId": "execution-1",
-            "jobId": "123",
-            "status": ExecutionStatus.SUCCEEDED,
-            "message": "done",
-            "finishedAt": "2026-08-09T00:00:01Z",
-        }
+    async def terminate(**kwargs):
+        return "CANCELLED", "0:15", "c001"
 
+    monkeypatch.setattr(
+        service,
+        "_wait_for_worker_allocation_running",
+        lambda **kwargs: asyncio.sleep(0),
+    )
     monkeypatch.setattr(service, "_run_command", submit)
-    monkeypatch.setattr(service, "_monitor_job", monitor)
+    monkeypatch.setattr(service, "_wait_for_worker_allocation_terminal", terminate)
     state_manager.start_execution("execution-1")
 
     asyncio.run(service.execute_graph(graph, "execution-1", {"mode": "full_graph"}))
@@ -799,28 +855,18 @@ def test_execute_submits_graph_derived_resources_and_worker_memory(
     assert "--mem=84G" in argv
     assert "--gres=gpu:1" in argv
     assert any(item.startswith("--comment=wf:") for item in argv)
-    assert argv[-7:] == (
-        str(config.execution_root / "execution-1" / "request.json"),
-        str(config.runtime_directory),
-        "8",
-        "64",
-        config.squeue_executable,
-        config.sacct_executable or "-",
-        config.scontrol_executable,
+    assert argv[-1] == str(
+        config.execution_root / "execution-1" / "request.json"
     )
     payload = json.loads(
         (config.execution_root / "execution-1" / "request.json").read_text(
             encoding="utf-8"
         )
     )
-    assert payload["resourcePlan"] == {"cpuWorkers": 2, "gpuWorkers": 1}
-    assert payload["eventPath"] == str(
-        config.execution_root / "execution-1" / "events.jsonl"
-    )
-    assert payload["resultPath"] == str(
-        config.execution_root / "execution-1" / "result.json"
-    )
-    assert payload["graph"] == graph
+    assert payload["resourcePlan"]["cpuWorkers"] == 2
+    assert payload["resourcePlan"]["gpuWorkers"] == 1
+    assert payload["workerMemoryGiB"] == {"cpu": 8, "gpu": 64}
+    assert "graph" not in payload
     job_record = json.loads(
         (config.execution_root / "execution-1" / "job.json").read_text(
             encoding="utf-8"
@@ -844,6 +890,21 @@ def test_cancel_during_sbatch_waits_for_job_id_then_cancels(tmp_path, monkeypatc
         classmethod(lambda cls: config),
     )
     monkeypatch.setattr(service_module, "_git_revision", lambda root: "b" * 40)
+    monkeypatch.setattr(
+        service_module.SlurmExecutionService,
+        "_worker_security_payload",
+        staticmethod(lambda selected: None),
+    )
+    monkeypatch.setattr(
+        service_module.dask_service,
+        "start_external_scheduler",
+        lambda **kwargs: SimpleNamespace(
+            scheduler=SimpleNamespace(address="tcp://mn02.internal:8786")
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.dask_service, "stop_cluster", lambda: True
+    )
 
     entered = threading.Event()
     release = threading.Event()
@@ -855,32 +916,12 @@ def test_cancel_during_sbatch_waits_for_job_id_then_cancels(tmp_path, monkeypatc
         assert release.wait(timeout=5)
         return subprocess.CompletedProcess(argv, 0, "456\n", "")
 
-    async def send_cancel(
-        config_arg,
-        job_id,
-        *,
-        whole_job,
-        cluster=None,
-        submission_token=None,
-    ):
-        cancelled_jobs.append((job_id, whole_job))
-
-    async def queue_state(*args, **kwargs):
-        return True, ("RUNNING", "c001", "")
-
-    async def monitor(**kwargs):
-        return {
-            "schemaVersion": 1,
-            "executionId": "execution-2",
-            "jobId": "456",
-            "status": ExecutionStatus.CANCELLED,
-            "message": "cancelled",
-        }
+    async def terminate(**kwargs):
+        cancelled_jobs.append((kwargs["job_id"], True))
+        return "CANCELLED", "0:15", "c001"
 
     monkeypatch.setattr(service, "_run_command", delayed_submit)
-    monkeypatch.setattr(service, "_send_cancel", send_cancel)
-    monkeypatch.setattr(service, "_query_queue_state", queue_state)
-    monkeypatch.setattr(service, "_monitor_job", monitor)
+    monkeypatch.setattr(service, "_wait_for_worker_allocation_terminal", terminate)
 
     async def scenario():
         state_manager.start_execution("execution-2")
@@ -901,7 +942,7 @@ def test_cancel_during_sbatch_waits_for_job_id_then_cancels(tmp_path, monkeypatc
 
     asyncio.run(scenario())
 
-    assert cancelled_jobs == [("456", False)]
+    assert cancelled_jobs == [("456", True)]
     job_record = json.loads(
         (config.execution_root / "execution-2" / "job.json").read_text(
             encoding="utf-8"
@@ -931,6 +972,21 @@ def test_explicit_sbatch_failure_is_terminal_across_restart(
         classmethod(lambda cls: config),
     )
     monkeypatch.setattr(service_module, "_git_revision", lambda root: "c" * 40)
+    monkeypatch.setattr(
+        service_module.SlurmExecutionService,
+        "_worker_security_payload",
+        staticmethod(lambda selected: None),
+    )
+    monkeypatch.setattr(
+        service_module.dask_service,
+        "start_external_scheduler",
+        lambda **kwargs: SimpleNamespace(
+            scheduler=SimpleNamespace(address="tcp://mn02.internal:8786")
+        ),
+    )
+    monkeypatch.setattr(
+        service_module.dask_service, "stop_cluster", lambda: True
+    )
 
     def reject_submission(argv, *, timeout):
         if failure_kind == "oserror":
@@ -1026,67 +1082,6 @@ def test_runner_revision_validation_rejects_changed_checkout(monkeypatch):
         runner.validate_code_revision(request)
 
 
-def test_monitor_error_retries_and_keeps_active_lease(tmp_path, monkeypatch):
-    config = _runtime_config(tmp_path)
-    graph = {"terminal": {"type": "TestOutput", "inputs": {}}}
-    plan = SimpleNamespace(cpu_workers=1, gpu_workers=0)
-    monkeypatch.setattr(
-        service_module,
-        "_authoritative_graph_and_plan",
-        lambda selected_graph, selected_config: (selected_graph, plan),
-    )
-    monkeypatch.setattr(
-        service_module.SlurmRuntimeConfig,
-        "from_environment",
-        classmethod(lambda cls: config),
-    )
-    monkeypatch.setattr(service_module, "_git_revision", lambda root: "e" * 40)
-    service = service_module.SlurmExecutionService()
-    monitor_retried = asyncio.Event()
-    release = asyncio.Event()
-    calls = 0
-
-    def submit(argv, *, timeout):
-        return subprocess.CompletedProcess(argv, 0, "333\n", "")
-
-    async def monitor(**kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise OSError("temporary shared filesystem outage")
-        monitor_retried.set()
-        await release.wait()
-        return {
-            "schemaVersion": 1,
-            "executionId": "execution-monitor-retry",
-            "jobId": "333",
-            "status": ExecutionStatus.SUCCEEDED,
-            "message": "done",
-        }
-
-    monkeypatch.setattr(service, "_run_command", submit)
-    monkeypatch.setattr(service, "_monitor_job", monitor)
-
-    async def scenario():
-        state_manager.start_execution("execution-monitor-retry")
-        task = asyncio.create_task(service.execute_graph(
-            graph,
-            "execution-monitor-retry",
-            {"mode": "full_graph"},
-        ))
-        assert state_manager.attach_execution_task("execution-monitor-retry", task)
-        await monitor_retried.wait()
-        session = state_manager.get_execution("execution-monitor-retry")
-        assert session is not None and session.status == ExecutionStatus.RUNNING
-        assert state_manager.active_execution_id == "execution-monitor-retry"
-        with pytest.raises(RuntimeError, match="Another execution"):
-            state_manager.start_execution("must-be-rejected")
-        release.set()
-        assert await task == "execution-monitor-retry"
-
-    asyncio.run(scenario())
-
-
 def test_failed_scancel_cannot_terminalize_running_job(tmp_path, monkeypatch):
     config = _runtime_config(tmp_path)
     config = service_module.SlurmRuntimeConfig(
@@ -1142,7 +1137,7 @@ def test_failed_scancel_cannot_terminalize_running_job(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_reconcile_reattaches_one_durable_submitted_job(tmp_path, monkeypatch):
+def test_reconcile_cancels_submitted_workers_instead_of_reattaching_driver(tmp_path, monkeypatch):
     config = _runtime_config(tmp_path)
     run_directory = config.execution_root / "execution-4"
     run_directory.mkdir()
@@ -1165,27 +1160,21 @@ def test_reconcile_reattaches_one_durable_submitted_job(tmp_path, monkeypatch):
         "from_environment",
         classmethod(lambda cls: config),
     )
-    monitor_started = asyncio.Event()
     service = service_module.SlurmExecutionService()
 
-    async def monitor(**kwargs):
-        monitor_started.set()
-        await asyncio.Event().wait()
+    cancelled = []
 
-    monkeypatch.setattr(service, "_monitor_job", monitor)
+    async def terminate(**kwargs):
+        cancelled.append(kwargs["job_id"])
+        return "CANCELLED", "0:15", "c001"
 
-    async def scenario():
-        assert await service.reconcile_active_job() == "execution-4"
-        await monitor_started.wait()
-        session = state_manager.get_execution("execution-4")
-        assert session is not None
-        assert state_manager.active_execution_id == "execution-4"
-        assert session.task is not None
-        session.task.cancel()
-        await asyncio.gather(session.task, return_exceptions=True)
+    monkeypatch.setattr(service, "_wait_for_worker_allocation_terminal", terminate)
 
-    asyncio.run(scenario())
+    assert asyncio.run(service.reconcile_active_job()) is None
 
+    assert cancelled == ["789"]
+    record = json.loads((run_directory / "job.json").read_text(encoding="utf-8"))
+    assert record["state"] == ExecutionStatus.INTERRUPTED
     assert state_manager.active_execution_id is None
 
 
@@ -1254,32 +1243,22 @@ def test_reconcile_fails_closed_for_unresolved_ambiguous_submission(
         asyncio.run(service.reconcile_active_job())
 
 
-def test_ambiguous_submission_recovers_fast_finished_runner_result(
+def test_ambiguous_worker_submission_recovers_job_id_from_slurm_token(
     tmp_path,
     monkeypatch,
 ):
     config = _runtime_config(tmp_path)
     execution_id = "fast-finished-1"
-    run_directory = config.execution_root / execution_id
-    run_directory.mkdir()
-    (run_directory / service_module.RESULT_FILENAME).write_text(
-        json.dumps({
-            "schemaVersion": service_module.REQUEST_SCHEMA_VERSION,
-            "executionId": execution_id,
-            "jobId": "902",
-            "status": ExecutionStatus.SUCCEEDED,
-        }),
-        encoding="utf-8",
-    )
+    (config.execution_root / execution_id).mkdir()
     service = service_module.SlurmExecutionService()
 
-    async def must_not_query_squeue(*args, **kwargs):
-        raise AssertionError("a durable runner result must win over squeue")
+    async def find_by_token(*args, **kwargs):
+        return True, ("902", "RUNNING")
 
     monkeypatch.setattr(
         service,
         "_query_job_by_submission_token",
-        must_not_query_squeue,
+        find_by_token,
     )
 
     assert asyncio.run(service._recover_ambiguous_submission(
@@ -1312,31 +1291,23 @@ def test_reconcile_recovers_job_id_from_submission_token(tmp_path, monkeypatch):
         classmethod(lambda cls: config),
     )
     service = service_module.SlurmExecutionService()
-    monitor_started = asyncio.Event()
+    cancelled = []
 
     async def found(*args, **kwargs):
         return True, ("901", "RUNNING")
 
-    async def monitor(**kwargs):
-        monitor_started.set()
-        await asyncio.Event().wait()
+    async def terminate(**kwargs):
+        cancelled.append(kwargs["job_id"])
+        return "CANCELLED", "0:15", "c001"
 
     monkeypatch.setattr(service, "_query_job_by_submission_token", found)
-    monkeypatch.setattr(service, "_monitor_until_terminal", monitor)
+    monkeypatch.setattr(service, "_wait_for_worker_allocation_terminal", terminate)
 
-    async def scenario():
-        assert await service.reconcile_active_job() == "ambiguous-2"
-        await monitor_started.wait()
-        session = state_manager.get_execution("ambiguous-2")
-        assert session is not None and session.task is not None
-        service.request_monitor_detach("ambiguous-2")
-        session.task.cancel()
-        await asyncio.gather(session.task, return_exceptions=True)
-
-    asyncio.run(scenario())
+    assert asyncio.run(service.reconcile_active_job()) is None
 
     recovered = json.loads(
         (run_directory / "job.json").read_text(encoding="utf-8")
     )
+    assert cancelled == ["901"]
     assert recovered["jobId"] == "901"
-    assert recovered["state"] == "submitted"
+    assert recovered["state"] == ExecutionStatus.INTERRUPTED

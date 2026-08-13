@@ -1,12 +1,44 @@
 # WorkFlow Slurm 集群部署与验收记录（2026-08-13）
 
+## 2026-08-13 多节点架构修订
+
+本文件前半部分的 job 55052/55053/55054 和 WebSocket Restart 记录，是旧架构“Driver + Scheduler + Workers 全部位于单个 CN”的历史实机证据。它们仍能证明 Slurm 19.05、共享 Python 环境、单卡 CUDA、页面隧道和恢复数据链路可用，但**不能**证明最终多节点架构已经通过。
+
+最终架构已经明确为：
+
+```text
+登录/管理/专用 service node
+  ├─ Uvicorn/FastAPI（常驻）
+  ├─ workflow Driver（每次执行）
+  └─ Dask Scheduler（每次执行按需启动，结束后关闭）
+       ↓
+一个按 Graph 动态申请的多节点 Slurm allocation
+  └─ 每个 compute node 一个 Worker agent，仅启动 Nanny/Worker
+```
+
+Scheduler 不是常驻进程，也不在 CN。应用一次只允许一个 active execution，因此使用固定的 CN 可达 Scheduler 端口。若一个节点的 per-node GPU/CPU/内存 envelope 装不下 Graph 的 Worker 计划，资源规划会增加节点数，直到 `WorkFlow_SLURM_MAX_NODES`；不会把 Worker 放到服务节点。
+
+修订后的真实集群验收状态：
+
+| 项目 | 当前状态 | 说明 |
+| --- | --- | --- |
+| 旧单 CN、CPU/GPU Worker smoke | 已通过（历史证据） | jobs 55052/55053/55054 |
+| CN → service Scheduler 固定端口 | **未实测** | 需运行 `probe_scheduler_connectivity.sh` |
+| service Driver + on-demand Scheduler | **未实测** | 需部署修订后版本并从页面执行 |
+| 两个或更多 CN 的同一 Dask 集群 | **未实测** | 必须取得真实 multi-node allocation |
+| 多 CN CUDA Workers | **未实测** | 不能由单 A40 job 推断 |
+| mTLS | **未配置、未实测** | 生产必须由管理员提供证书并结合 ACL |
+| 取消/服务重启后的 orphan allocation 回收 | **未实测** | 需故障注入 |
+
+目标集群的 `WorkFlow_DASK_SCHEDULER_HOST` 尚未从 CN 验证。部署前必须选择服务节点的内网 IPv4/FQDN（禁止 loopback/wildcard），并由管理员开放 Scheduler 固定端口和 Worker/Nanny 端口范围。未完成这些实测前，不得把下文旧结果表述为“最终多节点已验收”。
+
 ## 结论
 
 基于目标集群返回的真实日志，首轮提交 `839894bf0ab94b8567bee4d6ebce6f0c032e18d1`
 以及兼容性更新 `f2c3d6f1bcf8d5738e885e6174d141639314a903` 已验证以下链路：
 
 - Web 控制面常驻登录/服务节点 `mn02`，页面返回 HTTP 200；
-- 控制面按 Worker 数量提交 Slurm 作业，Dask Scheduler、Nanny 和 Worker 仅在
+- 旧控制面按 Worker 数量提交单节点 Slurm 作业，当时 Dask Scheduler、Nanny 和 Worker 均在
   compute node `c001` 中运行；
 - 两个 CPU Worker 的真实多进程任务通过；
 - 一个 CPU Worker 加一个 GPU Worker 的真实多进程任务通过，GPU Worker 在
@@ -17,9 +49,9 @@
   recovery 目录中的不可变 Graph 提交 Slurm 作业，最终 4/4 Window 完成；
 - 三次多 Worker smoke 都产生了持久结果文件，并完成 Dask 集群的正常关闭。
 
-因此，当前的“登录/服务节点控制面 → Slurm 动态申请 → 单个 compute node 内建立
-Dask 集群”架构已通过本次范围内的实机验收。此次验收**没有**证明多 GPU或跨多个
-compute node 可用；这些边界见下文。
+因此，下列日志只验收了旧的“登录/服务节点控制面 → Slurm 动态申请 → 单个 compute node 内建立
+Dask 集群”链路。该链路已被上面的最终架构取代；此次验收**没有**证明 service-node Driver、
+service-node on-demand Scheduler、多 GPU 或跨多个 compute node 可用。
 
 ## 验收环境和证据
 
@@ -71,7 +103,7 @@ compute node 可用；这些边界见下文。
 控制面 Slurm 分派、不可变恢复 Graph 和 Window checkpoint 收口；它是显式 Recovery
 Restart，不等同于从当前编辑器 Graph 发起一次全新的普通 Run。
 
-## 实际部署架构
+## 历史实测架构（已被最终设计取代）
 
 ```text
 外部浏览器
@@ -99,9 +131,9 @@ Slurm 分配的一个 compute node
 node；作业进入分配后，runner 才在该节点建立本地 Dask 集群。控制面不会 SSH 到
 compute node，也不会在登录节点启动 Dask Worker。
 
-当前正式执行是**单 compute node Dask**：一次 execution 的 Scheduler 和全部 Worker
-位于同一个 Slurm allocation。资源数量不是写死在生产 `.sbatch` 文件中，但拓扑固定为
-`--nodes=1 --ntasks=1`。跨节点 Dask 尚未实现。
+上述 jobs 实测的是**单 compute node Dask**：一次 execution 的 Driver、Scheduler 和全部 Worker
+位于同一个 Slurm allocation。不要继续把这一节当成现行部署说明；现行架构和配置见
+[`README.md`](README.md)。
 
 ## `workflow-runtime` 目录说明
 
@@ -134,11 +166,15 @@ bash "$HOME/apps/WorkFlow/deploy/hpc/install.sh"
 cd "$HOME/apps/WorkFlow"
 WorkFlow_SLURM_SACCT='' \
 WorkFlow_SLURM_PARTITION=compute \
+WorkFlow_DASK_SCHEDULER_HOST=REPLACE_WITH_CN_REACHABLE_SERVICE_HOST \
+WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1 \
   bash deploy/hpc/control_plane.sh restart
 ```
 
 这里显式将 `WorkFlow_SLURM_SACCT` 设为空，是因为本次验收已经证明站点安装了 `sacct`
 客户端，但没有可连接的 `slurmdbd`；控制面将直接使用 `squeue + scontrol`。
+`REPLACE_WITH_CN_REACHABLE_SERVICE_HOST` 不能照抄，必须替换并先运行 Scheduler connectivity
+probe。`ALLOW_INSECURE_CLUSTER=1` 只记录当前无 mTLS 的受控验收方式，不是生产建议。
 
 检查状态、页面和插件：
 
@@ -231,7 +267,8 @@ scontrol --local --oneliner --quiet show job 55054
 
 - **多 GPU 未实测**：本次只真实申请并计算了 1 张 NVIDIA A40；不能据此宣称 2/4/8 GPU
   Worker 已通过。
-- **跨节点未实现、未实测**：当前是一个 Slurm job、一个 compute node 内的 Dask 集群。
+- **最终跨节点链路未实测**：代码修订目标是一个多节点 Slurm allocation、每 CN 一个 Worker
+  agent，而 Driver/Scheduler 留在 service node；本报告仍没有两个真实 CN 的通过证据。
 - **普通 New Run 仍未单独做浏览器点击验收**：正式 WebSocket Recovery Restart 已完成，
   但本次没有用自动化视觉工具从编辑器逐项点击并提交一份全新的代表性 Graph。
 - **浏览器视觉交互未自动化断言**：Windows 隧道的 HTTP、插件 API 和 WebSocket 已实测，
@@ -239,4 +276,5 @@ scontrol --local --oneliner --quiet show job 55054
 - **无 accounting 故障注入待复验**：`sacct` 不可用已确认，兼容修改已部署；仍需验证作业
   在写入 `result.json` 前异常结束时，UI 和 Window recovery lock 能在预期宽限期后收敛。
 - **站点策略依赖管理员确认**：长期在登录节点运行 tmux 服务、partition/account/QoS、
-  单节点 CPU/内存/GPU 上限及 SSH 转发权限应遵循集群管理规定。
+  per-node CPU/内存/GPU 容量、最大节点数、Scheduler/Worker/Nanny 端口 ACL 及 SSH 转发权限
+  都应遵循集群管理规定。

@@ -420,7 +420,8 @@ class WriteParquetCellTable(BaseMapBlocksNode):
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Write Parquet Cell Table"
-    EXECUTION_WORKERS = 0
+    EXECUTION_RESOURCE = "cpu"
+    EXECUTION_WORKERS = 6
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_dir"
     CHUNK_POLICY = {"mode": "rechunk_to_primary"}

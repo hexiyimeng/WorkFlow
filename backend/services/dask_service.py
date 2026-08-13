@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
 import operator
 import os
@@ -9,10 +10,11 @@ import threading
 import time
 import weakref
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 import dask.config
-from dask.distributed import Client, Nanny, Scheduler, SpecCluster
+from dask.distributed import Client, Nanny, Scheduler, Security, SpecCluster
 from distributed import WorkerPlugin, get_worker
 from distributed.core import Status
 
@@ -112,6 +114,54 @@ def _positive_timeout_from_env(name: str, default: float) -> float:
     if value <= 0:
         raise ValueError(f"{name} must be a positive number, got {raw_value!r}.")
     return value
+
+
+def _external_cluster_security_from_environment() -> tuple[Security | None, dict[str, str] | None]:
+    """Load explicit mTLS material for a cross-node Dask cluster.
+
+    Plain TCP is permitted only with an explicit opt-in intended for a trusted
+    and ACL-isolated test network.  A Dask Scheduler is a remote-code-execution
+    boundary, so silently exposing it from loopback would be unsafe.
+    """
+    ca = os.getenv("WorkFlow_DASK_TLS_CA", "").strip()
+    cert = os.getenv("WorkFlow_DASK_TLS_CERT", "").strip()
+    key = os.getenv("WorkFlow_DASK_TLS_KEY", "").strip()
+    provided = tuple(bool(item) for item in (ca, cert, key))
+    if any(provided) and not all(provided):
+        raise ValueError(
+            "WorkFlow_DASK_TLS_CA, WorkFlow_DASK_TLS_CERT and "
+            "WorkFlow_DASK_TLS_KEY must be configured together."
+        )
+    if all(provided):
+        resolved: dict[str, str] = {}
+        for name, value in (("ca", ca), ("cert", cert), ("key", key)):
+            path = Path(value).expanduser()
+            if not path.is_absolute() or path.is_symlink() or not path.is_file():
+                raise ValueError(
+                    f"Cross-node Dask TLS {name} must be an absolute regular "
+                    f"non-symlink file: {path}"
+                )
+            resolved[name] = str(path.resolve(strict=True))
+        security = Security(
+            require_encryption=True,
+            tls_ca_file=resolved["ca"],
+            tls_client_cert=resolved["cert"],
+            tls_client_key=resolved["key"],
+            tls_scheduler_cert=resolved["cert"],
+            tls_scheduler_key=resolved["key"],
+            tls_worker_cert=resolved["cert"],
+            tls_worker_key=resolved["key"],
+        )
+        return security, resolved
+
+    insecure = os.getenv("WorkFlow_DASK_ALLOW_INSECURE_CLUSTER", "").strip().lower()
+    if insecure not in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            "Cross-node Dask requires mTLS. Configure WorkFlow_DASK_TLS_CA/"
+            "CERT/KEY, or explicitly set WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1 "
+            "only on a trusted ACL-isolated test network."
+        )
+    return None, None
 
 
 def _cluster_start_timeout() -> float:
@@ -483,6 +533,20 @@ class WorkerDevicePlugin(WorkerPlugin):
         )
         if len(visible_ids) != 1:
             raise RuntimeError("Each GPU Worker must see exactly one CUDA device.")
+        # On a multi-node Slurm allocation the node-local CUDA identifier (for
+        # example ``0``) is not globally unique.  The Worker still validates
+        # its actual visibility mask against the node-local identifier, while
+        # publishing a scheduler-wide identity such as ``c002:0`` through
+        # WORKFLOW_PHYSICAL_GPU_ID.
+        local_gpu_id = os.environ.get(
+            "WORKFLOW_LOCAL_GPU_ID",
+            os.environ.get("WORKFLOW_PHYSICAL_GPU_ID", visible_ids[0]),
+        )
+        if visible_ids[0] != local_gpu_id:
+            raise RuntimeError(
+                "GPU Worker CUDA visibility does not match its node-local "
+                f"assignment: visible={visible_ids[0]!r}, assigned={local_gpu_id!r}."
+            )
 
         worker.worker_role = "gpu"
         worker.assigned_gpu = "cuda:0"
@@ -505,6 +569,10 @@ def worker_device_diagnostics(dask_worker: Any | None = None) -> dict[str, Any]:
         "assignedDevice": assigned_device,
         "cudaVisibleDevices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
         "physicalGpuId": os.getenv("WORKFLOW_PHYSICAL_GPU_ID") if role == "gpu" else None,
+        "localGpuId": os.getenv("WORKFLOW_LOCAL_GPU_ID") if role == "gpu" else None,
+        "executionId": os.getenv("WORKFLOW_EXECUTION_ID"),
+        "submissionTokenHash": os.getenv("WORKFLOW_SUBMISSION_TOKEN_HASH"),
+        "nodeRank": os.getenv("WORKFLOW_NODE_RANK"),
         "resources": _worker_resources(worker),
     }
     return result
@@ -1312,6 +1380,7 @@ class DaskService:
     active_gpu_workers: int = 0
     active_gpu_ids: tuple[str, ...] = ()
     _cluster_poisoned: bool = False
+    _external_workers: bool = False
     _cluster_lock = threading.RLock()
 
     def __new__(cls) -> DaskService:
@@ -1334,6 +1403,39 @@ class DaskService:
     ) -> Client:
         """Return a service-owned client sized for the requested topology."""
         with self._cluster_lock:
+            if self._external_workers:
+                if self.client is None:
+                    raise RuntimeError(
+                        "The external Dask runtime has no live Driver Client."
+                    )
+                expected_cpu = _normalize_worker_count(
+                    0 if cpu_workers is None else cpu_workers,
+                    name="cpu_workers",
+                )
+                expected_gpu = _normalize_worker_count(
+                    0 if gpu_workers is None else gpu_workers,
+                    name="gpu_workers",
+                )
+                if (
+                    self.active_cpu_workers != expected_cpu
+                    or self.active_gpu_workers != expected_gpu
+                ):
+                    raise RuntimeError(
+                        "The externally provisioned Slurm Worker topology does "
+                        "not match the Graph resource plan: "
+                        f"active CPU/GPU={self.active_cpu_workers}/"
+                        f"{self.active_gpu_workers}, requested={expected_cpu}/"
+                        f"{expected_gpu}."
+                    )
+                self._wait_for_stable_topology(
+                    expected_cpu_workers=expected_cpu,
+                    expected_gpu_workers=expected_gpu,
+                    expected_gpu_ids=None,
+                    expected_total_workers=expected_cpu + expected_gpu,
+                    deadline=time.monotonic() + _cluster_start_timeout(),
+                    client=self.client,
+                )
+                return self.client
             if self.client is None:
                 try:
                     Client.current()
@@ -1352,6 +1454,186 @@ class DaskService:
             return self.start_cluster(
                 cpu_workers=cpu_workers,
                 gpu_workers=gpu_workers,
+            )
+
+    def start_external_scheduler(
+        self,
+        *,
+        host: str,
+        port: int = 0,
+        dashboard_address: str | None = None,
+    ) -> Client:
+        """Start a service-node Scheduler/Client with no local Workers.
+
+        Slurm Worker launchers connect to the returned Scheduler address from
+        one or more compute nodes.  This path deliberately performs no CUDA
+        detection on the service node.
+        """
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError("External Dask Scheduler host must be non-empty.")
+        if type(port) is not int or port < 0 or port > 65535:
+            raise ValueError("External Dask Scheduler port must be 0..65535.")
+        with self._cluster_lock:
+            if self.client is not None or self.cluster is not None:
+                raise RuntimeError(
+                    "A Dask runtime is already active; it must be stopped before "
+                    "starting an external Slurm Worker allocation."
+                )
+            if dashboard_address not in (None, ""):
+                raise ValueError(
+                    "The cross-node Scheduler dashboard must remain disabled; "
+                    "use the WorkFlow execution UI instead."
+                )
+            security, _security_paths = _external_cluster_security_from_environment()
+            scheduler_spec = {
+                "cls": Scheduler,
+                "options": {
+                    "host": host.strip(),
+                    "port": port,
+                    # The Scheduler protocol listens on the configured
+                    # compute-facing host.  Do not expose the unauthenticated
+                    # Bokeh dashboard on that interface; the application UI
+                    # already relays execution state over its loopback HTTP
+                    # service.
+                    "dashboard": False,
+                    "dashboard_address": None,
+                    "security": security,
+                },
+            }
+            cluster: SpecCluster | None = None
+            client: WorkflowClient | None = None
+            try:
+                cluster = SpecCluster(
+                    scheduler=scheduler_spec,
+                    workers={},
+                    security=security,
+                    asynchronous=False,
+                    name="WorkFlow-Slurm-Driver",
+                )
+                client = WorkflowClient(
+                    cluster.scheduler_address,
+                    security=cluster.security,
+                    timeout=min(60.0, _cluster_start_timeout()),
+                    set_as_default=True,
+                )
+            except BaseException:
+                if client is not None:
+                    try:
+                        client.close(timeout=5.0)
+                    except Exception:
+                        logger.exception(
+                            "[Dask] Failed to close external Driver Client after startup failure."
+                        )
+                if cluster is not None:
+                    try:
+                        cluster.close(timeout=10.0)
+                    except Exception:
+                        logger.exception(
+                            "[Dask] Failed to close external Scheduler after startup failure."
+                        )
+                raise
+
+            self.cluster = cluster
+            self.client = client
+            self.active_cpu_workers = 0
+            self.active_gpu_workers = 0
+            self.active_gpu_ids = ()
+            self._external_workers = True
+            self._cluster_poisoned = False
+            logger.info(
+                "[Dask] Service-node Driver Scheduler ready for Slurm Workers: %s",
+                cluster.scheduler_address,
+            )
+            return client
+
+    def activate_external_workers(
+        self,
+        *,
+        cpu_workers: int,
+        gpu_workers: int,
+        timeout: float,
+        execution_id: str | None = None,
+        submission_token: str | None = None,
+    ) -> ClusterResourceSummary:
+        """Validate and publish an exact externally launched Worker topology."""
+        expected_cpu = _normalize_worker_count(cpu_workers, name="cpu_workers")
+        expected_gpu = _normalize_worker_count(gpu_workers, name="gpu_workers")
+        if expected_cpu + expected_gpu <= 0:
+            raise ValueError("At least one external Worker must be requested.")
+        if timeout <= 0:
+            raise ValueError("External Worker startup timeout must be positive.")
+        # Do not hold the service-wide lifecycle lock while waiting for a
+        # queued multi-node allocation to register.  Cancellation cannot stop
+        # a synchronous distributed RPC running in ``to_thread``; holding the
+        # lock here would therefore prevent ``stop_cluster`` from closing the
+        # Client/Scheduler and issuing the authoritative Slurm cleanup.
+        with self._cluster_lock:
+            if not self._external_workers or self.client is None:
+                raise RuntimeError("No external Slurm Dask runtime is active.")
+            active_client = self.client
+
+        summary = self._wait_for_stable_topology(
+            expected_cpu_workers=expected_cpu,
+            expected_gpu_workers=expected_gpu,
+            expected_gpu_ids=None,
+            expected_total_workers=expected_cpu + expected_gpu,
+            deadline=time.monotonic() + timeout,
+            client=active_client,
+        )
+        diagnostics = self.get_worker_diagnostics(active_client)
+        if execution_id is not None:
+            token_hash = (
+                hashlib.sha256(submission_token.encode("utf-8")).hexdigest()
+                if submission_token is not None
+                else None
+            )
+            ownership_errors = []
+            for address, item in diagnostics.items():
+                if item.get("executionId") != execution_id:
+                    ownership_errors.append(
+                        f"{address} executionId={item.get('executionId')!r}"
+                    )
+                if token_hash is not None and item.get("submissionTokenHash") != token_hash:
+                    ownership_errors.append(
+                        f"{address} submission token does not match"
+                    )
+            if ownership_errors:
+                raise RuntimeError(
+                    "External Dask Workers failed execution ownership "
+                    "validation: " + "; ".join(ownership_errors)
+                )
+        gpu_ids = tuple(sorted(
+            str(item.get("physicalGpuId"))
+            for item in diagnostics.values()
+            if item.get("workerRole") == "gpu"
+        ))
+
+        with self._cluster_lock:
+            if not self._external_workers or self.client is not active_client:
+                raise RuntimeError(
+                    "The external Dask runtime was stopped while Workers were "
+                    "registering."
+                )
+            self.active_cpu_workers = expected_cpu
+            self.active_gpu_workers = expected_gpu
+            self.active_gpu_ids = gpu_ids
+            logger.info(
+                "[Dask] External Slurm Worker topology validated: CPU=%s GPU=%s "
+                "devices=%s Scheduler=%s",
+                expected_cpu,
+                expected_gpu,
+                gpu_ids,
+                summary.scheduler_address,
+            )
+            return summary
+
+    def uses_external_workers(self, client: Client | None = None) -> bool:
+        """Return whether the active Client is backed by Slurm Workers."""
+        with self._cluster_lock:
+            return bool(
+                self._external_workers
+                and self.client is not None
+                and (client is None or client is self.client)
             )
 
     def start_cluster(
@@ -1818,7 +2100,7 @@ class DaskService:
         *,
         expected_cpu_workers: int,
         expected_gpu_workers: int,
-        expected_gpu_ids: tuple[str, ...],
+        expected_gpu_ids: tuple[str, ...] | None,
         expected_total_workers: int,
         deadline: float,
         client: Client,
@@ -1972,11 +2254,14 @@ class DaskService:
                 elif role == "gpu":
                     visible_ids = tuple(part for part in str(visible).split(",") if part)
                     physical_gpu_id = str(diagnostic.get("physicalGpuId") or "")
+                    local_gpu_id = str(
+                        diagnostic.get("localGpuId") or physical_gpu_id
+                    )
                     if (
                         assigned != "cuda:0"
                         or len(visible_ids) != 1
                         or not physical_gpu_id
-                        or visible_ids[0] != physical_gpu_id
+                        or visible_ids[0] != local_gpu_id
                         or resources != {GPU_RESOURCE_NAME: 1.0}
                     ):
                         contract_errors.append(
@@ -2128,6 +2413,8 @@ class DaskService:
             self.active_cpu_workers = 0
             self.active_gpu_workers = 0
             self.active_gpu_ids = ()
+            if not cleanup_unconfirmed:
+                self._external_workers = False
             if cleanup_unconfirmed:
                 raise RuntimeError(
                     "Dask runtime shutdown could not be confirmed; the local "

@@ -5,6 +5,7 @@ import logging
 import operator
 import uuid
 from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 import dask
 import dask.array as da
@@ -316,6 +317,27 @@ def _cancel_sink_futures(client, sink_futures) -> None:
         dist_wait(sink_futures, timeout=2)
     except Exception as exc:
         logger.debug(f"[Cleanup] Future cancellation drain skipped/failed: {exc}")
+
+
+async def _cancel_sink_futures_with_timeout(
+    client,
+    sink_futures,
+    *,
+    timeout_seconds: float = 5.0,
+) -> None:
+    """Bound synchronous distributed cancellation during Driver teardown.
+
+    A cross-node Scheduler or Worker network failure must not keep the service
+    event loop inside ``Client.cancel`` forever; the outer Slurm controller
+    still has to issue ``scancel`` and prove that the allocation is terminal.
+    The underlying call may finish later in its disposable thread, but the
+    execution cleanup barrier remains the authoritative remote-process fence.
+    """
+
+    await asyncio.wait_for(
+        asyncio.to_thread(_cancel_sink_futures, client, sink_futures),
+        timeout=timeout_seconds,
+    )
 
 
 def _normalize_futures(futures) -> list:
@@ -1287,6 +1309,8 @@ async def execute_graph(
     execution_config: ExecutionConfig | dict | None = None,
     *,
     checkpoint_store: WindowCheckpointStore | None = None,
+    release_active_execution: bool = True,
+    external_cleanup_barrier: Callable[[], Awaitable[None]] | None = None,
 ):
     """Execute true terminal roots in Full Graph or bounded Window mode."""
     tasks: dict = {}
@@ -1310,6 +1334,14 @@ async def execute_graph(
     terminal_outputs: tuple[RecoveryOutput, ...] = ()
     resource_plan: WorkflowResourcePlan | None = None
     cluster_summary = None
+    external_cleanup_completed = False
+
+    async def run_external_cleanup_barrier() -> None:
+        nonlocal external_cleanup_completed
+        if external_cleanup_barrier is None or external_cleanup_completed:
+            return
+        await external_cleanup_barrier()
+        external_cleanup_completed = True
 
     if not execution_id:
         execution_id = uuid.uuid4().hex
@@ -1975,6 +2007,11 @@ async def execute_graph(
         for node_id in execution_roots:
             await progress_callback(node_id, 100, "Done", "done")
 
+        # A service-node Driver must prove its remote Worker allocation gone
+        # and close the Scheduler while it still owns active.lock. Only then
+        # may a successful recovery record become externally available.
+        await run_external_cleanup_barrier()
+
         # Recovery history remains durable after success. No await is allowed
         # between committing the terminal manifest, releasing ownership, and the
         # synchronous successful state transition.
@@ -2122,12 +2159,16 @@ async def execute_graph(
 
         if client and sink_futures and should_cancel_dask_objects:
             try:
-                _cancel_sink_futures(client, sink_futures)
+                await _cancel_sink_futures_with_timeout(
+                    client,
+                    sink_futures,
+                    timeout_seconds=5.0,
+                )
                 logger.info(
                     "[Cleanup] Force cancelled %s sink futures",
                     len(sink_futures),
                 )
-            except Exception as exc:
+            except (Exception, asyncio.TimeoutError) as exc:
                 logger.debug("[Cleanup] Cancel failed: %s", exc)
 
         # Successful Full Graph Futures and cancelled failure Futures both
@@ -2148,7 +2189,21 @@ async def execute_graph(
                             exc,
                         )
 
-        if client and should_cancel_dask_objects:
+        externally_managed_workers = external_cleanup_barrier is not None
+        # On failure/cancellation the normal success barrier was not reached.
+        # Run it after local Futures/node cleanup but before active.lock.
+        await run_external_cleanup_barrier()
+        if externally_managed_workers:
+            # The service-node Slurm Driver owns the Scheduler Client, while
+            # the Worker allocation is a separately tracked Slurm job.  Its
+            # outer lifecycle must first cancel/confirm that allocation and
+            # only then close the Scheduler; doing either operation here would
+            # release the execution lease before remote writers are gone.
+            logger.info(
+                "[Cleanup] External Slurm Worker allocation cleanup is "
+                "delegated to the service-node execution controller."
+            )
+        elif client and should_cancel_dask_objects:
             # A failed/cancelled task may have died while owning a no-expiry
             # Zarr storage-chunk lease.  Rebuild the fixed local cluster before
             # another execution instead of either deadlocking on that stale
@@ -2213,8 +2268,9 @@ async def execute_graph(
         # Keep the single-active-execution lease until all Driver/Worker
         # cleanup has completed. A following DAG may require a different
         # Worker topology and must not replace this execution's cluster early.
-        state_manager.clear_active_execution(execution_id)
-        state_manager.cleanup_old_executions()
+        if release_active_execution:
+            state_manager.clear_active_execution(execution_id)
+            state_manager.cleanup_old_executions()
 
         await log_memory_snapshot("execution_end_after_cleanup")
         mem_monitor.log_delta(

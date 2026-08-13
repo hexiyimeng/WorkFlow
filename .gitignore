@@ -37,3 +37,6 @@ backend/tests/*
 backend/demo_data/
 backend/demo_output/
 backend/examples/
+
+output/pdf
+tmp/

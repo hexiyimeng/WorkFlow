@@ -58,6 +58,42 @@ def test_active_lock_records_current_slurm_job_id(
     assert not layout.lock_path.exists()
 
 
+def test_service_driver_lock_records_worker_allocation_job_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.setenv("WorkFlow_SLURM_WORKER_JOB_ID", "9876")
+    layout = ExecutionLayout(tmp_path / "recovery")
+
+    with ActiveExecutionLock(layout, "execution-1"):
+        payload = json.loads(layout.lock_path.read_text(encoding="utf-8"))
+        assert payload["slurmJobId"] == "9876"
+
+
+def test_dead_local_driver_does_not_reclaim_live_worker_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _foreign_lock_payload(slurm_job_id="4321")
+    payload["hostname"] = window_execution.socket.gethostname()
+
+    def missing_process(_pid: int):
+        raise psutil.NoSuchProcess(_pid)
+
+    monkeypatch.setattr(window_execution.psutil, "Process", missing_process)
+    monkeypatch.setattr(
+        window_execution,
+        "_slurm_job_owner_state",
+        lambda job_id, **_kwargs: "alive" if job_id == "4321" else "unknown",
+    )
+
+    assert _active_lock_owner_state(
+        payload,
+        lock_path=tmp_path / "active.lock",
+    ) == "alive"
+
+
 def test_active_lock_without_slurm_environment_preserves_existing_format(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -348,7 +384,7 @@ def test_local_dead_process_still_uses_existing_pid_semantics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = _foreign_lock_payload()
+    payload = _foreign_lock_payload(slurm_job_id=None)
     payload["hostname"] = "local-node"
     monkeypatch.setattr(window_execution, "_normalized_hostname", lambda: "local-node")
 

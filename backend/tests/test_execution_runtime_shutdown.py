@@ -29,7 +29,7 @@ class _RuntimeState:
         self.current_task = None
 
 
-def test_slurm_shutdown_detaches_monitor_without_user_cancel_or_local_dask(
+def test_slurm_shutdown_interrupts_service_driver_without_detaching_workers(
     monkeypatch,
 ):
     async def scenario():
@@ -46,12 +46,6 @@ def test_slurm_shutdown_detaches_monitor_without_user_cancel_or_local_dask(
 
         monkeypatch.setattr(main, "state_manager", runtime_state)
         monkeypatch.setattr(main, "uses_slurm_execution_backend", lambda: True)
-        detach_calls = []
-        monkeypatch.setattr(
-            main,
-            "detach_execution_backend",
-            lambda execution_id: detach_calls.append(execution_id),
-        )
         monkeypatch.setattr(
             main.dask_service,
             "stop_cluster",
@@ -62,8 +56,7 @@ def test_slurm_shutdown_detaches_monitor_without_user_cancel_or_local_dask(
 
         assert task.cancelled()
         assert runtime_state.cancelled == []
-        assert detach_calls == ["execution-1"]
-        assert runtime_state.cleared == ["execution-1"]
+        assert runtime_state.cleared == []
         assert runtime_state.session.status == ExecutionStatus.RUNNING
         assert stop_calls == []
 

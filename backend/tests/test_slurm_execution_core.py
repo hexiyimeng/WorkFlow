@@ -50,6 +50,10 @@ def _policy(**overrides: object) -> SlurmPolicy:
         "max_cpus": 64,
         "max_gpus": 8,
         "max_memory_gib": 256,
+        "max_nodes": 4,
+        "cpus_per_node": 64,
+        "gpus_per_node": 8,
+        "memory_gib_per_node": 256,
         "allowed_partitions": ("gpu-compute", "short"),
     }
     values.update(overrides)
@@ -71,6 +75,53 @@ def test_policy_calculates_one_node_request_from_worker_counts() -> None:
     )
     assert request.time == "1-00:00:00"
     assert request.to_dict()["memoryGiB"] == 82
+    assert request.cpu_workers_by_node == (2,)
+    assert request.gpu_workers_by_node == (3,)
+    assert request.total_cpus == 12
+    assert request.total_gpus == 3
+    assert request.total_memory_gib == 82
+
+
+def test_policy_builds_deterministic_homogeneous_multi_node_placement() -> None:
+    request = _policy(
+        max_gpu_workers=16,
+        max_gpus=16,
+        max_memory_gib=512,
+        gpus_per_node=4,
+    ).resource_request(cpu_workers=2, gpu_workers=10)
+
+    assert request.nodes == 3
+    assert request.cpu_workers_by_node == (0, 1, 1)
+    assert request.gpu_workers_by_node == (4, 3, 3)
+    assert (request.cpus, request.gpus, request.memory_gib) == (13, 4, 98)
+    assert (request.total_cpus, request.total_gpus, request.total_memory_gib) == (
+        39,
+        12,
+        294,
+    )
+    assert request.to_dict()["cpuWorkersByNode"] == [0, 1, 1]
+    assert request.to_dict()["gpuWorkersByNode"] == [4, 3, 3]
+
+
+def test_cpu_only_workers_expand_to_smallest_feasible_node_count() -> None:
+    request = _policy(
+        cpus_per_node=4,
+        memory_gib_per_node=32,
+    ).resource_request(cpu_workers=7, gpu_workers=0)
+
+    assert request.nodes == 3
+    assert request.cpu_workers_by_node == (3, 2, 2)
+    assert request.gpu_workers_by_node == (0, 0, 0)
+    assert (request.cpus, request.gpus, request.memory_gib) == (4, 0, 14)
+
+
+def test_policy_rejects_topology_that_cannot_fit_within_max_nodes() -> None:
+    with pytest.raises(ValueError, match="cannot be placed"):
+        _policy(
+            max_nodes=2,
+            cpus_per_node=4,
+            memory_gib_per_node=32,
+        ).resource_request(cpu_workers=7, gpu_workers=0)
 
 
 def test_policy_permits_cpu_only_and_gpu_only_requests() -> None:
@@ -104,6 +155,9 @@ def test_resource_request_rejects_too_few_cpu_slots_for_workers() -> None:
         ("memory_gib_per_cpu_worker", True),
         ("max_cpus", 0),
         ("max_memory_gib", 0),
+        ("max_nodes", 0),
+        ("cpus_per_node", 0),
+        ("memory_gib_per_node", 0),
     ],
 )
 def test_policy_rejects_non_positive_integer_fields(field: str, value: object) -> None:
@@ -189,6 +243,7 @@ def test_sbatch_argv_is_explicit_and_slurm_19_05_compatible(tmp_path: Path) -> N
     assert "--export=NONE" in argv
     assert "--nodes=1" in argv
     assert "--ntasks=1" in argv
+    assert "--ntasks-per-node=1" in argv
     assert "--cpus-per-task=12" in argv
     assert "--mem=82G" in argv
     assert "--time=1-00:00:00" in argv
@@ -198,6 +253,29 @@ def test_sbatch_argv_is_explicit_and_slurm_19_05_compatible(tmp_path: Path) -> N
     # Whitespace and shell metacharacters remain inside individual argv items.
     assert str(script) in argv
     assert str(request_file) in argv
+
+
+def test_multi_node_sbatch_argv_uses_one_task_per_node(tmp_path: Path) -> None:
+    request = _policy(
+        max_gpu_workers=16,
+        max_gpus=16,
+        max_memory_gib=512,
+        gpus_per_node=4,
+    ).resource_request(cpu_workers=2, gpu_workers=10)
+
+    argv = build_sbatch_argv(
+        request,
+        script_path=tmp_path / "run.sh",
+        job_name="workflow-multi",
+        output_path=tmp_path / "%j.log",
+    )
+
+    assert "--nodes=3" in argv
+    assert "--ntasks=3" in argv
+    assert "--ntasks-per-node=1" in argv
+    assert "--cpus-per-task=13" in argv
+    assert "--mem=98G" in argv
+    assert "--gres=gpu:4" in argv
 
 
 def test_zero_gpu_request_has_no_gpu_allocation_flag(tmp_path: Path) -> None:
