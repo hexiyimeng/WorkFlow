@@ -2,8 +2,8 @@
 
 ## 结论
 
-基于目标集群返回的真实日志，提交 `839894bf0ab94b8567bee4d6ebce6f0c032e18d1`
-已验证以下链路：
+基于目标集群返回的真实日志，首轮提交 `839894bf0ab94b8567bee4d6ebce6f0c032e18d1`
+以及兼容性更新 `f2c3d6f1bcf8d5738e885e6174d141639314a903` 已验证以下链路：
 
 - Web 控制面常驻登录/服务节点 `mn02`，页面返回 HTTP 200；
 - 控制面按 Worker 数量提交 Slurm 作业，Dask Scheduler、Nanny 和 Worker 仅在
@@ -11,24 +11,30 @@
 - 两个 CPU Worker 的真实多进程任务通过；
 - 一个 CPU Worker 加一个 GPU Worker 的真实多进程任务通过，GPU Worker 在
   NVIDIA A40 上完成了 PyTorch CUDA 计算；
-- 两次测试都产生了持久结果文件，并完成 Dask 集群的正常关闭。
+- Windows 客户端经 OpenVPN/SSH loopback 隧道访问首页返回 HTTP 200，WebSocket
+  收到 Slurm 控制面就绪消息；
+- 三次测试都产生了持久结果文件，并完成 Dask 集群的正常关闭。
 
 因此，当前的“登录/服务节点控制面 → Slurm 动态申请 → 单个 compute node 内建立
-Dask 集群”架构已通过本次范围内的实机验收。此次验收**没有**证明多 GPU、跨多个
-compute node 或外部浏览器隧道可用；这些边界见下文。
+Dask 集群”架构已通过本次范围内的实机验收。此次验收**没有**证明多 GPU或跨多个
+compute node 可用；这些边界见下文。
 
 ## 验收环境和证据
 
 | 项目 | 结果 | 实机证据 |
 | --- | --- | --- |
-| 部署版本 | 通过 | commit `839894bf0ab94b8567bee4d6ebce6f0c032e18d1` |
+| 首轮部署版本 | 通过 | commit `839894bf0ab94b8567bee4d6ebce6f0c032e18d1` |
+| 最终服务端版本 | 通过 | commit `f2c3d6f1bcf8d5738e885e6174d141639314a903` |
+| Slurm 版本 | 通过 | `slurm 19.05.7`；`squeue=/usr/bin/squeue`；`scontrol=/usr/bin/scontrol` |
 | 控制面 | 通过 | tmux 会话 `workflow-control-plane` 正在运行；`http://127.0.0.1:8000/` 返回 200 |
 | 插件加载 | 通过 | `/plugin_status`：`ok=true`、loaded 7、failed 0、node-info error 0 |
 | 作业 55052 | 通过 | `c001`；请求 CPU=2、GPU=0；验证 CPU Worker=2 |
 | 作业 55053 | 通过 | `c001`；请求 CPU=1、GPU=1；验证 CPU Worker=1、GPU Worker=1 |
+| 作业 55054 | 通过 | 最终服务端版本；`c001`；请求 CPU=1、GPU=1；验证 CPU Worker=1、GPU Worker=1 |
 | CUDA 实算 | 通过（单卡） | NVIDIA A40；逻辑设备数 1；PyTorch 2.11.0+cu128；CUDA 12.8；计算校验通过 |
 | Worker 隔离 | 通过 | 每个作业中的两个 Worker 地址与 PID 均不相同 |
-| 关闭流程 | 通过 | 两个结果均记录 `clusterShutdown=graceful` |
+| 关闭流程 | 通过 | 三个结果均记录 `clusterShutdown=graceful` |
+| Windows 外部访问 | 通过 | 隧道端口 `127.0.0.1:18000` 返回 HTTP 200；插件 7/0；WebSocket 就绪消息正确 |
 | Slurm accounting | 不可用 | `sacct` 连接 `localhost:6819` 被拒绝，目标环境没有可用的 `slurmdbd` |
 
 具体 Worker 证据：
@@ -38,12 +44,16 @@ compute node 或外部浏览器隧道可用；这些边界见下文。
 - 55053：地址 `tcp://127.0.0.1:38423`、`tcp://127.0.0.1:42297`；PID
   3844285、3844292。GPU Worker 物理 GPU ID 为 0，CUDA 结果 checksum 为
   750608527851520。
+- 55054：地址 `tcp://127.0.0.1:40495`、`tcp://127.0.0.1:42139`；PID
+  3844649、3844646。GPU Worker 只看到逻辑设备 0，NVIDIA A40 CUDA kernel
+  checksum 为 750608527851520，`clusterShutdown=graceful`。
 
 结果文件位于：
 
 ```text
 /share/home/songzh/workflow-runtime/test-runs/multi-worker-smoke-55052.json
 /share/home/songzh/workflow-runtime/test-runs/multi-worker-smoke-55053.json
+/share/home/songzh/workflow-runtime/test-runs/multi-worker-smoke-55054.json
 ```
 
 ## 实际部署架构
@@ -179,7 +189,7 @@ ssh -N -T \
 
 ## `sacct/slurmdbd` 兼容性事项
 
-目标集群上的 `sacct` 返回 `slurmdbd: Connection refused`。这不影响本次两个正常作业，
+目标集群上的 `sacct` 返回 `slurmdbd: Connection refused`。这不影响本次三个正常作业，
 因为 runner 的原子 `result.json` 已提供最终结果；但在节点崩溃或作业被强制终止、尚未来得及
 写结果时，仅依赖 `sacct` 会导致控制面无法确认终态，进而可能延迟释放 execution lease 或
 Window recovery lock。
@@ -189,14 +199,14 @@ Window recovery lock。
 `MinJobAge` 被清理时，只有连续两次精确、成功的 `squeue` 查询都找不到同一 job，且仍没有
 runner 结果，才将丢失作业判为失败。它不会把没有证据的作业判为成功。
 
-本报告中的实机结果来自 commit `839894b`。上述无 `slurmdbd` 兼容性修改已提交并推送为
-`bb7c53c`，但尚未作为新版本重新部署到目标集群，也尚未做目标集群故障注入验收；更新后必须再次执行
-安装、控制面重启，并至少验证：
+上述无 `slurmdbd` 兼容性修改由 `bb7c53c` 实现，并已随服务端版本 `f2c3d6f`
+部署到目标集群。真实作业 55054 证明更新后的控制面、Slurm 19.05.7 状态命令和
+CPU/GPU Worker 主路径正常；尚未做目标集群“作业在写结果前被强杀”的故障注入验收。
+已验证的状态命令包括：
 
 ```bash
 scontrol --version
-scontrol show job -o 55052
-scontrol show job -o 55053
+scontrol --local --oneliner --quiet show job 55054
 ```
 
 若作业历史已被清理，`scontrol` 查不到旧 job 是允许的；仍需用新提交的作业验证运行态查询
@@ -209,9 +219,9 @@ scontrol show job -o 55053
 - **跨节点未实现、未实测**：当前是一个 Slurm job、一个 compute node 内的 Dask 集群。
 - **页面正式 Graph 执行未包含在本次证据中**：smoke 已验证生产 `DaskService` 的真实
   Worker 启动和任务绑定，但还应从页面提交一份代表性 Graph 做端到端验收。
-- **外部浏览器未实测**：服务节点本机 HTTP 200 已确认，但附件中没有 Windows 客户端
-  VPN、SSH 隧道及浏览器成功打开页面的证据。
-- **无 accounting 故障路径待复验**：`sacct` 不可用已确认；兼容修改部署后仍需验证作业
+- **浏览器视觉交互未自动化断言**：Windows 隧道的 HTTP、插件 API 和 WebSocket 已实测，
+  但没有用自动化视觉工具逐项点击页面组件。
+- **无 accounting 故障注入待复验**：`sacct` 不可用已确认，兼容修改已部署；仍需验证作业
   在写入 `result.json` 前异常结束时，UI 和 Window recovery lock 能在预期宽限期后收敛。
 - **站点策略依赖管理员确认**：长期在登录节点运行 tmux 服务、partition/account/QoS、
   单节点 CPU/内存/GPU 上限及 SSH 转发权限应遵循集群管理规定。
