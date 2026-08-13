@@ -29,6 +29,7 @@ from core.slurm_execution import (
     SlurmResourceRequest,
     build_sbatch_argv,
     parse_sbatch_submission,
+    parse_scontrol_job_record,
     resolve_execution_directory,
     validate_execution_id,
 )
@@ -85,7 +86,13 @@ _SLURM_TERMINAL_STATES = frozenset({
     "TIMEOUT",
 })
 _SLURM_SAFE_COMMAND_RE = re.compile(r"[^\x00\r\n]+\Z")
-_SLURM_OPTION_ENV_PREFIXES = ("SBATCH_", "SCANCEL_", "SQUEUE_", "SACCT_")
+_SLURM_OPTION_ENV_PREFIXES = (
+    "SBATCH_",
+    "SCANCEL_",
+    "SQUEUE_",
+    "SACCT_",
+    "SCONTROL_",
+)
 _SLURM_CLI_ENV_ALLOWLIST = frozenset({
     "HOME",
     "LANG",
@@ -272,6 +279,30 @@ def _resolved_executable(
     return str(resolved)
 
 
+def _optional_resolved_executable(
+    value: object,
+    *,
+    name: str,
+    default: str,
+    search_path: str | None,
+) -> str | None:
+    """Resolve an optional Slurm CLI without hiding invalid explicit paths."""
+
+    explicit = value is not None and bool(str(value).strip())
+    selected = str(value).strip() if explicit else default
+    try:
+        return _resolved_executable(
+            selected,
+            name=name,
+            default=default,
+            search_path=search_path,
+        )
+    except ValueError:
+        if explicit:
+            raise
+        return None
+
+
 def slurm_policy_from_environment(
     environment: Mapping[str, str] | None = None,
 ) -> SlurmPolicy:
@@ -326,7 +357,8 @@ class SlurmRuntimeConfig:
     policy: SlurmPolicy
     sbatch_executable: str
     squeue_executable: str
-    sacct_executable: str
+    sacct_executable: str | None
+    scontrol_executable: str
     scancel_executable: str
     poll_interval_seconds: float
     result_grace_seconds: float
@@ -380,10 +412,21 @@ class SlurmRuntimeConfig:
                 default="squeue",
                 search_path=env.get("PATH"),
             ),
-            sacct_executable=_resolved_executable(
-                env.get("WorkFlow_SLURM_SACCT"),
-                name="WorkFlow_SLURM_SACCT",
-                default="sacct",
+            sacct_executable=(
+                None
+                if "WorkFlow_SLURM_SACCT" in env
+                and not str(env.get("WorkFlow_SLURM_SACCT", "")).strip()
+                else _optional_resolved_executable(
+                    env.get("WorkFlow_SLURM_SACCT"),
+                    name="WorkFlow_SLURM_SACCT",
+                    default="sacct",
+                    search_path=env.get("PATH"),
+                )
+            ),
+            scontrol_executable=_resolved_executable(
+                env.get("WorkFlow_SLURM_SCONTROL"),
+                name="WorkFlow_SLURM_SCONTROL",
+                default="scontrol",
                 search_path=env.get("PATH"),
             ),
             scancel_executable=_safe_command(
@@ -746,6 +789,7 @@ class SlurmExecutionService:
         config: SlurmRuntimeConfig,
         job_id: str,
         cluster: str | None = None,
+        submission_token: str | None = None,
     ) -> tuple[bool, tuple[str, str, str] | None]:
         """Return (query_succeeded, queue_row).
 
@@ -756,14 +800,15 @@ class SlurmExecutionService:
         try:
             argv = [
                 config.squeue_executable,
-                "-h",
-                "-j",
-                job_id,
-                "-o",
-                "%T|%N|%R",
+                "--local",
+                "--noheader",
+                f"--jobs={job_id}",
+                "--format=%i|%k|%T|%N|%R",
             ]
             if cluster:
-                argv[1:1] = ["-M", cluster]
+                # The submitted job belongs to the local controller. Do not
+                # use -M here: old federation support can require slurmdbd.
+                logger.debug("Ignoring sbatch cluster suffix for local squeue: %s", cluster)
             result = await asyncio.to_thread(
                 self._run_command,
                 tuple(argv),
@@ -775,19 +820,38 @@ class SlurmExecutionService:
         if result.returncode != 0:
             logger.warning("squeue failed for job %s: %s", job_id, result.stderr.strip())
             return False, None
-        line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
-        if not line:
+        lines = [item.strip() for item in result.stdout.splitlines() if item.strip()]
+        if not lines:
             return True, None
-        fields = line.split("|", 2)
-        fields.extend([""] * (3 - len(fields)))
-        return True, (fields[0].upper(), fields[1], fields[2])
+        if len(lines) != 1:
+            logger.warning("squeue returned ambiguous rows for root job %s", job_id)
+            return False, None
+        fields = lines[0].split("|", 4)
+        if len(fields) != 5 or fields[0].strip() != job_id:
+            logger.warning("squeue returned a mismatched row for root job %s", job_id)
+            return False, None
+        if submission_token is not None and fields[1].strip() != submission_token:
+            logger.error(
+                "Slurm job ID %s belongs to another submission token; refusing "
+                "to monitor or control it.",
+                job_id,
+            )
+            return False, None
+        return True, (
+            fields[2].strip().upper(),
+            fields[3].strip(),
+            fields[4].strip(),
+        )
 
     async def _query_accounting_state(
         self,
         config: SlurmRuntimeConfig,
         job_id: str,
         cluster: str | None = None,
-    ) -> tuple[str, str, str] | None:
+        submission_token: str | None = None,
+    ) -> tuple[bool, tuple[str, str, str] | None]:
+        if config.sacct_executable is None:
+            return False, None
         try:
             argv = [
                 config.sacct_executable,
@@ -795,28 +859,104 @@ class SlurmExecutionService:
                 "-P",
                 "-j",
                 job_id,
-                "--format=State,ExitCode,NodeList",
+                "--format=JobIDRaw,State,ExitCode,NodeList,Comment",
             ]
-            if cluster:
-                argv[1:1] = ["-M", cluster]
             result = await asyncio.to_thread(
                 self._run_command,
                 tuple(argv),
                 timeout=10.0,
             )
         except (OSError, subprocess.SubprocessError):
-            return None
+            return False, None
         if result.returncode != 0:
-            return None
+            return False, None
+        root_states: list[tuple[str, str, str]] = []
         for raw_line in result.stdout.splitlines():
             fields = [field.strip() for field in raw_line.split("|")]
-            if not fields or not fields[0]:
+            if len(fields) < 2 or fields[0] != job_id or not fields[1]:
                 continue
-            state = fields[0].split(None, 1)[0].split("+", 1)[0].upper()
-            if state in _SLURM_TERMINAL_STATES:
-                fields.extend([""] * (3 - len(fields)))
-                return state, fields[1], fields[2]
-        return None
+            if submission_token is not None and (
+                len(fields) < 5 or fields[4] != submission_token
+            ):
+                continue
+            state = fields[1].split(None, 1)[0].split("+", 1)[0].upper()
+            fields.extend([""] * (4 - len(fields)))
+            root_states.append((state, fields[2], fields[3]))
+        if len(root_states) == 1 and root_states[0][0] in _SLURM_TERMINAL_STATES:
+            return True, root_states[0]
+        if root_states:
+            return True, None
+        return False, None
+
+    async def _query_scontrol_state(
+        self,
+        config: SlurmRuntimeConfig,
+        job_id: str,
+        cluster: str | None = None,
+        submission_token: str | None = None,
+    ) -> tuple[bool, tuple[str, str, str] | None]:
+        """Return ``(record_found, terminal_state)`` from the controller.
+
+        ``scontrol`` is available on old installations that have no working
+        slurmdbd.  A failed query, missing/purged record, malformed output, or
+        non-terminal state remains unknown so the execution lease is retained.
+        """
+
+        argv = [
+            config.scontrol_executable,
+            "--local",
+            "--oneliner",
+            "--quiet",
+            "show",
+            "job",
+            job_id,
+        ]
+        try:
+            result = await asyncio.to_thread(
+                self._run_command,
+                tuple(argv),
+                timeout=10.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False, None
+        if result.returncode != 0:
+            return False, None
+        try:
+            record = parse_scontrol_job_record(
+                result.stdout,
+                expected_job_id=job_id,
+            )
+        except (TypeError, ValueError):
+            return False, None
+        if record is None:
+            return False, None
+        if submission_token is not None and record.comment != submission_token:
+            return False, None
+        if record.state not in _SLURM_TERMINAL_STATES:
+            return True, None
+        return True, (record.state, record.exit_code, record.node_list)
+
+    async def _query_terminal_state(
+        self,
+        config: SlurmRuntimeConfig,
+        job_id: str,
+        cluster: str | None = None,
+        submission_token: str | None = None,
+    ) -> tuple[bool, tuple[str, str, str] | None]:
+        """Return whether an authoritative record exists and its terminal state.
+
+        Query the controller first: it works without slurmdbd and avoids a
+        noisy refused accounting connection on legacy installations.
+        """
+
+        control_found, control_state = await self._query_scontrol_state(
+            config, job_id, cluster, submission_token
+        )
+        if control_found:
+            return control_found, control_state
+        return await self._query_accounting_state(
+            config, job_id, cluster, submission_token
+        )
 
     async def _query_job_by_submission_token(
         self,
@@ -829,9 +969,9 @@ class SlurmExecutionService:
                 self._run_command,
                 (
                     config.squeue_executable,
-                    "-h",
-                    "-o",
-                    "%i|%k|%T",
+                    "--local",
+                    "--noheader",
+                    "--format=%i|%k|%T",
                 ),
                 timeout=10.0,
             )
@@ -981,6 +1121,7 @@ class SlurmExecutionService:
         run_directory: Path,
         resource_request: SlurmResourceRequest,
         cluster: str | None = None,
+        submission_token: str | None = None,
         cursor: _EventCursor | None = None,
     ) -> dict[str, Any]:
         event_path = run_directory / EVENTS_FILENAME
@@ -989,20 +1130,24 @@ class SlurmExecutionService:
             cursor = _EventCursor()
         last_queue_state: tuple[str, str, str] | None = None
         absent_since: float | None = None
+        absent_confirmations = 0
+
+        def load_terminal_result() -> dict[str, Any] | None:
+            if not result_path.exists():
+                return None
+            result = _read_json_file(result_path)
+            if result.get("schemaVersion") != REQUEST_SCHEMA_VERSION:
+                raise RuntimeError("Slurm result has an unsupported schema version.")
+            if result.get("executionId") != execution_id:
+                raise RuntimeError("Slurm result belongs to another execution.")
+            if result.get("jobId") != job_id:
+                raise RuntimeError("Slurm result belongs to another Slurm job.")
+            if result.get("status") not in _TERMINAL_STATUSES:
+                raise RuntimeError("Slurm result has an invalid terminal status.")
+            return result
 
         while True:
-            terminal_result: dict[str, Any] | None = None
-            if result_path.exists():
-                result = _read_json_file(result_path)
-                if result.get("schemaVersion") != REQUEST_SCHEMA_VERSION:
-                    raise RuntimeError("Slurm result has an unsupported schema version.")
-                if result.get("executionId") != execution_id:
-                    raise RuntimeError("Slurm result belongs to another execution.")
-                if result.get("jobId") != job_id:
-                    raise RuntimeError("Slurm result belongs to another Slurm job.")
-                if result.get("status") not in _TERMINAL_STATUSES:
-                    raise RuntimeError("Slurm result has an invalid terminal status.")
-                terminal_result = result
+            terminal_result = load_terminal_result()
 
             try:
                 await self._relay_events(
@@ -1034,14 +1179,17 @@ class SlurmExecutionService:
                 config,
                 job_id,
                 cluster,
+                submission_token,
             )
             if not queue_query_succeeded:
                 # Preserve the active lease and keep waiting for the durable
                 # runner result.  A transient Slurm control-plane outage must
                 # never be mistaken for a terminal compute job.
                 absent_since = None
+                absent_confirmations = 0
             elif queue_state is not None:
                 absent_since = None
+                absent_confirmations = 0
                 if queue_state != last_queue_state:
                     last_queue_state = queue_state
                     await self._broadcast_job_state(
@@ -1051,22 +1199,58 @@ class SlurmExecutionService:
                         *queue_state,
                     )
             else:
+                absent_confirmations += 1
                 if absent_since is None:
                     absent_since = time.monotonic()
-                if time.monotonic() - absent_since >= config.result_grace_seconds:
-                    accounting = await self._query_accounting_state(
+                if (
+                    absent_confirmations >= 2
+                    and time.monotonic() - absent_since
+                    >= config.result_grace_seconds
+                ):
+                    history_found, terminal_state = await self._query_terminal_state(
                         config,
                         job_id,
                         cluster,
+                        submission_token,
                     )
-                    if accounting is None:
-                        # squeue no longer sees the job, but accounting and the
-                        # durable runner result may lag.  Neither absence nor a
-                        # query failure proves terminal state, so retain the
-                        # active lease and retry.
-                        await asyncio.sleep(config.poll_interval_seconds)
-                        continue
-                    state, exit_code, node = accounting
+                    if terminal_state is None:
+                        if history_found:
+                            # An exact non-terminal controller record
+                            # contradicts squeue absence. Keep the lease and
+                            # require later scheduler agreement or a result.
+                            absent_since = None
+                            absent_confirmations = 0
+                            await asyncio.sleep(config.poll_interval_seconds)
+                            continue
+                        # The successful exact squeue query has continuously
+                        # reported no root allocation for the full grace
+                        # period. Old controllers can purge scontrol history
+                        # and may have no slurmdbd at all. Give a concurrently
+                        # published runner result one final chance, then fail
+                        # closed as a lost runner result rather than keeping the
+                        # UI lease forever. Scheduler *query failures* never
+                        # enter this branch because they reset absent_since.
+                        final_runner_result = load_terminal_result()
+                        if final_runner_result is not None:
+                            return final_runner_result
+                        return {
+                            "schemaVersion": 1,
+                            "executionId": execution_id,
+                            "jobId": job_id,
+                            "status": ExecutionStatus.FAILED,
+                            "message": (
+                                "Slurm job disappeared from squeue without a "
+                                "durable runner result, and no terminal root-job "
+                                "record remains in sacct or scontrol."
+                            ),
+                            "finishedAt": _utc_timestamp(),
+                            "runnerHost": None,
+                            "exitCode": None,
+                        }
+                    state, exit_code, node = terminal_state
+                    final_runner_result = load_terminal_result()
+                    if final_runner_result is not None:
+                        return final_runner_result
                     status = (
                         ExecutionStatus.CANCELLED
                         if state == "CANCELLED"
@@ -1098,6 +1282,7 @@ class SlurmExecutionService:
         run_directory: Path,
         resource_request: SlurmResourceRequest,
         cluster: str | None = None,
+        submission_token: str | None = None,
     ) -> dict[str, Any]:
         """Retry control-plane monitoring without releasing a live job lease."""
         last_error: str | None = None
@@ -1111,6 +1296,7 @@ class SlurmExecutionService:
                     run_directory=run_directory,
                     resource_request=resource_request,
                     cluster=cluster,
+                    submission_token=submission_token,
                     cursor=cursor,
                 )
             except asyncio.CancelledError:
@@ -1151,10 +1337,21 @@ class SlurmExecutionService:
         *,
         whole_job: bool,
         cluster: str | None = None,
+        submission_token: str | None = None,
     ) -> None:
+        query_succeeded, queue_state = await self._query_queue_state(
+            config,
+            job_id,
+            cluster,
+            submission_token,
+        )
+        if not query_succeeded:
+            raise SlurmSubmissionError(
+                f"Cannot prove ownership of Slurm job {job_id}; refusing scancel."
+            )
+        if queue_state is None:
+            return
         argv = [config.scancel_executable]
-        if cluster:
-            argv.extend(("-M", cluster))
         if not whole_job:
             argv.extend(("--batch", "--signal=TERM"))
         argv.append(job_id)
@@ -1176,6 +1373,7 @@ class SlurmExecutionService:
         execution_id: str,
         job_id: str,
         cluster: str | None,
+        submission_token: str,
         run_directory: Path,
         resource_request: SlurmResourceRequest,
     ) -> dict[str, Any]:
@@ -1201,6 +1399,7 @@ class SlurmExecutionService:
             config,
             job_id,
             cluster,
+            submission_token,
         )
         pending = bool(
             query_succeeded
@@ -1213,6 +1412,7 @@ class SlurmExecutionService:
                 job_id,
                 whole_job=pending,
                 cluster=cluster,
+                submission_token=submission_token,
             )
         except Exception as exc:
             state_manager.add_log(
@@ -1227,6 +1427,7 @@ class SlurmExecutionService:
             execution_id=execution_id,
             job_id=job_id,
             cluster=cluster,
+            submission_token=submission_token,
             run_directory=run_directory,
             resource_request=resource_request,
         ))
@@ -1247,6 +1448,7 @@ class SlurmExecutionService:
                         job_id,
                         whole_job=True,
                         cluster=cluster,
+                        submission_token=submission_token,
                     )
                 except Exception as exc:
                     state_manager.add_log(
@@ -1380,6 +1582,7 @@ class SlurmExecutionService:
         execution_id: str,
         job_id: str,
         cluster: str | None,
+        submission_token: str,
         submitted_at: object,
         run_directory: Path,
         job_path: Path,
@@ -1391,6 +1594,7 @@ class SlurmExecutionService:
                 execution_id=execution_id,
                 job_id=job_id,
                 cluster=cluster,
+                submission_token=submission_token,
                 run_directory=run_directory,
                 resource_request=resource_request,
             )
@@ -1419,6 +1623,7 @@ class SlurmExecutionService:
                         execution_id=execution_id,
                         job_id=job_id,
                         cluster=cluster,
+                        submission_token=submission_token,
                         run_directory=run_directory,
                         resource_request=resource_request,
                     )
@@ -1458,7 +1663,16 @@ class SlurmExecutionService:
         """
         config = SlurmRuntimeConfig.from_environment()
         candidates: list[
-            tuple[str, str, str | None, object, Path, Path, SlurmResourceRequest]
+            tuple[
+                str,
+                str,
+                str | None,
+                str,
+                object,
+                Path,
+                Path,
+                SlurmResourceRequest,
+            ]
         ] = []
         for run_directory in sorted(config.execution_root.iterdir()):
             if run_directory.is_symlink() or not run_directory.is_dir():
@@ -1523,6 +1737,11 @@ class SlurmExecutionService:
             cluster_value = record.get("cluster")
             if cluster_value is not None and not isinstance(cluster_value, str):
                 raise SlurmSubmissionError(f"Invalid Slurm cluster in {job_path}")
+            submission_token = record.get("submissionToken")
+            if not isinstance(submission_token, str) or not submission_token:
+                raise SlurmSubmissionError(
+                    f"Non-terminal Slurm job has no ownership token: {job_path}"
+                )
             resource_request = _resource_request_from_mapping(
                 record.get("resources")
             )
@@ -1530,6 +1749,7 @@ class SlurmExecutionService:
                 execution_id,
                 job_id,
                 cluster_value,
+                submission_token,
                 record.get("submittedAt"),
                 run_directory,
                 job_path,
@@ -1549,6 +1769,7 @@ class SlurmExecutionService:
             execution_id,
             job_id,
             cluster,
+            submission_token,
             submitted_at,
             run_directory,
             job_path,
@@ -1560,6 +1781,7 @@ class SlurmExecutionService:
             execution_id=execution_id,
             job_id=job_id,
             cluster=cluster,
+            submission_token=submission_token,
             submitted_at=submitted_at,
             run_directory=run_directory,
             job_path=job_path,
@@ -1653,7 +1875,8 @@ class SlurmExecutionService:
                 str(config.policy.memory_gib_per_cpu_worker),
                 str(config.policy.memory_gib_per_gpu_worker),
                 config.squeue_executable,
-                config.sacct_executable,
+                config.sacct_executable or "-",
+                config.scontrol_executable,
             ),
             sbatch_executable=config.sbatch_executable,
             comment=submission_token,
@@ -1763,6 +1986,7 @@ class SlurmExecutionService:
                 execution_id=execution_id,
                 job_id=job_id,
                 cluster=submission.cluster,
+                submission_token=submission_token,
                 run_directory=run_directory,
                 resource_request=resource_request,
             )
@@ -1799,6 +2023,7 @@ class SlurmExecutionService:
                         execution_id=execution_id,
                         job_id=job_id,
                         cluster=submission.cluster,
+                        submission_token=submission_token,
                         run_directory=run_directory,
                         resource_request=resource_request,
                     )

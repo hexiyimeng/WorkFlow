@@ -167,13 +167,22 @@ sbatch --export=NONE \
   /shared/song/workflow-runtime \
   8 64 \
   "$(command -v squeue)" \
-  "$(command -v sacct)"
+  "$(command -v sacct || printf '%s' '-')" \
+  "$(command -v scontrol)"
 ```
 
 上面的资源和 Worker 内存数字只是一次手工调试请求，不是生产默认值。正常
 运行时由 Graph 资源计划与管理员策略生成这些参数。CPU/GPU Worker 内存上限
 会显式传入 compute job，避免 Dask 误把整台物理节点内存当成本次 allocation
 可用内存。
+
+`sacct` 是可选的终态历史来源。旧集群未运行 `slurmdbd` 时，控制面不会因
+`sacct: Connection refused` 而停止：它优先读取 Slurm 19.05 已支持的
+`scontrol show job -o` 根作业记录。若控制器已按 `MinJobAge` 清除了记录，
+则只在两次精确 `squeue` 查询均成功且持续找不到同一根 job、同时没有 runner
+的原子 `result.json` 后，才把作业判为丢失并失败结束。任何命令错误、错误 job
+编号、歧义输出或明确的非终态记录都会继续保持 active，避免误回收正在运行的
+Window recovery lock。
 
 ## Graph 如何决定 Worker 和 Slurm 资源
 

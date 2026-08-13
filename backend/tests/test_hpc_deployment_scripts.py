@@ -27,7 +27,13 @@ def test_control_plane_is_not_submitted_as_a_slurm_job() -> None:
     assert "exec \"$PYTHON\" -m uvicorn" in script
     assert "sbatch" not in script.split("exec \"$PYTHON\" -m uvicorn", 1)[1]
     assert "dask_service" not in script
-    for command in ("SBATCH_COMMAND", "SQUEUE_COMMAND", "SACCT_COMMAND", "SCANCEL_COMMAND"):
+    for command in (
+        "SBATCH_COMMAND",
+        "SQUEUE_COMMAND",
+        "SACCT_COMMAND",
+        "SCONTROL_COMMAND",
+        "SCANCEL_COMMAND",
+    ):
         assert command in script
 
 
@@ -78,9 +84,11 @@ def test_execution_job_has_no_fixed_graph_resource_request() -> None:
     assert not any("--gres" in line for line in directives)
     assert not any("--time" in line for line in directives)
     assert "WorkFlow_EXECUTION_BACKEND=\"local\"" in script
-    assert "if (( $# != 6 ))" in script
+    assert "if (( $# != 7 ))" in script
     assert "export WorkFlow_SLURM_SQUEUE=\"$SQUEUE_PATH\"" in script
     assert "export WorkFlow_SLURM_SACCT=\"$SACCT_PATH\"" in script
+    assert "export WorkFlow_SLURM_SCONTROL=\"$SCONTROL_PATH\"" in script
+    assert 'if [[ "$SACCT_PATH" == "-" ]]' in script
     assert '[[ ! -f "$scheduler_command" || ! -x "$scheduler_command" ]]' in script
     assert "exec \"$PYTHON\" -m services.slurm_execution_runner" in script
 

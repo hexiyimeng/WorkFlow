@@ -46,7 +46,8 @@ def _runtime_config(tmp_path: Path) -> service_module.SlurmRuntimeConfig:
     cli_directory.mkdir()
     squeue = cli_directory / "squeue"
     sacct = cli_directory / "sacct"
-    for executable in (squeue, sacct):
+    scontrol = cli_directory / "scontrol"
+    for executable in (squeue, sacct, scontrol):
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         executable.chmod(0o755)
     return service_module.SlurmRuntimeConfig(
@@ -58,6 +59,7 @@ def _runtime_config(tmp_path: Path) -> service_module.SlurmRuntimeConfig:
         sbatch_executable="sbatch",
         squeue_executable=str(squeue.resolve()),
         sacct_executable=str(sacct.resolve()),
+        scontrol_executable=str(scontrol.resolve()),
         scancel_executable="scancel",
         poll_interval_seconds=0.001,
         result_grace_seconds=0.001,
@@ -79,6 +81,7 @@ def test_runtime_config_finds_checkout_above_deploy_directory(tmp_path):
         "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
         "WorkFlow_SLURM_SQUEUE": config.squeue_executable,
         "WorkFlow_SLURM_SACCT": config.sacct_executable,
+        "WorkFlow_SLURM_SCONTROL": config.scontrol_executable,
     }
 
     loaded = service_module.SlurmRuntimeConfig.from_environment(environment)
@@ -87,6 +90,7 @@ def test_runtime_config_finds_checkout_above_deploy_directory(tmp_path):
     assert loaded.execution_root == config.execution_root
     assert loaded.squeue_executable == config.squeue_executable
     assert loaded.sacct_executable == config.sacct_executable
+    assert loaded.scontrol_executable == config.scontrol_executable
 
 
 def test_runtime_config_rejects_missing_status_command(tmp_path):
@@ -96,6 +100,7 @@ def test_runtime_config_rejects_missing_status_command(tmp_path):
         "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
         "WorkFlow_SLURM_SQUEUE": str(tmp_path / "missing-squeue"),
         "WorkFlow_SLURM_SACCT": config.sacct_executable,
+        "WorkFlow_SLURM_SCONTROL": config.scontrol_executable,
     }
 
     with pytest.raises(ValueError, match="WorkFlow_SLURM_SQUEUE"):
@@ -146,6 +151,86 @@ def test_squeue_failure_is_not_reported_as_job_absence(tmp_path, monkeypatch):
     assert row is None
 
 
+def test_squeue_requires_one_exact_root_job_row(tmp_path, monkeypatch):
+    service = service_module.SlurmExecutionService()
+    config = _runtime_config(tmp_path)
+    outputs = iter([
+        "123|wf:token:one|RUNNING|c001|None\n",
+        "123.batch|wf:token:one|RUNNING|c001|None\n",
+        "123|wf:token:one|RUNNING|c001|None\n123|wf:token:one|PENDING||Resources\n",
+    ])
+    monkeypatch.setattr(
+        service,
+        "_run_command",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, next(outputs), ""
+        ),
+    )
+
+    async def scenario():
+        assert await service._query_queue_state(
+            config, "123", submission_token="wf:token:one"
+        ) == (
+            True,
+            ("RUNNING", "c001", "None"),
+        )
+        assert await service._query_queue_state(config, "123") == (False, None)
+        assert await service._query_queue_state(config, "123") == (False, None)
+
+    asyncio.run(scenario())
+
+
+def test_squeue_submission_token_mismatch_is_unknown(tmp_path, monkeypatch):
+    service = service_module.SlurmExecutionService()
+    config = _runtime_config(tmp_path)
+    monkeypatch.setattr(
+        service,
+        "_run_command",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            "123|wf:another:execution|RUNNING|c001|None\n",
+            "",
+        ),
+    )
+
+    assert asyncio.run(service._query_queue_state(
+        config,
+        "123",
+        submission_token="wf:expected:execution",
+    )) == (False, None)
+
+
+def test_cancel_refuses_reused_job_id_with_different_submission_token(
+    tmp_path,
+    monkeypatch,
+):
+    service = service_module.SlurmExecutionService()
+    config = _runtime_config(tmp_path)
+    commands = []
+
+    def command(argv, **kwargs):
+        commands.append(tuple(argv))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "123|wf:other:run|RUNNING|c001|None\n",
+            "",
+        )
+
+    monkeypatch.setattr(service, "_run_command", command)
+
+    with pytest.raises(service_module.SlurmSubmissionError, match="ownership"):
+        asyncio.run(service._send_cancel(
+            config,
+            "123",
+            whole_job=True,
+            submission_token="wf:expected:run",
+        ))
+
+    assert all(command[0] != "scancel" for command in commands)
+
+
 def test_slurm_cli_environment_removes_option_overrides():
     cleaned = service_module._slurm_cli_environment({
         "PATH": "/usr/bin",
@@ -166,7 +251,7 @@ def test_slurm_cli_environment_removes_option_overrides():
     }
 
 
-def test_cancel_argv_targets_batch_first_and_propagates_cluster(
+def test_cancel_argv_targets_local_batch_first_without_federation(
     tmp_path,
     monkeypatch,
 ):
@@ -179,6 +264,11 @@ def test_cancel_argv_targets_batch_first_and_propagates_cluster(
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(service, "_run_command", command)
+
+    async def owned_job(*args, **kwargs):
+        return True, ("RUNNING", "c001", "")
+
+    monkeypatch.setattr(service, "_query_queue_state", owned_job)
 
     async def scenario():
         await service._send_cancel(
@@ -197,8 +287,8 @@ def test_cancel_argv_targets_batch_first_and_propagates_cluster(
     asyncio.run(scenario())
 
     assert commands == [
-        ("scancel", "-M", "alpha", "--batch", "--signal=TERM", "123"),
-        ("scancel", "-M", "alpha", "123"),
+        ("scancel", "--batch", "--signal=TERM", "123"),
+        ("scancel", "123"),
     ]
 
 
@@ -211,14 +301,109 @@ def test_accounting_normalizes_cancelled_by_uid(tmp_path, monkeypatch):
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args[0],
             0,
-            "CANCELLED by 1000|0:15|c002\n",
+            "123|CANCELLED by 1000|0:15|c002\n",
             "",
         ),
     )
 
     assert asyncio.run(
         service._query_accounting_state(config, "123")
-    ) == ("CANCELLED", "0:15", "c002")
+    ) == (True, ("CANCELLED", "0:15", "c002"))
+
+
+def test_runtime_config_allows_missing_optional_sacct(tmp_path):
+    config = _runtime_config(tmp_path)
+    empty_path = tmp_path / "without-accounting"
+    empty_path.mkdir()
+    environment = {
+        "PATH": str(empty_path),
+        "WorkFlow_SLURM_RUNTIME_DIR": str(config.runtime_directory),
+        "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
+        "WorkFlow_SLURM_SQUEUE": config.squeue_executable,
+        "WorkFlow_SLURM_SCONTROL": config.scontrol_executable,
+    }
+
+    loaded = service_module.SlurmRuntimeConfig.from_environment(environment)
+
+    assert loaded.sacct_executable is None
+
+
+def test_runtime_config_explicit_empty_sacct_disables_autodiscovery(tmp_path):
+    config = _runtime_config(tmp_path)
+    environment = {
+        "PATH": str(Path(config.sacct_executable).parent),
+        "WorkFlow_SLURM_RUNTIME_DIR": str(config.runtime_directory),
+        "WorkFlow_SLURM_EXECUTION_SCRIPT": str(config.execution_script),
+        "WorkFlow_SLURM_SQUEUE": config.squeue_executable,
+        "WorkFlow_SLURM_SCONTROL": config.scontrol_executable,
+        "WorkFlow_SLURM_SACCT": "",
+    }
+
+    loaded = service_module.SlurmRuntimeConfig.from_environment(environment)
+
+    assert loaded.sacct_executable is None
+
+
+def test_scontrol_returns_only_exact_terminal_root_job(tmp_path, monkeypatch):
+    service = service_module.SlurmExecutionService()
+    config = _runtime_config(tmp_path)
+    outputs = iter([
+        "JobId=123 JobState=NODE_FAIL ExitCode=1:0 NodeList=c001\n",
+        "JobId=123.batch JobState=FAILED ExitCode=1:0 NodeList=c001\n",
+        "JobId=123 JobState=RUNNING ExitCode=0:0 NodeList=c001\n",
+        "JobId=123 JobState=FAILED\nJobId=123 JobState=FAILED\n",
+    ])
+    monkeypatch.setattr(
+        service,
+        "_run_command",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, next(outputs), ""
+        ),
+    )
+
+    async def scenario():
+        assert await service._query_scontrol_state(config, "123") == (
+            True,
+            ("NODE_FAIL", "1:0", "c001"),
+        )
+        assert await service._query_scontrol_state(config, "123") == (False, None)
+        assert await service._query_scontrol_state(config, "123") == (True, None)
+        assert await service._query_scontrol_state(config, "123") == (False, None)
+
+    asyncio.run(scenario())
+
+
+def test_terminal_query_falls_back_when_slurmdbd_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    service = service_module.SlurmExecutionService()
+    config = _runtime_config(tmp_path)
+    commands = []
+
+    def command(argv, **kwargs):
+        commands.append(tuple(argv))
+        if argv[0] == config.sacct_executable:
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "",
+                "Problem talking to the database: Connection refused",
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "JobId=123 JobState=COMPLETED ExitCode=0:0 NodeList=c001\n",
+            "",
+        )
+
+    monkeypatch.setattr(service, "_run_command", command)
+
+    assert asyncio.run(service._query_terminal_state(config, "123")) == (
+        True,
+        ("COMPLETED", "0:0", "c001"),
+    )
+    assert commands[0][0] == config.scontrol_executable
 
 
 def test_relay_rejects_event_from_another_job(tmp_path):
@@ -450,11 +635,128 @@ def test_monitor_rejects_result_from_another_job(tmp_path):
         ))
 
 
-def test_execute_submits_graph_derived_resources_and_worker_memory(
+def test_monitor_fails_after_confirmed_squeue_absence_without_history_or_result(
     tmp_path,
     monkeypatch,
 ):
     config = _runtime_config(tmp_path)
+    run_directory = config.execution_root / "execution-purged-job"
+    run_directory.mkdir()
+    service = service_module.SlurmExecutionService()
+    queue_queries = 0
+
+    async def absent(*args, **kwargs):
+        nonlocal queue_queries
+        queue_queries += 1
+        return True, None
+
+    async def no_history(*args, **kwargs):
+        return False, None
+
+    monkeypatch.setattr(service, "_query_queue_state", absent)
+    monkeypatch.setattr(service, "_query_terminal_state", no_history)
+
+    result = asyncio.run(service._monitor_job(
+        config=config,
+        execution_id="execution-purged-job",
+        job_id="123",
+        run_directory=run_directory,
+        resource_request=config.policy.resource_request(
+            cpu_workers=1,
+            gpu_workers=0,
+        ),
+    ))
+
+    assert queue_queries >= 2
+    assert result["status"] == ExecutionStatus.FAILED
+    assert result["jobId"] == "123"
+    assert "disappeared from squeue" in result["message"]
+
+
+def test_accounting_rejects_conflicting_duplicate_root_rows(tmp_path, monkeypatch):
+    service = service_module.SlurmExecutionService()
+    config = _runtime_config(tmp_path)
+    outputs = iter([
+        "123|COMPLETED|0:0|c001\n123.batch|FAILED|1:0|c001\n",
+        "123|COMPLETED|0:0|c001\n123|RUNNING|0:0|c001\n",
+    ])
+    monkeypatch.setattr(
+        service,
+        "_run_command",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, next(outputs), ""
+        ),
+    )
+
+    async def scenario():
+        assert await service._query_accounting_state(config, "123") == (
+            True,
+            ("COMPLETED", "0:0", "c001"),
+        )
+        assert await service._query_accounting_state(config, "123") == (True, None)
+
+    asyncio.run(scenario())
+
+
+def test_monitor_query_failure_never_starts_absence_grace(
+    tmp_path,
+    monkeypatch,
+):
+    config = _runtime_config(tmp_path)
+    run_directory = config.execution_root / "execution-query-failure"
+    run_directory.mkdir()
+    expected_result = {
+        "schemaVersion": 1,
+        "executionId": "execution-query-failure",
+        "jobId": "123",
+        "status": ExecutionStatus.SUCCEEDED,
+        "message": "runner eventually published",
+    }
+    service = service_module.SlurmExecutionService()
+    queries = 0
+
+    async def failed_query(*args, **kwargs):
+        nonlocal queries
+        queries += 1
+        if queries == 2:
+            (run_directory / service_module.RESULT_FILENAME).write_text(
+                json.dumps(expected_result),
+                encoding="utf-8",
+            )
+        return False, None
+
+    async def must_not_query_history(*args, **kwargs):
+        raise AssertionError("failed squeue must not be treated as absence")
+
+    monkeypatch.setattr(service, "_query_queue_state", failed_query)
+    monkeypatch.setattr(service, "_query_terminal_state", must_not_query_history)
+
+    result = asyncio.run(service._monitor_job(
+        config=config,
+        execution_id="execution-query-failure",
+        job_id="123",
+        run_directory=run_directory,
+        resource_request=config.policy.resource_request(
+            cpu_workers=1,
+            gpu_workers=0,
+        ),
+    ))
+
+    assert queries == 2
+    assert result == expected_result
+
+
+@pytest.mark.parametrize("with_sacct", [True, False])
+def test_execute_submits_graph_derived_resources_and_worker_memory(
+    tmp_path,
+    monkeypatch,
+    with_sacct,
+):
+    config = _runtime_config(tmp_path)
+    if not with_sacct:
+        config = service_module.SlurmRuntimeConfig(
+            **{**config.__dict__, "sacct_executable": None}
+        )
     graph = {"terminal": {"type": "TestOutput", "inputs": {}}}
     plan = SimpleNamespace(cpu_workers=2, gpu_workers=1)
     monkeypatch.setattr(
@@ -497,13 +799,14 @@ def test_execute_submits_graph_derived_resources_and_worker_memory(
     assert "--mem=84G" in argv
     assert "--gres=gpu:1" in argv
     assert any(item.startswith("--comment=wf:") for item in argv)
-    assert argv[-6:] == (
+    assert argv[-7:] == (
         str(config.execution_root / "execution-1" / "request.json"),
         str(config.runtime_directory),
         "8",
         "64",
         config.squeue_executable,
-        config.sacct_executable,
+        config.sacct_executable or "-",
+        config.scontrol_executable,
     )
     payload = json.loads(
         (config.execution_root / "execution-1" / "request.json").read_text(
@@ -552,7 +855,14 @@ def test_cancel_during_sbatch_waits_for_job_id_then_cancels(tmp_path, monkeypatc
         assert release.wait(timeout=5)
         return subprocess.CompletedProcess(argv, 0, "456\n", "")
 
-    async def send_cancel(config_arg, job_id, *, whole_job, cluster=None):
+    async def send_cancel(
+        config_arg,
+        job_id,
+        *,
+        whole_job,
+        cluster=None,
+        submission_token=None,
+    ):
         cancelled_jobs.append((job_id, whole_job))
 
     async def queue_state(*args, **kwargs):
@@ -811,8 +1121,9 @@ def test_failed_scancel_cannot_terminalize_running_job(tmp_path, monkeypatch):
         task = asyncio.create_task(service._cancel_and_wait_for_terminal(
             config=config,
             execution_id="execution-cancel-stuck",
-            job_id="444",
-            cluster=None,
+                job_id="444",
+                cluster=None,
+                submission_token="wf:cancel:stuck",
             run_directory=config.execution_root,
             resource_request=config.policy.resource_request(
                 cpu_workers=1,
@@ -843,6 +1154,7 @@ def test_reconcile_reattaches_one_durable_submitted_job(tmp_path, monkeypatch):
             "jobId": "789",
             "cluster": "test-cluster",
             "state": "submitted",
+            "submissionToken": "wf:execution:four",
             "resources": request.to_dict(),
             "submittedAt": "2026-08-09T00:00:00Z",
         }),

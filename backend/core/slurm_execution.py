@@ -21,6 +21,8 @@ _SAFE_COMMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}\Z")
 _SBATCH_RESULT_RE = re.compile(
     r"(?P<job_id>[1-9][0-9]*)(?:;(?P<cluster>[A-Za-z0-9][A-Za-z0-9_.-]{0,63}))?\Z"
 )
+_SLURM_JOB_ID_RE = re.compile(r"[1-9][0-9]*\Z")
+_SCONTROL_FIELD_RE = re.compile(r"(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=(\S*)")
 _WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -381,6 +383,70 @@ class SbatchSubmission:
     cluster: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ScontrolJobRecord:
+    """A strictly identified root allocation returned by ``scontrol -o``."""
+
+    job_id: str
+    state: str
+    exit_code: str = ""
+    node_list: str = ""
+    comment: str = ""
+
+
+def parse_scontrol_job_record(
+    output: str,
+    *,
+    expected_job_id: str,
+) -> ScontrolJobRecord | None:
+    """Parse one exact root-job record from Slurm 19.05 ``scontrol`` output.
+
+    This helper is intentionally fail-closed.  ``scontrol show job -o`` is
+    expected to emit exactly one single-line record for the requested root
+    allocation.  Empty output, extra records, a step/array identifier, missing
+    state, or duplicate required fields is therefore not evidence that a job
+    ended.
+    """
+
+    if not isinstance(output, str):
+        raise TypeError("scontrol output must be a string.")
+    if not isinstance(expected_job_id, str) or not _SLURM_JOB_ID_RE.fullmatch(
+        expected_job_id
+    ):
+        raise ValueError("expected_job_id must be a positive decimal job ID.")
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+
+    fields: dict[str, str] = {}
+    duplicated: set[str] = set()
+    for match in _SCONTROL_FIELD_RE.finditer(lines[0]):
+        name, value = match.groups()
+        if name in fields:
+            duplicated.add(name)
+        fields[name] = value
+
+    required = {"JobId", "JobState"}
+    if duplicated.intersection(required):
+        return None
+    if fields.get("JobId") != expected_job_id:
+        return None
+    raw_state = fields.get("JobState", "")
+    if not raw_state:
+        return None
+    state = raw_state.split("+", 1)[0].upper()
+    if not state or re.fullmatch(r"[A-Z_]+", state) is None:
+        return None
+    return ScontrolJobRecord(
+        job_id=expected_job_id,
+        state=state,
+        exit_code=fields.get("ExitCode", ""),
+        node_list=fields.get("NodeList", ""),
+        comment=fields.get("Comment", ""),
+    )
+
+
 def parse_sbatch_submission(output: str | bytes) -> SbatchSubmission:
     """Parse ``sbatch --parsable`` output (``jobid`` or ``jobid;cluster``)."""
 
@@ -472,12 +538,14 @@ def resolve_execution_directory(
 
 __all__ = [
     "SbatchSubmission",
+    "ScontrolJobRecord",
     "SlurmPolicy",
     "SlurmResourceRequest",
     "build_sbatch_argv",
     "build_slurm_resource_request",
     "parse_sbatch_job_id",
     "parse_sbatch_submission",
+    "parse_scontrol_job_record",
     "resolve_execution_directory",
     "validate_execution_id",
 ]

@@ -27,6 +27,8 @@ import uuid
 import numpy as np
 import psutil
 
+from core.slurm_execution import parse_scontrol_job_record
+
 WINDOW_GENERATOR_VERSION = 1
 WINDOW_TRAVERSAL_ORDER = "lexicographic"
 RECOVERY_FORMAT = "workflow-window-recovery"
@@ -48,6 +50,8 @@ ACTIVE_LOCK_SCHEMA_VERSION = 2
 ACTIVE_LOCK_GUARD_OFFSET = 1 << 20
 ACTIVE_LOCK_MUTATION_GUARD_FILENAME = ".active.guard"
 SLURM_COMMAND_TIMEOUT_SECONDS = 3.0
+SLURM_LOCK_ABSENCE_MINIMUM_AGE_SECONDS = 30.0
+SLURM_LOCK_ABSENCE_CONFIRMATION_DELAY_SECONDS = 0.05
 
 _SLURM_JOB_ID_PATTERN = re.compile(r"[1-9][0-9]*\Z")
 _SLURM_TERMINAL_JOB_STATES = frozenset({
@@ -1171,57 +1175,131 @@ def _run_slurm_status_command(
         return None
 
 
-def _slurm_job_owner_state(job_id: str) -> Literal["alive", "stale", "unknown"]:
+def _slurm_queue_owner_state(
+    squeue: str,
+    job_id: str,
+) -> Literal["alive", "absent", "unknown"]:
+    """Query one exact root allocation without treating bad output as absence."""
+
+    result = _run_slurm_status_command((
+        squeue,
+        "--local",
+        "--noheader",
+        f"--jobs={job_id}",
+        "--format=%i|%T",
+    ))
+    if result is None or result.returncode != 0:
+        return "unknown"
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return "absent"
+    if len(lines) != 1:
+        return "unknown"
+    fields = [field.strip() for field in lines[0].split("|", 1)]
+    if len(fields) != 2 or fields[0] != job_id or not fields[1]:
+        return "unknown"
+    return "alive"
+
+
+def _slurm_lock_is_old_enough_for_absence(created_at: str) -> bool:
+    try:
+        normalized = created_at[:-1] + "+00:00" if created_at.endswith("Z") else created_at
+        created = datetime.fromisoformat(normalized)
+        if created.tzinfo is None:
+            return False
+        age = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return age >= SLURM_LOCK_ABSENCE_MINIMUM_AGE_SECONDS
+
+
+def _slurm_job_owner_state(
+    job_id: str,
+    *,
+    lock_created_at: str,
+) -> Literal["alive", "stale", "unknown"]:
     """Classify a foreign Slurm owner only from authoritative scheduler state.
 
     Absence from ``squeue`` is not proof that a job ended: it can also reflect
     accounting delay or a scheduler/query failure.  Reclamation therefore
-    additionally requires the allocation row in ``sacct`` to report a known
-    terminal state.
+    additionally requires the exact root allocation row in ``sacct`` or
+    ``scontrol`` to report a known terminal state. ``scontrol`` supports old
+    clusters whose optional slurmdbd/accounting service is unavailable.
     """
 
     squeue = _slurm_executable("WorkFlow_SLURM_SQUEUE", "squeue")
     sacct = _slurm_executable("WorkFlow_SLURM_SACCT", "sacct")
-    if squeue is None or sacct is None:
+    scontrol = _slurm_executable("WorkFlow_SLURM_SCONTROL", "scontrol")
+    if squeue is None or scontrol is None:
         return "unknown"
 
-    queue_result = _run_slurm_status_command((
-        squeue,
-        "--noheader",
-        "--jobs",
-        job_id,
-        "--format=%T",
-    ))
-    if queue_result is None or queue_result.returncode != 0:
+    first_queue_state = _slurm_queue_owner_state(squeue, job_id)
+    if first_queue_state == "unknown":
         return "unknown"
-    if any(line.strip() for line in queue_result.stdout.splitlines()):
+    if first_queue_state == "alive":
         return "alive"
 
-    accounting_result = _run_slurm_status_command((
-        sacct,
-        "--noheader",
-        "--parsable2",
-        "--jobs",
+    control_result = _run_slurm_status_command((
+        scontrol,
+        "--local",
+        "--oneliner",
+        "--quiet",
+        "show",
+        "job",
         job_id,
-        "--format=JobIDRaw%40,State%40",
     ))
-    if accounting_result is None or accounting_result.returncode != 0:
+    record = None
+    if control_result is not None and control_result.returncode == 0:
+        try:
+            record = parse_scontrol_job_record(
+                control_result.stdout,
+                expected_job_id=job_id,
+            )
+        except (TypeError, ValueError):
+            record = None
+    if record is not None and record.state in _SLURM_TERMINAL_JOB_STATES:
+        return "stale"
+    if record is not None:
         return "unknown"
 
-    allocation_states: list[str] = []
-    for raw_line in accounting_result.stdout.splitlines():
-        fields = raw_line.split("|")
-        if len(fields) < 2 or fields[0].strip() != job_id:
-            continue
-        state_text = fields[1].strip()
-        if not state_text:
-            return "unknown"
-        state = state_text.split(None, 1)[0].split("+", 1)[0].upper()
-        allocation_states.append(state)
+    if sacct is not None:
+        accounting_result = _run_slurm_status_command((
+            sacct,
+            "--noheader",
+            "--parsable2",
+            "--jobs",
+            job_id,
+            "--format=JobIDRaw%40,State%40",
+        ))
+        if accounting_result is not None and accounting_result.returncode == 0:
+            allocation_states: list[str] = []
+            for raw_line in accounting_result.stdout.splitlines():
+                fields = raw_line.split("|")
+                if len(fields) < 2 or fields[0].strip() != job_id:
+                    continue
+                state_text = fields[1].strip()
+                if not state_text:
+                    break
+                state = state_text.split(None, 1)[0].split("+", 1)[0].upper()
+                allocation_states.append(state)
 
-    if not allocation_states:
+            if allocation_states:
+                if all(
+                    state in _SLURM_TERMINAL_JOB_STATES
+                    for state in allocation_states
+                ):
+                    return "stale"
+                return "unknown"
+
+    # The controller can purge completed Job records after MinJobAge, and old
+    # clusters may have no usable slurmdbd. This lock was created by a runner
+    # already executing inside the allocation, so two exact, successful
+    # squeue absences are authoritative once the lock is no longer brand new.
+    # Any malformed output or command failure remains unknown/fail-closed.
+    if not _slurm_lock_is_old_enough_for_absence(lock_created_at):
         return "unknown"
-    if all(state in _SLURM_TERMINAL_JOB_STATES for state in allocation_states):
+    time.sleep(SLURM_LOCK_ABSENCE_CONFIRMATION_DELAY_SECONDS)
+    if _slurm_queue_owner_state(squeue, job_id) == "absent":
         return "stale"
     return "unknown"
 
@@ -1327,7 +1405,10 @@ def _active_lock_owner_state(
         slurm_job_id = _validated_slurm_job_id(payload.get("slurmJobId"))
         if slurm_job_id is None:
             return "unknown"
-        return _slurm_job_owner_state(slurm_job_id)
+        return _slurm_job_owner_state(
+            slurm_job_id,
+            lock_created_at=payload["createdAt"],
+        )
 
     try:
         process = psutil.Process(pid)

@@ -93,7 +93,7 @@ def test_foreign_lock_is_alive_when_squeue_lists_job(
         calls.append(argv)
         assert kwargs["shell"] is False
         assert kwargs["timeout"] == window_execution.SLURM_COMMAND_TIMEOUT_SECONDS
-        return _completed_process(argv, stdout="RUNNING\n")
+        return _completed_process(argv, stdout="4321|RUNNING\n")
 
     monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
 
@@ -105,7 +105,7 @@ def test_foreign_lock_is_alive_when_squeue_lists_job(
     assert state == "alive"
     assert len(calls) == 1
     assert calls[0][0] == "squeue"
-    assert calls[0][calls[0].index("--jobs") + 1] == "4321"
+    assert "--jobs=4321" in calls[0]
 
 
 @pytest.mark.parametrize(
@@ -133,26 +133,14 @@ def test_foreign_lock_is_stale_only_after_sacct_reports_terminal_allocation(
     ) == "stale"
 
 
-@pytest.mark.parametrize(
-    "queue_result,accounting_output",
-    [
-        (_completed_process(["squeue"], returncode=1, stderr="denied"), ""),
-        (_completed_process(["squeue"], stdout=""), ""),
-        (_completed_process(["squeue"], stdout=""), "4321|RUNNING|\n"),
-        (_completed_process(["squeue"], stdout=""), "4321.batch|FAILED|\n"),
-        (_completed_process(["squeue"], stdout=""), "4321|UNKNOWN|\n"),
-    ],
-)
-def test_foreign_lock_remains_unknown_without_authoritative_terminal_state(
+def test_foreign_lock_remains_unknown_when_squeue_query_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    queue_result: subprocess.CompletedProcess[str],
-    accounting_output: str,
 ) -> None:
     def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         if argv[0] == "squeue":
-            return queue_result
-        return _completed_process(argv, stdout=accounting_output)
+            return _completed_process(argv, returncode=1, stderr="denied")
+        raise AssertionError("history must not be queried after squeue failure")
 
     monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
 
@@ -160,6 +148,170 @@ def test_foreign_lock_remains_unknown_without_authoritative_terminal_state(
         _foreign_lock_payload(),
         lock_path=tmp_path / "active.lock",
     ) == "unknown"
+
+
+def test_foreign_lock_uses_scontrol_when_accounting_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "squeue":
+            return _completed_process(argv, stdout="")
+        if argv[0] == "sacct":
+            return _completed_process(argv, returncode=1, stderr="connection refused")
+        return _completed_process(
+            argv,
+            stdout="JobId=4321 JobState=NODE_FAIL ExitCode=1:0 NodeList=c001\n",
+        )
+
+    monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
+
+    assert _active_lock_owner_state(
+        _foreign_lock_payload(),
+        lock_path=tmp_path / "active.lock",
+    ) == "stale"
+
+
+@pytest.mark.parametrize(
+    "source,output",
+    [
+        ("sacct", "4321|RUNNING|\n"),
+        ("scontrol", "JobId=4321 JobState=RUNNING ExitCode=0:0 NodeList=c001\n"),
+    ],
+)
+def test_exact_nonterminal_history_vetoes_absence_reclamation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    output: str,
+) -> None:
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "squeue":
+            return _completed_process(argv, stdout="")
+        if argv[0] == source:
+            return _completed_process(argv, stdout=output)
+        return _completed_process(argv, returncode=1)
+
+    monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
+
+    assert _active_lock_owner_state(
+        _foreign_lock_payload(),
+        lock_path=tmp_path / "active.lock",
+    ) == "unknown"
+
+
+def test_two_exact_squeue_absences_reclaim_purged_old_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_calls = 0
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal queue_calls
+        if argv[0] == "squeue":
+            queue_calls += 1
+            return _completed_process(argv, stdout="")
+        return _completed_process(argv, returncode=1, stderr="not available")
+
+    monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        window_execution,
+        "_slurm_lock_is_old_enough_for_absence",
+        lambda created_at: True,
+    )
+
+    assert _active_lock_owner_state(
+        _foreign_lock_payload(),
+        lock_path=tmp_path / "active.lock",
+    ) == "stale"
+    assert queue_calls == 2
+
+
+def test_second_squeue_failure_keeps_purged_job_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_calls = 0
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal queue_calls
+        if argv[0] == "squeue":
+            queue_calls += 1
+            return _completed_process(
+                argv,
+                returncode=0 if queue_calls == 1 else 1,
+                stdout="",
+            )
+        return _completed_process(argv, returncode=1)
+
+    monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        window_execution,
+        "_slurm_lock_is_old_enough_for_absence",
+        lambda created_at: True,
+    )
+
+    assert _active_lock_owner_state(
+        _foreign_lock_payload(),
+        lock_path=tmp_path / "active.lock",
+    ) == "unknown"
+    assert queue_calls == 2
+
+
+def test_second_squeue_running_keeps_purged_job_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_calls = 0
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal queue_calls
+        if argv[0] == "squeue":
+            queue_calls += 1
+            return _completed_process(
+                argv,
+                stdout="" if queue_calls == 1 else "4321|RUNNING\n",
+            )
+        return _completed_process(argv, returncode=1)
+
+    monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        window_execution,
+        "_slurm_lock_is_old_enough_for_absence",
+        lambda created_at: True,
+    )
+
+    assert _active_lock_owner_state(
+        _foreign_lock_payload(),
+        lock_path=tmp_path / "active.lock",
+    ) == "unknown"
+    assert queue_calls == 2
+
+
+def test_fresh_lock_is_not_reclaimed_from_purged_scheduler_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_calls = 0
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal queue_calls
+        if argv[0] == "squeue":
+            queue_calls += 1
+            return _completed_process(argv, stdout="")
+        return _completed_process(argv, returncode=1)
+
+    payload = _foreign_lock_payload()
+    payload["createdAt"] = window_execution.datetime.now(
+        window_execution.timezone.utc
+    ).isoformat()
+    monkeypatch.setattr(window_execution.subprocess, "run", fake_run)
+
+    assert _active_lock_owner_state(
+        payload,
+        lock_path=tmp_path / "active.lock",
+    ) == "unknown"
+    assert queue_calls == 1
 
 
 def test_scheduler_query_timeout_keeps_foreign_lock_unknown(

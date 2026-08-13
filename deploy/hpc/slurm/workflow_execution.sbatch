@@ -8,8 +8,8 @@
 set -euo pipefail
 umask 077
 
-if (( $# != 6 )); then
-  echo "Usage: workflow_execution.sbatch ABSOLUTE_REQUEST_PATH ABSOLUTE_RUNTIME_DIR CPU_WORKER_MEMORY_GB GPU_WORKER_MEMORY_GB ABSOLUTE_SQUEUE_PATH ABSOLUTE_SACCT_PATH" >&2
+if (( $# != 7 )); then
+  echo "Usage: workflow_execution.sbatch ABSOLUTE_REQUEST_PATH ABSOLUTE_RUNTIME_DIR CPU_WORKER_MEMORY_GB GPU_WORKER_MEMORY_GB ABSOLUTE_SQUEUE_PATH OPTIONAL_ABSOLUTE_SACCT_PATH ABSOLUTE_SCONTROL_PATH" >&2
   exit 2
 fi
 
@@ -19,6 +19,10 @@ CPU_WORKER_MEMORY_GB="$3"
 GPU_WORKER_MEMORY_GB="$4"
 SQUEUE_PATH="$5"
 SACCT_PATH="$6"
+SCONTROL_PATH="$7"
+if [[ "$SACCT_PATH" == "-" ]]; then
+  SACCT_PATH=""
+fi
 [[ -n "$RUNTIME_DIR" ]] || RUNTIME_DIR="/"
 
 case "$REQUEST_PATH" in
@@ -49,7 +53,7 @@ if [[ ! "$GPU_WORKER_MEMORY_GB" =~ ^[1-9][0-9]*$ ]]; then
   echo "GPU Worker memory must be a positive integer GB value." >&2
   exit 2
 fi
-for scheduler_command in "$SQUEUE_PATH" "$SACCT_PATH"; do
+for scheduler_command in "$SQUEUE_PATH" "$SCONTROL_PATH"; do
   case "$scheduler_command" in
     /*) ;;
     *) echo "Slurm status command path must be absolute: $scheduler_command" >&2; exit 2 ;;
@@ -59,6 +63,16 @@ for scheduler_command in "$SQUEUE_PATH" "$SACCT_PATH"; do
     exit 1
   fi
 done
+if [[ -n "$SACCT_PATH" ]]; then
+  case "$SACCT_PATH" in
+    /*) ;;
+    *) echo "Slurm accounting command path must be absolute: $SACCT_PATH" >&2; exit 2 ;;
+  esac
+  if [[ ! -f "$SACCT_PATH" || ! -x "$SACCT_PATH" ]]; then
+    echo "Slurm accounting command is not an executable file: $SACCT_PATH" >&2
+    exit 1
+  fi
+fi
 
 # sbatch uses a private spool copy of this script, so BASH_SOURCE cannot locate
 # the repository. The submitter sets --chdir to the repository root. Also
@@ -113,6 +127,7 @@ export PYTHONUNBUFFERED=1
 export WorkFlow_EXECUTION_BACKEND="local"
 export WorkFlow_SLURM_SQUEUE="$SQUEUE_PATH"
 export WorkFlow_SLURM_SACCT="$SACCT_PATH"
+export WorkFlow_SLURM_SCONTROL="$SCONTROL_PATH"
 export TMPDIR="$SCRATCH_ROOT/tmp"
 export TMP="$SCRATCH_ROOT/tmp"
 export TEMP="$SCRATCH_ROOT/tmp"

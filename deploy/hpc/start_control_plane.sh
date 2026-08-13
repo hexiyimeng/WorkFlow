@@ -50,12 +50,12 @@ if [[ ! -f "$EXECUTION_SCRIPT" ]]; then
 fi
 SBATCH_COMMAND="${WorkFlow_SLURM_SBATCH:-sbatch}"
 SQUEUE_COMMAND="${WorkFlow_SLURM_SQUEUE:-squeue}"
-SACCT_COMMAND="${WorkFlow_SLURM_SACCT:-sacct}"
+SCONTROL_COMMAND="${WorkFlow_SLURM_SCONTROL:-scontrol}"
 SCANCEL_COMMAND="${WorkFlow_SLURM_SCANCEL:-scancel}"
 for command_name in \
   "$SBATCH_COMMAND" \
   "$SQUEUE_COMMAND" \
-  "$SACCT_COMMAND" \
+  "$SCONTROL_COMMAND" \
   "$SCANCEL_COMMAND"; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "Required Slurm command is unavailable: $command_name" >&2
@@ -65,8 +65,21 @@ for command_name in \
 done
 SBATCH_COMMAND="$(command -v "$SBATCH_COMMAND")"
 SQUEUE_COMMAND="$(command -v "$SQUEUE_COMMAND")"
-SACCT_COMMAND="$(command -v "$SACCT_COMMAND")"
+SCONTROL_COMMAND="$(command -v "$SCONTROL_COMMAND")"
 SCANCEL_COMMAND="$(command -v "$SCANCEL_COMMAND")"
+if [[ -v WorkFlow_SLURM_SACCT && -z "$WorkFlow_SLURM_SACCT" ]]; then
+  SACCT_COMMAND=""
+elif [[ -n "${WorkFlow_SLURM_SACCT:-}" ]]; then
+  if ! command -v "$WorkFlow_SLURM_SACCT" >/dev/null 2>&1; then
+    echo "Configured optional Slurm accounting command is unavailable: $WorkFlow_SLURM_SACCT" >&2
+    exit 1
+  fi
+  SACCT_COMMAND="$(command -v "$WorkFlow_SLURM_SACCT")"
+elif command -v sacct >/dev/null 2>&1; then
+  SACCT_COMMAND="$(command -v sacct)"
+else
+  SACCT_COMMAND=""
+fi
 
 mkdir -p \
   "$WORKFLOW_RUNTIME_DIR/logs" \
@@ -87,6 +100,7 @@ export WorkFlow_SLURM_RUNTIME_DIR="$WORKFLOW_RUNTIME_DIR"
 export WorkFlow_SLURM_SBATCH="$SBATCH_COMMAND"
 export WorkFlow_SLURM_SQUEUE="$SQUEUE_COMMAND"
 export WorkFlow_SLURM_SACCT="$SACCT_COMMAND"
+export WorkFlow_SLURM_SCONTROL="$SCONTROL_COMMAND"
 export WorkFlow_SLURM_SCANCEL="$SCANCEL_COMMAND"
 export WorkFlow_MODELS_DIR="$WORKFLOW_RUNTIME_DIR/models"
 export CELLPOSE_LOCAL_MODELS_PATH="$WORKFLOW_RUNTIME_DIR/models/cellpose"
@@ -100,7 +114,7 @@ printf '%s\n' \
   "listen=http://127.0.0.1:$WEB_PORT" \
   "execution_backend=slurm" \
   "execution_script=$EXECUTION_SCRIPT" \
-  "slurm_commands=$SBATCH_COMMAND,$SQUEUE_COMMAND,$SACCT_COMMAND,$SCANCEL_COMMAND"
+  "slurm_commands=sbatch:$SBATCH_COMMAND,squeue:$SQUEUE_COMMAND,sacct:${SACCT_COMMAND:-unavailable},scontrol:$SCONTROL_COMMAND,scancel:$SCANCEL_COMMAND"
 
 cd "$WORKFLOW_ROOT/backend"
 exec "$PYTHON" -m uvicorn main:app \

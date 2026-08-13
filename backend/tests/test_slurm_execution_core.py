@@ -10,9 +10,29 @@ from core.slurm_execution import (
     build_sbatch_argv,
     parse_sbatch_job_id,
     parse_sbatch_submission,
+    parse_scontrol_job_record,
     resolve_execution_directory,
     validate_execution_id,
 )
+
+
+def test_scontrol_parser_requires_exact_single_root_record() -> None:
+    assert parse_scontrol_job_record(
+        "JobId=4321 JobName=wf JobState=COMPLETED ExitCode=0:0 NodeList=c001\n",
+        expected_job_id="4321",
+    ).state == "COMPLETED"
+    assert parse_scontrol_job_record(
+        "JobId=4321.batch JobState=FAILED\n",
+        expected_job_id="4321",
+    ) is None
+    assert parse_scontrol_job_record(
+        "JobId=4321 JobState=FAILED\nJobId=4321 JobState=FAILED\n",
+        expected_job_id="4321",
+    ) is None
+    assert parse_scontrol_job_record(
+        "JobId=4321 JobState=FAILED JobState=RUNNING\n",
+        expected_job_id="4321",
+    ) is None
 
 
 def _policy(**overrides: object) -> SlurmPolicy:
