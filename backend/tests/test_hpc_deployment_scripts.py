@@ -71,6 +71,8 @@ def test_client_tunnel_keeps_both_ends_on_loopback() -> None:
     assert "ExitOnForwardFailure=yes" in script
     assert "ServerAliveInterval=30" in script
     assert "Start-Process $url" in script
+    assert "Wait-Process -Id $process.Id" in script
+    assert "Stop-Process -Id $process.Id" in script
     assert "password or private key is read or stored" in script
 
 

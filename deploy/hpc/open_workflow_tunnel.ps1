@@ -64,3 +64,15 @@ $url = "http://127.0.0.1:${LocalPort}/"
 Write-Host "WorkFlow tunnel is ready: $url"
 Write-Host 'Keep the SSH window open while using WorkFlow.'
 Start-Process $url
+
+# Keep this helper (and therefore the console hosting the interactive SSH
+# process) alive for the lifetime of the tunnel. Closing this helper window or
+# pressing Ctrl+C ends the exact child tunnel instead of leaving it detached.
+try {
+    Wait-Process -Id $process.Id
+}
+finally {
+    if (-not $process.HasExited) {
+        Stop-Process -Id $process.Id
+    }
+}
