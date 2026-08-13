@@ -107,9 +107,13 @@ bash "$HOME/apps/WorkFlow/deploy/hpc/install.sh"
 
 ```bash
 cd "$HOME/apps/WorkFlow"
+WorkFlow_SLURM_SACCT='' \
 WorkFlow_SLURM_PARTITION=compute \
   bash deploy/hpc/control_plane.sh restart
 ```
+
+这里显式将 `WorkFlow_SLURM_SACCT` 设为空，是因为本次验收已经证明站点安装了 `sacct`
+客户端，但没有可连接的 `slurmdbd`；控制面将直接使用 `squeue + scontrol`。
 
 检查状态、页面和插件：
 

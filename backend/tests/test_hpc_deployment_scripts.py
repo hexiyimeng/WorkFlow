@@ -35,6 +35,8 @@ def test_control_plane_is_not_submitted_as_a_slurm_job() -> None:
         "SCANCEL_COMMAND",
     ):
         assert command in script
+    assert '[[ -v WorkFlow_SLURM_SACCT && -z "$WorkFlow_SLURM_SACCT" ]]' in script
+    assert 'SACCT_COMMAND=""' in script
 
 
 def test_control_plane_manager_persists_only_the_web_control_plane() -> None:
