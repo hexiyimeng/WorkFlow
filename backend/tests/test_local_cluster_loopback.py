@@ -26,6 +26,7 @@ from services.dask_service import (
     _nanny_shutdown_confirmed,
     _provision_worker_specs_in_batches,
     _worker_batch_start_timeout,
+    _worker_registration_timeout,
     _worker_start_batch_size,
     build_local_cluster_specs,
 )
@@ -56,16 +57,31 @@ def test_worker_batch_size_rejects_invalid_values(
     monkeypatch.setenv("WorkFlow_DASK_WORKER_START_BATCH_SIZE", value)
 
     with pytest.raises(ValueError, match="positive integer"):
-        _worker_start_batch_size()
+        _worker_start_batch_size(8)
+
+
+def test_worker_batch_defaults_to_concurrent_topology_and_honors_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WorkFlow_DASK_WORKER_START_BATCH_SIZE", raising=False)
+    assert _worker_start_batch_size(11) == 11
+
+    monkeypatch.setenv("WorkFlow_DASK_WORKER_START_BATCH_SIZE", "4")
+    assert _worker_start_batch_size(11) == 4
+
+    monkeypatch.setenv("WorkFlow_DASK_WORKER_START_BATCH_SIZE", "32")
+    assert _worker_start_batch_size(11) == 11
 
 
 def test_worker_startup_timeout_policy_supports_slow_large_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("WorkFlow_DASK_WORKER_BATCH_START_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("WorkFlow_DASK_WORKER_REGISTRATION_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("WorkFlow_DASK_CLUSTER_START_TIMEOUT_SECONDS", raising=False)
 
     assert _worker_batch_start_timeout() == 180.0
+    assert _worker_registration_timeout() == 60.0
     assert dask_service_module._cluster_start_timeout() == 600.0
 
 
@@ -110,10 +126,121 @@ def test_seven_healthy_slow_batches_can_exceed_old_120_second_budget(
         deadline=600.0,
         batch_size=2,
         batch_timeout=180.0,
+        registration_timeout=60.0,
     )
 
     assert clock["now"] == 350.0
     assert len(observed_workers) == 14
+
+
+def test_slow_worker_start_gets_fresh_registration_and_identity_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 0.0}
+    observed_workers: dict[str, object] = {}
+    observed_timeouts: list[tuple[str, float]] = []
+
+    class _Cluster:
+        def sync(self, function, candidate, batch, **kwargs):
+            assert function is _add_worker_spec_batch
+            assert candidate is self
+            assert kwargs["start_timeout"] == pytest.approx(180.0)
+            clock["now"] = 179.5
+            observed_workers.update({name: {} for name in batch})
+
+    class _Client:
+        def wait_for_workers(self, count, *, timeout):
+            observed_timeouts.append(("registration", timeout))
+            assert len(observed_workers) == count
+            clock["now"] += 10.0
+
+    def fresh_info(_client, *, timeout):
+        observed_timeouts.append(("identity", timeout))
+        return {"workers": dict(observed_workers)}
+
+    monkeypatch.setattr(
+        dask_service_module.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        dask_service_module,
+        "get_fresh_scheduler_info",
+        fresh_info,
+    )
+
+    _provision_worker_specs_in_batches(
+        _Cluster(),
+        _Client(),
+        {"gpu-0": {"cls": object, "options": {}}},
+        deadline=600.0,
+        batch_size=1,
+        batch_timeout=180.0,
+        registration_timeout=60.0,
+    )
+
+    assert observed_timeouts == [
+        ("registration", pytest.approx(60.0)),
+        ("identity", pytest.approx(60.0)),
+    ]
+
+
+def test_nanny_start_failure_preserves_name_exception_and_exit_diagnostics() -> None:
+    async def scenario() -> None:
+        class _AsyncProcess:
+            pid = 4321
+            exitcode = 7
+
+            def is_alive(self):
+                return False
+
+        class _WorkerProcess:
+            process = _AsyncProcess()
+
+        class _Nanny:
+            def __init__(self, scheduler_address, **options):
+                self.name = options["name"]
+                self.status = Status.init
+                self.address = "tcp://127.0.0.1:1"
+                self.worker_address = ""
+                self.process = _WorkerProcess()
+                self._startup_lock = asyncio.Lock()
+
+            async def start(self):
+                self.status = Status.failed
+                try:
+                    raise OSError("spawn exploded")
+                except OSError as cause:
+                    raise RuntimeError("Nanny failed to start") from cause
+
+        class _Scheduler:
+            address = "tcp://127.0.0.1:1"
+            contact_address = address
+
+        class _Cluster:
+            scheduler = _Scheduler()
+            worker_spec: dict[str, object] = {}
+            workers: dict[str, object] = {}
+            _created: set[object] = set()
+
+        with pytest.raises(RuntimeError) as error:
+            await _add_worker_spec_batch(
+                _Cluster(),
+                {"gpu-3": {"cls": _Nanny, "options": {}}},
+                start_timeout=1.0,
+                cleanup_timeout=1.0,
+            )
+
+        message = str(error.value)
+        assert "gpu-3" in message
+        assert "RuntimeError" in message
+        assert "Nanny failed to start" in message
+        assert "OSError" in message
+        assert "spawn exploded" in message
+        assert "4321" in message
+        assert "7" in message
+
+    asyncio.run(scenario())
 
 
 def test_starting_nanny_without_child_is_not_shutdown_confirmed() -> None:
@@ -653,6 +780,7 @@ def test_real_eight_gpu_six_cpu_nannies_validate_over_loopback() -> None:
     backend_dir = Path(__file__).resolve().parents[1]
     probe = Path(__file__).with_name("test_support_local_cluster_loopback_probe.py")
     environment = os.environ.copy()
+    environment.pop("WorkFlow_DASK_WORKER_START_BATCH_SIZE", None)
     environment["PYTHONPATH"] = str(backend_dir)
     completed = subprocess.run(
         [sys.executable, str(probe)],
@@ -687,8 +815,8 @@ def test_real_eight_gpu_six_cpu_nannies_validate_over_loopback() -> None:
     ]
     assert result["clientOwnsCluster"] is False
     assert result["independentLoops"] is True
-    assert len(result["registeredBatches"]) == 7
-    assert all(len(batch) <= 2 for batch in result["registeredBatches"])
+    assert len(result["registeredBatches"]) == 1
+    assert len(result["registeredBatches"][0]) == 14
     roles = [entry["role"] for entry in result["taskResults"]]
     assert roles.count("cpu") == 6
     assert roles.count("gpu") == 8

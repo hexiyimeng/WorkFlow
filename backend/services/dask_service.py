@@ -128,6 +128,13 @@ def _worker_batch_start_timeout() -> float:
     )
 
 
+def _worker_registration_timeout() -> float:
+    return _positive_timeout_from_env(
+        "WorkFlow_DASK_WORKER_REGISTRATION_TIMEOUT_SECONDS",
+        60.0,
+    )
+
+
 def _bounded_phase_deadline(overall_deadline: float, phase_timeout: float) -> float:
     return min(overall_deadline, time.monotonic() + phase_timeout)
 
@@ -625,12 +632,54 @@ def _safe_runtime_attribute(value: Any, name: str) -> str:
 
 
 def _nanny_startup_diagnostic(nanny: Any) -> dict[str, object]:
+    try:
+        worker_process = getattr(nanny, "process", None)
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        worker_process = None
+    try:
+        async_process = getattr(worker_process, "process", None)
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        async_process = None
+    try:
+        process_state = getattr(async_process, "_state", None)
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        process_state = None
+
+    def process_value(name: str) -> object | None:
+        for candidate in (async_process, process_state):
+            if candidate is None:
+                continue
+            try:
+                value = getattr(candidate, name, None)
+            except (AttributeError, OSError, RuntimeError, ValueError):
+                continue
+            if value is not None:
+                return value
+        return None
+
     return {
         "name": _safe_runtime_attribute(nanny, "name"),
         "status": _safe_runtime_attribute(nanny, "status") or "unknown",
         "nannyAddress": _safe_runtime_attribute(nanny, "address"),
         "workerAddress": _safe_runtime_attribute(nanny, "worker_address"),
+        "workerPid": process_value("pid"),
+        "workerExitCode": process_value("exitcode"),
     }
+
+
+def _exception_cause_chain(error: BaseException) -> tuple[dict[str, str], ...]:
+    """Return a cycle-safe cause chain suitable for logs and UI errors."""
+    result: list[dict[str, str]] = []
+    visited: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        result.append({
+            "exceptionType": type(current).__name__,
+            "message": str(current),
+        })
+        current = current.__cause__ or current.__context__
+    return tuple(result)
 
 
 def _cluster_startup_diagnostics(cluster: Any) -> dict[str, object]:
@@ -990,8 +1039,25 @@ dask.config.set(
 )
 
 
-def _worker_start_batch_size() -> int:
-    raw_value = os.getenv("WorkFlow_DASK_WORKER_START_BATCH_SIZE", "2")
+def _worker_start_batch_size(total_workers: int) -> int:
+    """Return the concurrent Worker-start width for one local topology.
+
+    The Driver Client is connected before this function is used, so there is
+    no longer a reason to serialize same-host Worker startup merely to protect
+    the first Client handshake.  On the target Windows host, serial batches of
+    two grew from 8 seconds to 49, 101, then 188 seconds while the historical
+    concurrent eight-Worker startup was fast.  Start the requested topology
+    together by default and retain an explicit environment cap for sites that
+    need to limit process-spawn concurrency.
+    """
+    if type(total_workers) is not int or total_workers <= 0:
+        raise ValueError(
+            "total_workers must be a positive integer, "
+            f"got {total_workers!r}."
+        )
+    raw_value = os.getenv("WorkFlow_DASK_WORKER_START_BATCH_SIZE")
+    if raw_value is None:
+        return total_workers
     try:
         value = int(raw_value)
     except (TypeError, ValueError) as exc:
@@ -1004,7 +1070,7 @@ def _worker_start_batch_size() -> int:
             "WorkFlow_DASK_WORKER_START_BATCH_SIZE must be a positive integer, "
             f"got {raw_value!r}."
         )
-    return value
+    return min(value, total_workers)
 
 
 async def _add_worker_spec_batch(
@@ -1072,11 +1138,32 @@ async def _add_worker_spec_batch(
             ),
             timeout=start_timeout,
         )
-        failures = [result for result in results if isinstance(result, BaseException)]
+        failures = {
+            name: result
+            for name, result in zip(batch_tasks, results)
+            if isinstance(result, BaseException)
+        }
         if failures:
+            failure_details: dict[str, dict[str, object]] = {}
+            for name, failure in failures.items():
+                diagnostic = _nanny_startup_diagnostic(batch_nannies[name])
+                failure_details[name] = {
+                    "exceptionChain": _exception_cause_chain(failure),
+                    **diagnostic,
+                }
+                logger.error(
+                    "[Dask] Nanny %s failed during Worker startup: %s | "
+                    "diagnostic=%s",
+                    name,
+                    failure,
+                    diagnostic,
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                )
+            first_failure = next(iter(failures.values()))
             raise RuntimeError(
-                f"{len(failures)} Dask Nanny process(es) failed to start in batch."
-            ) from failures[0]
+                f"{len(failures)} Dask Nanny process(es) failed to start in "
+                f"batch: {failure_details!r}."
+            ) from first_failure
 
         cluster.workers.update(batch_nannies)
         for nanny in batch_nannies.values():
@@ -1133,6 +1220,7 @@ def _provision_worker_specs_in_batches(
     deadline: float,
     batch_size: int,
     batch_timeout: float,
+    registration_timeout: float,
 ) -> None:
     """Provision Workers incrementally after the Driver Client is connected."""
     items = tuple(worker_specs.items())
@@ -1169,17 +1257,30 @@ def _provision_worker_specs_in_batches(
             callback_timeout=remaining + min(15.0, batch_timeout) + 5.0,
         )
         registered += len(batch)
+        # Nanny.start() normally returns only after its Worker has registered,
+        # but observe the independent Client as a separate bounded phase.  Do
+        # not reuse the process-start deadline here: a healthy Worker that
+        # finishes close to its start limit must not be rejected merely because
+        # the registration RPC begins a few milliseconds later.
+        registration_deadline = _bounded_phase_deadline(
+            deadline,
+            registration_timeout,
+        )
         client.wait_for_workers(
             registered,
             timeout=_remaining_startup_time(
-                batch_deadline,
+                registration_deadline,
                 stage="observing Worker registration",
             ),
+        )
+        identity_deadline = _bounded_phase_deadline(
+            deadline,
+            registration_timeout,
         )
         scheduler_info = get_fresh_scheduler_info(
             client,
             timeout=_remaining_startup_time(
-                batch_deadline,
+                identity_deadline,
                 stage="validating Worker batch registration",
             ),
         )
@@ -1326,8 +1427,9 @@ class DaskService:
                 raise ValueError("At least one CPU or GPU Worker must be configured.")
             # Parse startup policy before creating any Scheduler or Client so a
             # bad deployment value has no process or socket side effects.
-            batch_size = min(_worker_start_batch_size(), total_workers)
+            batch_size = _worker_start_batch_size(total_workers)
             worker_batch_timeout = _worker_batch_start_timeout()
+            worker_registration_timeout = _worker_registration_timeout()
 
             desired_topology = (
                 requested_cpu_workers,
@@ -1437,6 +1539,7 @@ class DaskService:
                 "gpu_workers=%s selected_gpu_ids=%s threads_per_worker=1 "
                 "cpu_memory_limit=%s gpu_memory_limit=%s local_directory=%s "
                 "worker_batch_size=%s worker_batch_timeout=%.1fs "
+                "worker_registration_timeout=%.1fs "
                 "total_startup_timeout=%.1fs",
                 current_platform(),
                 LOCAL_CLUSTER_HOST,
@@ -1448,6 +1551,7 @@ class DaskService:
                 local_directory,
                 batch_size,
                 worker_batch_timeout,
+                worker_registration_timeout,
                 startup_timeout,
             )
 
@@ -1461,8 +1565,10 @@ class DaskService:
                 # remote Windows host, creating 14 Nannies first left that loop
                 # unable to complete the subsequent Client handshake even
                 # though all Workers had already registered.  A separate Client
-                # loop plus bounded Worker batches prevents that thundering
-                # herd from blocking the only Driver connection.
+                # loop prevents Worker startup from blocking the only Driver
+                # connection.  Once the Client is healthy, Workers start
+                # concurrently by default; an explicit batch-size override can
+                # still cap process-spawn concurrency for a specific site.
                 cluster = SpecCluster(
                     workers={},
                     scheduler=scheduler_spec,
@@ -1513,6 +1619,7 @@ class DaskService:
                     deadline=startup_deadline,
                     batch_size=batch_size,
                     batch_timeout=worker_batch_timeout,
+                    registration_timeout=worker_registration_timeout,
                 )
                 workers_ready_at = time.monotonic()
                 logger.info(
