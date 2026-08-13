@@ -13,7 +13,9 @@
   NVIDIA A40 上完成了 PyTorch CUDA 计算；
 - Windows 客户端经 OpenVPN/SSH loopback 隧道访问首页返回 HTTP 200，WebSocket
   收到 Slurm 控制面就绪消息；
-- 三次测试都产生了持久结果文件，并完成 Dask 集群的正常关闭。
+- 通过同一外部 WebSocket 接口发起了一次正式 Window Recovery Restart，控制面使用
+  recovery 目录中的不可变 Graph 提交 Slurm 作业，最终 4/4 Window 完成；
+- 三次多 Worker smoke 都产生了持久结果文件，并完成 Dask 集群的正常关闭。
 
 因此，当前的“登录/服务节点控制面 → Slurm 动态申请 → 单个 compute node 内建立
 Dask 集群”架构已通过本次范围内的实机验收。此次验收**没有**证明多 GPU或跨多个
@@ -35,6 +37,7 @@ compute node 可用；这些边界见下文。
 | Worker 隔离 | 通过 | 每个作业中的两个 Worker 地址与 PID 均不相同 |
 | 关闭流程 | 通过 | 三个结果均记录 `clusterShutdown=graceful` |
 | Windows 外部访问 | 通过 | 隧道端口 `127.0.0.1:18000` 返回 HTTP 200；插件 7/0；WebSocket 就绪消息正确 |
+| 正式 WebSocket 执行 | 通过（Recovery Restart） | execution `cluster-page-restart-8c45f063883e4b4e84b622f4e806afa9`；不可变恢复 Graph；状态 `succeeded`；Window 4/4 |
 | Slurm accounting | 不可用 | `sacct` 连接 `localhost:6819` 被拒绝，目标环境没有可用的 `slurmdbd` |
 
 具体 Worker 证据：
@@ -55,6 +58,18 @@ compute node 可用；这些边界见下文。
 /share/home/songzh/workflow-runtime/test-runs/multi-worker-smoke-55053.json
 /share/home/songzh/workflow-runtime/test-runs/multi-worker-smoke-55054.json
 ```
+
+正式 WebSocket Recovery Restart 的恢复记录位于：
+
+```text
+/share/home/songzh/workflow-runtime/test-runs/server-smoke-7547c9a6f0404737b45a2d175c9ce0a4/recovery
+```
+
+再次通过恢复检查 API 读取该记录，得到 `valid=true`、`compatible=true`、
+`status=succeeded`、`completedWindows=4`、`totalWindows=4`。输出合同指向测试目录中的
+`output/masks.zarr` 和 `output/cells`。这项证据覆盖了浏览器所用 WebSocket 协议、
+控制面 Slurm 分派、不可变恢复 Graph 和 Window checkpoint 收口；它是显式 Recovery
+Restart，不等同于从当前编辑器 Graph 发起一次全新的普通 Run。
 
 ## 实际部署架构
 
@@ -217,8 +232,8 @@ scontrol --local --oneliner --quiet show job 55054
 - **多 GPU 未实测**：本次只真实申请并计算了 1 张 NVIDIA A40；不能据此宣称 2/4/8 GPU
   Worker 已通过。
 - **跨节点未实现、未实测**：当前是一个 Slurm job、一个 compute node 内的 Dask 集群。
-- **页面正式 Graph 执行未包含在本次证据中**：smoke 已验证生产 `DaskService` 的真实
-  Worker 启动和任务绑定，但还应从页面提交一份代表性 Graph 做端到端验收。
+- **普通 New Run 仍未单独做浏览器点击验收**：正式 WebSocket Recovery Restart 已完成，
+  但本次没有用自动化视觉工具从编辑器逐项点击并提交一份全新的代表性 Graph。
 - **浏览器视觉交互未自动化断言**：Windows 隧道的 HTTP、插件 API 和 WebSocket 已实测，
   但没有用自动化视觉工具逐项点击页面组件。
 - **无 accounting 故障注入待复验**：`sacct` 不可用已确认，兼容修改已部署；仍需验证作业
