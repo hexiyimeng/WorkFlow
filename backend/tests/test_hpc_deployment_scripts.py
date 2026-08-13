@@ -56,6 +56,9 @@ def test_control_plane_manager_persists_only_the_web_control_plane() -> None:
     assert "-u WORKFLOW_RUNTIME_DIR" in script
     assert 'launch+=(-u "$variable_name")' in script
     assert 'launch+=("$variable_name=${!variable_name}")' in script
+    assert 'READY_URL="http://127.0.0.1:$WEB_PORT/plugin_status"' in script
+    assert 'curl --silent --fail --max-time 2 --output /dev/null "$READY_URL"' in script
+    assert 'did not become HTTP-ready within 60 seconds' in script
     assert script.index('launch+=(-u "$variable_name")') < script.index(
         'launch+=("$variable_name=${!variable_name}")'
     )

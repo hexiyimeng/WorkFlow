@@ -16,6 +16,8 @@ SESSION_NAME="${WORKFLOW_CONTROL_PLANE_SESSION:-workflow-control-plane}"
 START_SCRIPT="$WORKFLOW_ROOT/deploy/hpc/start_control_plane.sh"
 LOG_PATH="$WORKFLOW_RUNTIME_DIR/logs/control-plane.log"
 ACTION="${1:-status}"
+WEB_PORT="${WORKFLOW_WEB_PORT:-8000}"
+READY_URL="http://127.0.0.1:$WEB_PORT/plugin_status"
 CONTROL_PLANE_ENVIRONMENT=(
   WorkFlow_ALLOWED_ORIGINS
   WorkFlow_SLURM_ALLOWED_PARTITIONS
@@ -94,14 +96,26 @@ start_control_plane() {
   printf -v launch_command '%q ' "${launch[@]}"
   printf -v launch_command 'exec %s>>%q 2>&1' "$launch_command" "$LOG_PATH"
   tmux new-session -d -s "$SESSION_NAME" "$launch_command"
-  sleep 1
-  if ! session_exists; then
-    echo "WorkFlow control plane exited during startup. See $LOG_PATH" >&2
+  ready=false
+  for _ in {1..120}; do
+    if ! session_exists; then
+      echo "WorkFlow control plane exited during startup. See $LOG_PATH" >&2
+      exit 1
+    fi
+    if curl --silent --fail --max-time 2 --output /dev/null "$READY_URL"; then
+      ready=true
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "$ready" != true ]]; then
+    echo "WorkFlow control plane did not become HTTP-ready within 60 seconds." >&2
+    echo "See $LOG_PATH" >&2
     exit 1
   fi
   echo "WorkFlow control plane started (tmux=$SESSION_NAME)."
   echo "log=$LOG_PATH"
-  echo "remote=http://127.0.0.1:${WORKFLOW_WEB_PORT:-8000}"
+  echo "remote=http://127.0.0.1:$WEB_PORT"
 }
 
 stop_control_plane() {
