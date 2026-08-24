@@ -317,8 +317,7 @@ def cellpose_block(
 class Cellpose(BaseMapOverlapNode):
     CATEGORY = "WorkFlow/Segmentation"
     DISPLAY_NAME = "Cellpose"
-    EXECUTION_RESOURCE = "gpu"
-    EXECUTION_WORKERS = 1
+    required_worker_profile = "gpu-cellpose"
 
     MAP_INPUTS = ["image"]
     PRIMARY_INPUT = "image"

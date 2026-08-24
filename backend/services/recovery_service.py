@@ -13,6 +13,7 @@ import uuid
 
 import numpy as np
 
+from core.execution_paths import execution_paths_equal, normalize_execution_path
 from core.registry import NODE_CLASS_MAPPINGS
 from core.window_execution import (
     ActiveExecutionLock,
@@ -44,7 +45,16 @@ def _absolute_path(value: Any, *, name: str) -> Path:
         raise ValueError(f"{name} contains a null byte.")
     path = Path(value.strip()).expanduser()
     if not path.is_absolute():
-        raise ValueError(f"{name} must be an absolute path.")
+        if os.name == "nt":
+            example = r"D:\results\output.zarr or \\server\share\output.zarr"
+            platform_name = "Windows"
+        else:
+            example = "/share/results/output.zarr"
+            platform_name = "Linux/POSIX"
+        raise ValueError(
+            f"{name} must be an absolute path for the {platform_name} backend "
+            f"that will execute the workflow, for example {example}."
+        )
     return path.resolve()
 
 
@@ -59,7 +69,7 @@ def _resolve_literal_output_path(
             f"Terminal OUTPUT node {node_id!r} input {path_input!r} must be a "
             "literal string, not a graph connection or another value type."
         )
-    resolved = _absolute_path(
+    resolved = normalize_execution_path(
         value,
         name=f"Terminal OUTPUT node {node_id!r} input {path_input!r}",
     )
@@ -68,16 +78,16 @@ def _resolve_literal_output_path(
     # enforces that a validator cannot infer or append part of the final path.
     validator = getattr(node_cls, "validate_output_path", None)
     if callable(validator):
-        validated = _absolute_path(
+        validated = normalize_execution_path(
             validator(value),
             name=f"Terminal OUTPUT node {node_id!r} input {path_input!r}",
         )
-        if validated != resolved:
+        if not execution_paths_equal(validated, resolved):
             raise ValueError(
                 f"Terminal OUTPUT node {node_id!r} modified its configured output "
                 "path. The graph must contain the complete final path."
             )
-    return str(resolved)
+    return resolved
 
 
 def discover_terminal_outputs(

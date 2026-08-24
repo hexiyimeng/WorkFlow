@@ -11,8 +11,18 @@ import type {
   ExecutionPreflightResponse,
   WorkflowExecutionSettings,
   WorkflowExecutionSettingsField,
+  WorkerPool,
+  WorkerProfile,
 } from '../../types';
 import { isAbsoluteServerPath } from '../../utils/executionConfig';
+import {
+  defaultWorkerPool,
+  defaultWorkerProfile,
+  loadWorkerPools,
+  loadWorkerProfiles,
+  saveRequiredWorkerResources,
+  synchronizeLogicalResources,
+} from '../../utils/workerResources';
 import { Button } from '../ui/Button';
 
 const DEFAULT_SETTINGS: WorkflowExecutionSettings = {
@@ -52,7 +62,7 @@ const settingsToDraft = (
     mode: settings.mode,
     windowShapeInputs: shape.map(size => String(size)),
     maxInFlightInput: settings.maxInFlightWindows === undefined
-      ? ''
+      ? (settings.mode === 'window' ? '1' : '')
       : String(settings.maxInFlightWindows),
     checkpointMode: location?.mode ?? 'output_sidecar',
     hasCheckpointLocation: location !== undefined,
@@ -108,6 +118,290 @@ const FieldError = ({ message }: { message?: string }) => (
     </p>
   ) : null
 );
+
+type WorkerDraftField = 'cpu' | 'memoryGB' | 'gpu' | 'threads' | 'processes' | 'scale';
+type WorkerDraftErrors = Partial<Record<WorkerDraftField, string>>;
+
+const WORKER_FIELD_LABELS: Record<WorkerDraftField, string> = {
+  cpu: 'CPU / Worker',
+  memoryGB: 'Memory / Worker',
+  gpu: 'GPU / Worker',
+  threads: 'Threads / Worker',
+  processes: 'Processes / Job',
+  scale: 'Scale (Slurm Jobs)',
+};
+
+interface WorkerResourceDraft {
+  cpu: string;
+  memoryGB: string;
+  gpu: string;
+  threads: string;
+  processes: string;
+  scale: string;
+}
+
+const memoryAmount = (value: string): string => (
+  value.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*(?:GB|GiB)$/i)?.[1] ?? ''
+);
+
+const positiveIntegerDraft = (value: string): number | null => {
+  const parsed = Number(value);
+  return value.trim() !== '' && Number.isSafeInteger(parsed) && parsed > 0
+    ? parsed
+    : null;
+};
+
+const positiveNumberDraft = (value: string): number | null => {
+  const parsed = Number(value);
+  return value.trim() !== '' && Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : null;
+};
+
+const nonnegativeIntegerDraft = (value: string): number | null => {
+  const parsed = Number(value);
+  return value.trim() !== '' && Number.isSafeInteger(parsed) && parsed >= 0
+    ? parsed
+    : null;
+};
+
+const WorkerResourcesSection = ({
+  requiredProfiles,
+  disabled,
+  onSaved,
+}: {
+  requiredProfiles: string[];
+  disabled: boolean;
+  onSaved: () => Promise<void>;
+}) => {
+  const [profiles, setProfiles] = useState<WorkerProfile[]>([]);
+  const [pools, setPools] = useState<WorkerPool[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, WorkerResourceDraft>>({});
+  const [fieldErrors, setFieldErrors] = useState<Record<string, WorkerDraftErrors>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const requirementKey = requiredProfiles.join('|');
+  useEffect(() => {
+    const profileNames = requirementKey ? requirementKey.split('|') : [];
+    const savedProfiles = new Map(loadWorkerProfiles().map(profile => [profile.name, profile]));
+    const savedPools = new Map(loadWorkerPools().map(pool => [pool.profile, pool]));
+    const nextProfiles = profileNames.map(
+      name => savedProfiles.get(name) ?? defaultWorkerProfile(name),
+    );
+    const nextPools = profileNames.map(
+      name => savedPools.get(name) ?? defaultWorkerPool(name),
+    );
+    const poolByName = new Map(nextPools.map(pool => [pool.profile, pool]));
+    setProfiles(nextProfiles);
+    setPools(nextPools);
+    setDrafts(Object.fromEntries(nextProfiles.map(profile => {
+      const pool = poolByName.get(profile.name) ?? defaultWorkerPool(profile.name);
+      return [profile.name, {
+        cpu: String(profile.physical_resources.cpu),
+        memoryGB: memoryAmount(profile.physical_resources.memory),
+        gpu: String(profile.physical_resources.gpu),
+        threads: String(profile.threads),
+        processes: String(pool.processes),
+        scale: String(pool.scale),
+      }];
+    })));
+    setFieldErrors({});
+    setError(null);
+  }, [requirementKey]);
+
+  const updateDraft = (name: string, field: WorkerDraftField, value: string) => {
+    setDrafts(current => ({
+      ...current,
+      [name]: {
+        ...(current[name] ?? {
+          cpu: '', memoryGB: '', gpu: '', threads: '', processes: '', scale: '',
+        }),
+        [field]: value,
+      },
+    }));
+    setFieldErrors(current => ({
+      ...current,
+      [name]: { ...current[name], [field]: undefined },
+    }));
+    setError(null);
+  };
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const nextErrors: Record<string, WorkerDraftErrors> = {};
+      const nextProfiles = profiles.map(profile => {
+        const draft = drafts[profile.name];
+        const errors: WorkerDraftErrors = {};
+        const cpu = positiveIntegerDraft(draft?.cpu ?? '');
+        const memoryGB = positiveNumberDraft(draft?.memoryGB ?? '');
+        const gpu = nonnegativeIntegerDraft(draft?.gpu ?? '');
+        const threads = positiveIntegerDraft(draft?.threads ?? '');
+        if (cpu === null) errors.cpu = 'Enter a positive whole number.';
+        if (memoryGB === null) errors.memoryGB = 'Enter a positive number.';
+        if (gpu === null || gpu > 1) errors.gpu = 'Enter 0 or 1.';
+        if (threads === null) {
+          errors.threads = 'Enter a positive whole number.';
+        } else if (cpu !== null && threads > cpu) {
+          errors.threads = 'Threads cannot exceed CPU / Worker.';
+        }
+        if (Object.keys(errors).length > 0) nextErrors[profile.name] = errors;
+        return synchronizeLogicalResources({
+          ...profile,
+          physical_resources: {
+            cpu: cpu ?? 0,
+            memory: `${memoryGB ?? 0}GB`,
+            gpu: gpu ?? 0,
+          },
+          threads: threads ?? 0,
+        });
+      });
+      const nextPools = pools.map(pool => {
+        const draft = drafts[pool.profile];
+        const profile = nextProfiles.find(item => item.name === pool.profile);
+        const processes = positiveIntegerDraft(draft?.processes ?? '');
+        const scale = positiveIntegerDraft(draft?.scale ?? '');
+        const errors = nextErrors[pool.profile] ?? {};
+        if (processes === null) errors.processes = 'Enter a positive whole number.';
+        if (scale === null) errors.scale = 'Enter a positive whole number.';
+        if (profile?.physical_resources.gpu && processes !== 1) {
+          errors.processes = 'GPU Pools require exactly 1 process per Job.';
+        }
+        if (Object.keys(errors).length > 0) nextErrors[pool.profile] = errors;
+        return {
+          ...pool,
+          processes: profile?.physical_resources.gpu ? 1 : processes ?? 0,
+          scale: scale ?? 0,
+        };
+      });
+      setFieldErrors(nextErrors);
+      const firstInvalid = Object.entries(nextErrors)[0];
+      if (firstInvalid) {
+        const [profileName, errors] = firstInvalid;
+        const firstError = Object.entries(errors).find(([, message]) => Boolean(message));
+        const field = firstError?.[0] as WorkerDraftField | undefined;
+        const message = firstError?.[1];
+        throw new Error(
+          `Worker Profile "${profileName}" — ${field ? WORKER_FIELD_LABELS[field] : 'invalid'}: ${message}`,
+        );
+      }
+      saveRequiredWorkerResources(nextProfiles, nextPools);
+      setProfiles(nextProfiles);
+      setPools(nextPools);
+      await onSaved();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (requiredProfiles.length === 0) {
+    return (
+      <section className="rounded-[var(--radius-md)] border px-3 py-3 text-[10px]"
+        style={{ borderColor: 'var(--color-border-subtle)' }}>
+        Run preflight to discover the Worker Profiles required by this workflow.
+      </section>
+    );
+  }
+
+  return (
+    <section className="space-y-3 rounded-[var(--radius-md)] border px-3 py-3"
+      style={{ borderColor: 'var(--color-border-subtle)' }}>
+      <div>
+        <h3 className="text-[11px] font-semibold">Worker Profiles and Pools</h3>
+        <p className="mt-1 text-[9px]" style={{ color: 'var(--color-text-muted)' }}>
+          Required by the current workflow. Saved only in this browser.
+        </p>
+      </div>
+      {profiles.map(profile => {
+        const draft = drafts[profile.name] ?? {
+          cpu: '', memoryGB: '', gpu: '', threads: '', processes: '', scale: '',
+        };
+        const errors = fieldErrors[profile.name] ?? {};
+        const gpuProfile = draft.gpu === '1';
+        const processes = positiveIntegerDraft(draft.processes);
+        const scale = positiveIntegerDraft(draft.scale);
+        const totalWorkers = processes !== null && scale !== null
+          ? scale * (gpuProfile ? 1 : processes)
+          : null;
+        return (
+          <fieldset key={profile.name} disabled={disabled || saving}
+            className="rounded border p-2" style={{ borderColor: 'var(--color-border-subtle)' }}>
+            <legend className="px-1 font-mono text-[10px] font-semibold">{profile.name}</legend>
+            <div className="grid grid-cols-2 gap-2 text-[9px]">
+              <label>CPU / Worker
+                <input type="number" min="1" step="1" value={draft.cpu}
+                  aria-invalid={Boolean(errors.cpu)}
+                  onChange={event => updateDraft(profile.name, 'cpu', event.target.value)}
+                  className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
+                <FieldError message={errors.cpu} />
+              </label>
+              <label>Memory / Worker
+                <span className="mt-1 flex h-8 overflow-hidden rounded border bg-[var(--color-bg-field)]">
+                  <input type="number" min="0" step="any" value={draft.memoryGB}
+                    aria-invalid={Boolean(errors.memoryGB)}
+                    placeholder="32"
+                    onChange={event => updateDraft(profile.name, 'memoryGB', event.target.value)}
+                    className="min-w-0 flex-1 bg-transparent px-2 outline-none" />
+                  <span className="flex items-center border-l px-2 font-mono"
+                    style={{ borderColor: 'var(--color-border-subtle)', color: 'var(--color-text-muted)' }}>
+                    GB
+                  </span>
+                </span>
+                <FieldError message={errors.memoryGB} />
+              </label>
+              <label>GPU / Worker
+                <input type="number" min="0" max="1" step="1" value={draft.gpu}
+                  aria-invalid={Boolean(errors.gpu)}
+                  onChange={event => {
+                    const gpu = event.target.value;
+                    updateDraft(profile.name, 'gpu', gpu);
+                    if (gpu === '1') updateDraft(profile.name, 'processes', '1');
+                  }}
+                  className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
+                <FieldError message={errors.gpu} />
+              </label>
+              <label>Threads / Worker
+                <input type="number" min="1" max={draft.cpu || undefined} step="1"
+                  value={draft.threads} aria-invalid={Boolean(errors.threads)}
+                  onChange={event => updateDraft(profile.name, 'threads', event.target.value)}
+                  className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
+                <FieldError message={errors.threads} />
+              </label>
+              <label>Processes / Job
+                <input type="number" min="1" step="1" value={gpuProfile ? '1' : draft.processes}
+                  aria-invalid={Boolean(errors.processes)}
+                  disabled={disabled || saving || gpuProfile}
+                  onChange={event => updateDraft(profile.name, 'processes', event.target.value)}
+                  className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2 disabled:opacity-60" />
+                <FieldError message={errors.processes} />
+              </label>
+              <label>Scale (Slurm Jobs)
+                <input type="number" min="1" step="1" value={draft.scale}
+                  aria-invalid={Boolean(errors.scale)}
+                  onChange={event => updateDraft(profile.name, 'scale', event.target.value)}
+                  className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
+                <FieldError message={errors.scale} />
+              </label>
+            </div>
+            <p className="mt-2 text-[9px]" style={{ color: 'var(--color-text-muted)' }}>
+              Total Workers: {totalWorkers ?? '—'}
+            </p>
+          </fieldset>
+        );
+      })}
+      {error && <FieldError message={error} />}
+      <div className="flex justify-end">
+        <Button type="button" variant="secondary" size="sm" loading={saving}
+          disabled={disabled} onClick={() => { void save(); }}>
+          Save Worker Resources
+        </Button>
+      </div>
+    </section>
+  );
+};
 
 export default function ExecutionSettingsDrawer() {
   const {
@@ -300,8 +594,15 @@ export default function ExecutionSettingsDrawer() {
   const totalWindows = Number.isSafeInteger(executionPreflight?.totalWindows)
     ? Number(executionPreflight?.totalWindows)
     : lastPreflight?.totalWindows;
-  const cpuWorkers = requiredResources?.cpuWorkers ?? lastPreflight?.cpuWorkers;
-  const gpuWorkers = requiredResources?.gpuWorkers ?? lastPreflight?.gpuWorkers;
+  const requiredWorkerProfiles = requiredResources?.requiredWorkerProfiles
+    ?? lastPreflight?.requiredWorkerProfiles;
+  const profileSummary = requiredWorkerProfiles
+    ? Object.entries(requiredWorkerProfiles)
+      .map(([profile, count]) => `${profile} (${count} nodes)`)
+      .join(', ')
+    : '—';
+  const allocationPlan = executionPreflight?.allocationPlan;
+  const workerProfileNames = Object.keys(requiredWorkerProfiles ?? {}).sort();
   const generalError = actionError
     ?? executionSettingsValidation?.generalError
     ?? (versionError
@@ -396,6 +697,9 @@ export default function ExecutionSettingsDrawer() {
                       setDraft(current => ({
                         ...current,
                         mode: value,
+                        ...(value === 'window' && !current.maxInFlightInput.trim()
+                          ? { maxInFlightInput: '1' }
+                          : {}),
                         ...(value === 'window' && current.windowShapeInputs.length === 0 && outputShape.length > 0
                           ? { windowShapeInputs: outputShape.map(() => '1') }
                           : {}),
@@ -410,7 +714,12 @@ export default function ExecutionSettingsDrawer() {
                       markDirty(
                         'mode',
                         ...(value === 'window'
-                          ? ['windowShape', 'newRunRecoveryLocation', 'anchorNodeId'] as const
+                          ? [
+                              'windowShape',
+                              'maxInFlightWindows',
+                              'newRunRecoveryLocation',
+                              'anchorNodeId',
+                            ] as const
                           : []),
                       );
                     }}
@@ -507,7 +816,7 @@ export default function ExecutionSettingsDrawer() {
                   step="1"
                   inputMode="numeric"
                   value={draft.maxInFlightInput}
-                  placeholder="Automatic"
+                  placeholder="1"
                   disabled={isExecuting || isSaving}
                   aria-invalid={Boolean(maxInFlightError)}
                   onChange={event => {
@@ -645,6 +954,12 @@ export default function ExecutionSettingsDrawer() {
             </>
           )}
 
+          <WorkerResourcesSection
+            requiredProfiles={workerProfileNames}
+            disabled={isExecuting || isSaving}
+            onSaved={async () => refreshExecutionSettingsPreflight()}
+          />
+
           <section
             className="rounded-[var(--radius-md)] border px-3 py-3"
             style={{
@@ -669,15 +984,29 @@ export default function ExecutionSettingsDrawer() {
               <dd className="text-right font-mono">
                 {totalWindows === undefined ? 'Not checked' : totalWindows.toLocaleString()}
               </dd>
-              <dt style={{ color: 'var(--color-text-muted)' }}>Planned Workers</dt>
-              <dd className="text-right font-mono">
-                CPU {cpuWorkers ?? '—'} · GPU {gpuWorkers ?? '—'}
-              </dd>
+              <dt style={{ color: 'var(--color-text-muted)' }}>Required Profiles</dt>
+              <dd className="text-right font-mono">{profileSummary}</dd>
               {availableResources && (
                 <>
                   <dt style={{ color: 'var(--color-text-muted)' }}>Current Workers</dt>
                   <dd className="text-right font-mono">
                     CPU {availableResources.cpuWorkers ?? '—'} · GPU {availableResources.gpuWorkers ?? '—'}
+                  </dd>
+                </>
+              )}
+              {allocationPlan && (
+                <>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Planned Workers</dt>
+                  <dd className="text-right font-mono">{allocationPlan.totalWorkers}</dd>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Jobs</dt>
+                  <dd className="text-right font-mono">{allocationPlan.jobs.length}</dd>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Target Nodes</dt>
+                  <dd className="text-right font-mono">
+                    {allocationPlan.nodes.map(node => node.node).join(', ')}
+                  </dd>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Resources</dt>
+                  <dd className="text-right font-mono">
+                    CPU {allocationPlan.totalCpu} · GPU {allocationPlan.totalGpu} · {allocationPlan.totalMemoryGiB} GiB
                   </dd>
                 </>
               )}

@@ -1,146 +1,68 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from core.execution_resources import (
-    ExecutionResource,
-    normalize_execution_resource,
-    normalize_execution_workers,
-    resolve_execution_resource,
-    resolve_execution_workers,
-)
 from core.registry import NODE_CLASS_MAPPINGS
+from core.worker_profiles import normalize_worker_profile, resolve_worker_profile
 
 
-@dataclass(frozen=True)
-class ResourceNodeRequirement:
+@dataclass(frozen=True, slots=True)
+class WorkerProfileRequirement:
     node_id: str
     node_type: str
     display_name: str
-    resource: ExecutionResource
-    workers: int | None = None
+    worker_profile: str
 
     def __post_init__(self) -> None:
-        owner = f"Resource requirement for node {self.node_id!r}"
-        resource = normalize_execution_resource(self.resource, owner=owner)
-        workers_value = self.workers
-        if workers_value is None:
-            workers_value = 0 if resource == "any" else 1
-        workers = normalize_execution_workers(
-            workers_value,
-            owner=owner,
+        object.__setattr__(
+            self,
+            "worker_profile",
+            normalize_worker_profile(
+                self.worker_profile,
+                owner=f"Worker profile requirement for node {self.node_id!r}",
+            ),
         )
-        object.__setattr__(self, "resource", resource)
-        object.__setattr__(self, "workers", workers)
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, str]:
         return {
             "nodeId": self.node_id,
             "nodeType": self.node_type,
             "displayName": self.display_name,
-            "resource": self.resource,
-            "workers": self.workers,
+            "workerProfile": self.worker_profile,
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WorkflowResourcePlan:
-    nodes: tuple[ResourceNodeRequirement, ...]
-    requires_cpu: bool
-    requires_gpu: bool
-    cpu_node_ids: tuple[str, ...]
-    gpu_node_ids: tuple[str, ...]
-    any_node_ids: tuple[str, ...] = ()
-    cpu_workers: int = 0
-    gpu_workers: int = 0
+    """Backend-neutral profile requirements for a reachable workflow.
 
-    def __post_init__(self) -> None:
-        for field_name in ("cpu_workers", "gpu_workers"):
-            value = getattr(self, field_name)
-            if type(value) is not int or value < 0:
-                raise ValueError(
-                    f"WorkflowResourcePlan.{field_name} must be a "
-                    f"non-negative integer, got {value!r}."
-                )
+    Each count is the number of reachable nodes declaring that profile. It is
+    intentionally not a Worker-pool size. The Resource Planner turns these
+    requirements plus browser-supplied Pools into concrete scheduler requests.
+    """
 
-        declared_cpu_ids = tuple(
-            node.node_id for node in self.nodes if node.resource == "cpu"
-        )
-        declared_gpu_ids = tuple(
-            node.node_id for node in self.nodes if node.resource == "gpu"
-        )
-        declared_any_ids = tuple(
-            node.node_id for node in self.nodes if node.resource == "any"
-        )
-        cpu_node_ids = tuple(
-            dict.fromkeys((*self.cpu_node_ids, *declared_cpu_ids))
-        )
-        gpu_node_ids = tuple(
-            dict.fromkeys((*self.gpu_node_ids, *declared_gpu_ids))
-        )
-        any_node_ids = tuple(
-            dict.fromkeys((*self.any_node_ids, *declared_any_ids))
-        )
-        declared_cpu = sum(
-            int(node.workers)
-            for node in self.nodes
-            if node.resource in {"any", "cpu"}
-        )
-        declared_gpu = sum(
-            int(node.workers)
-            for node in self.nodes
-            if node.resource == "gpu"
-        )
-        object.__setattr__(self, "cpu_node_ids", cpu_node_ids)
-        object.__setattr__(self, "gpu_node_ids", gpu_node_ids)
-        object.__setattr__(self, "any_node_ids", any_node_ids)
-        object.__setattr__(
-            self,
-            "cpu_workers",
-            max(self.cpu_workers, declared_cpu),
-        )
-        object.__setattr__(
-            self,
-            "gpu_workers",
-            max(self.gpu_workers, declared_gpu),
-        )
-        object.__setattr__(
-            self,
-            "requires_cpu",
-            bool(self.requires_cpu or cpu_node_ids or self.cpu_workers > 0),
-        )
-        object.__setattr__(
-            self,
-            "requires_gpu",
-            bool(self.requires_gpu or gpu_node_ids or self.gpu_workers > 0),
-        )
+    nodes: tuple[WorkerProfileRequirement, ...]
+
+    @property
+    def required_worker_profiles(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for node in self.nodes:
+            counts[node.worker_profile] = counts.get(node.worker_profile, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def requires_worker_profile(self, profile: str) -> bool:
+        normalized = normalize_worker_profile(profile, owner="WorkflowResourcePlan")
+        return any(node.worker_profile == normalized for node in self.nodes)
 
     @property
     def is_mixed(self) -> bool:
-        return self.requires_cpu and self.requires_gpu
+        return len(self.required_worker_profiles) > 1
 
     def to_preflight_dict(self) -> dict[str, object]:
         return {
-            "requiresCpu": self.requires_cpu,
-            "requiresGpu": self.requires_gpu,
-            "cpuWorkers": self.cpu_workers,
-            "gpuWorkers": self.gpu_workers,
-            "cpuNodes": [
-                node.to_dict()
-                for node in self.nodes
-                if node.resource == "cpu"
-            ],
-            "gpuNodes": [
-                node.to_dict()
-                for node in self.nodes
-                if node.resource == "gpu"
-            ],
-            "anyNodes": [
-                node.to_dict()
-                for node in self.nodes
-                if node.resource == "any"
-            ],
+            "requiredWorkerProfiles": self.required_worker_profiles,
+            "profileRequirements": [node.to_dict() for node in self.nodes],
         }
 
 
@@ -177,10 +99,10 @@ def build_workflow_resource_plan(
     *,
     node_mappings: Mapping[str, type] | None = None,
 ) -> WorkflowResourcePlan:
-    """Resolve logical resources for only the terminal-reachable graph."""
+    """Collect profile requirements for only the terminal-reachable graph."""
 
     mappings = NODE_CLASS_MAPPINGS if node_mappings is None else node_mappings
-    requirements: list[ResourceNodeRequirement] = []
+    requirements: list[WorkerProfileRequirement] = []
     for node_id in sorted(_reachable_node_ids(graph, execution_roots)):
         node_data = graph[node_id]
         node_type = str(node_data.get("type", ""))
@@ -189,100 +111,48 @@ def build_workflow_resource_plan(
             raise ValueError(
                 f"Cannot build resource plan: node type {node_type!r} is not registered."
             )
-        resource = resolve_execution_resource(node_cls)
-        workers = resolve_execution_workers(node_cls)
-        requirements.append(ResourceNodeRequirement(
+        requirements.append(WorkerProfileRequirement(
             node_id=node_id,
             node_type=node_type,
             display_name=str(getattr(node_cls, "DISPLAY_NAME", node_type)),
-            resource=resource,
-            workers=workers,
+            worker_profile=resolve_worker_profile(node_cls),
         ))
-
-    nodes = tuple(requirements)
-    cpu_node_ids = tuple(node.node_id for node in nodes if node.resource == "cpu")
-    gpu_node_ids = tuple(node.node_id for node in nodes if node.resource == "gpu")
-    any_node_ids = tuple(node.node_id for node in nodes if node.resource == "any")
-    cpu_workers = sum(
-        int(node.workers)
-        for node in nodes
-        if node.resource in {"any", "cpu"}
-    )
-    gpu_workers = sum(
-        int(node.workers) for node in nodes if node.resource == "gpu"
-    )
-    return WorkflowResourcePlan(
-        nodes=nodes,
-        requires_cpu=bool(cpu_node_ids or cpu_workers),
-        requires_gpu=bool(gpu_node_ids),
-        cpu_node_ids=cpu_node_ids,
-        gpu_node_ids=gpu_node_ids,
-        any_node_ids=any_node_ids,
-        cpu_workers=cpu_workers,
-        gpu_workers=gpu_workers,
-    )
+    return WorkflowResourcePlan(nodes=tuple(requirements))
 
 
-def ensure_executable_resource_plan(
-    plan: WorkflowResourcePlan,
-) -> WorkflowResourcePlan:
-    """Validate constrained pools and give an all-``any`` graph one Worker.
+def ensure_executable_resource_plan(plan: WorkflowResourcePlan) -> WorkflowResourcePlan:
+    """Validate profile declarations without inventing a Worker topology."""
 
-    This normalization is deliberately independent of the execution backend.
-    Local desktop execution and Slurm submission must derive exactly the same
-    CPU/GPU topology from a workflow graph.
-    """
-
-    has_cpu_nodes = any(node.resource == "cpu" for node in plan.nodes)
-    has_gpu_nodes = any(node.resource == "gpu" for node in plan.nodes)
-    if has_cpu_nodes and plan.cpu_workers == 0:
-        raise ValueError(
-            "The workflow contains CPU-constrained node(s), but their aggregate "
-            "EXECUTION_WORKERS count is 0. Declare at least one CPU Worker."
-        )
-    if has_gpu_nodes and plan.gpu_workers == 0:
-        raise ValueError(
-            "The workflow contains GPU-constrained node(s), but their aggregate "
-            "EXECUTION_WORKERS count is 0. Declare at least one GPU Worker."
-        )
-
-    if plan.cpu_workers > 0 or plan.gpu_workers > 0:
-        return plan
-
-    # An all-any graph has no typed pool from which to derive cluster capacity.
-    # One CPU Worker is the minimal executable topology.
-    return replace(
-        plan,
-        requires_cpu=True,
-        cpu_workers=1,
-    )
+    if not isinstance(plan, WorkflowResourcePlan):
+        raise TypeError("plan must be a WorkflowResourcePlan.")
+    return plan
 
 
 def validate_workflow_resource_plan(
     plan: WorkflowResourcePlan,
     cluster_summary: object,
 ) -> None:
-    cpu_slots = float(getattr(cluster_summary, "total_cpu_slots", 0.0))
-    gpu_slots = float(getattr(cluster_summary, "total_gpu_slots", 0.0))
-    required_cpu_slots = max(plan.cpu_workers, int(plan.requires_cpu))
-    required_gpu_slots = max(plan.gpu_workers, int(plan.requires_gpu))
-    if plan.requires_cpu and cpu_slots < required_cpu_slots:
-        availability = (
-            "no Worker with resource CPU=1 is available"
-            if cpu_slots < 1
-            else f"only {cpu_slots:g} CPU Worker slot(s) are available"
-        )
+    """Validate placement capabilities, never profile counts as Worker counts."""
+
+    profile_slots = getattr(cluster_summary, "worker_profile_slots", None)
+    if profile_slots is None:
+        return
+    missing = sorted(
+        profile for profile in plan.required_worker_profiles
+        if float(profile_slots.get(profile, 0) or 0) < 1
+    )
+    if missing:
         raise RuntimeError(
-            f"The workflow requires {required_cpu_slots} CPU Worker slot(s) with "
-            f"resource CPU=1, but {availability}."
+            "No active Dask Worker advertises required Profile(s): "
+            + ", ".join(missing)
+            + "."
         )
-    if plan.requires_gpu and gpu_slots < required_gpu_slots:
-        availability = (
-            "no GPU Worker is available"
-            if gpu_slots < 1
-            else f"only {gpu_slots:g} GPU Worker slot(s) are available"
-        )
-        raise RuntimeError(
-            f"The workflow requires {required_gpu_slots} GPU Worker slot(s) with "
-            f"resource GPU=1, but {availability}. CPU fallback is not supported."
-        )
+
+
+__all__ = [
+    "WorkerProfileRequirement",
+    "WorkflowResourcePlan",
+    "build_workflow_resource_plan",
+    "ensure_executable_resource_plan",
+    "validate_workflow_resource_plan",
+]

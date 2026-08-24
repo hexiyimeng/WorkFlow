@@ -214,6 +214,16 @@ const sanitizeLastPreflight = (value: unknown): LastPreflightSummary | undefined
   if (Number.isSafeInteger(value.totalWindows) && Number(value.totalWindows) >= 0) {
     summary.totalWindows = Number(value.totalWindows);
   }
+  if (isRecord(value.requiredWorkerProfiles)) {
+    const profiles = Object.fromEntries(
+      Object.entries(value.requiredWorkerProfiles).filter(
+        ([name, count]) => name.length > 0
+          && Number.isSafeInteger(count)
+          && Number(count) >= 0,
+      ).map(([name, count]) => [name, Number(count)]),
+    );
+    if (Object.keys(profiles).length > 0) summary.requiredWorkerProfiles = profiles;
+  }
   if (Number.isSafeInteger(value.cpuWorkers) && Number(value.cpuWorkers) >= 0) {
     summary.cpuWorkers = Number(value.cpuWorkers);
   }
@@ -541,9 +551,7 @@ export const buildNewRunExecutionConfig = (
   return {
     mode: 'window',
     windowShape: [...settings.windowShape],
-    ...(settings.maxInFlightWindows === undefined
-      ? {}
-      : { maxInFlightWindows: settings.maxInFlightWindows }),
+    maxInFlightWindows: settings.maxInFlightWindows ?? 1,
     resumeAction: 'new',
     recoveryLocation: location.mode === 'output_sidecar'
       ? { mode: 'output_sidecar', anchorNodeId: location.anchorNodeId }
@@ -561,13 +569,9 @@ export const lastPreflightSummaryFromResponse = (
   if (Number.isSafeInteger(preflight.totalWindows) && Number(preflight.totalWindows) >= 0) {
     summary.totalWindows = Number(preflight.totalWindows);
   }
-  const cpuWorkers = preflight.requiredResources?.cpuWorkers;
-  const gpuWorkers = preflight.requiredResources?.gpuWorkers;
-  if (Number.isSafeInteger(cpuWorkers) && Number(cpuWorkers) >= 0) {
-    summary.cpuWorkers = Number(cpuWorkers);
-  }
-  if (Number.isSafeInteger(gpuWorkers) && Number(gpuWorkers) >= 0) {
-    summary.gpuWorkers = Number(gpuWorkers);
+  const requiredWorkerProfiles = preflight.requiredResources?.requiredWorkerProfiles;
+  if (requiredWorkerProfiles) {
+    summary.requiredWorkerProfiles = { ...requiredWorkerProfiles };
   }
   if (Number.isFinite(validatedAt)) summary.validatedAt = validatedAt;
   return summary;
@@ -589,9 +593,7 @@ export const formatWorkflowExecutionSettingsSummary = (
   const shape = settings.windowShape?.length
     ? ` · ${settings.windowShape.join('×')}`
     : '';
-  const inFlight = settings.maxInFlightWindows === undefined
-    ? ''
-    : ` · In-flight ${settings.maxInFlightWindows}`;
+  const inFlight = ` · In-flight ${settings.maxInFlightWindows ?? 1}`;
   return `Window${shape}${inFlight}`;
 };
 

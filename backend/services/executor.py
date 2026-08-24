@@ -19,7 +19,9 @@ from core.invocation_builder import (
     prepare_node_inputs,
 )
 from core.config import config
-from core.execution_resources import dask_annotation_kwargs
+from core.worker_profiles import dask_annotation_kwargs
+from core.worker_profiles import parse_worker_profiles
+from core.worker_pool import parse_worker_pools
 from core.platform import rewrite_dashboard_url
 from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
@@ -442,7 +444,7 @@ def _compute_with_resource_boundaries(
     # ``compute``; existing node layers keep their CPU/GPU resource annotations.
     with dask.annotate(
         brainflow_node_id="__framework_finalize__",
-        execution_resource="any",
+        worker_profile="framework",
     ):
         if disable_graph_optimization:
             return client.compute(collections, optimize_graph=False)
@@ -471,10 +473,9 @@ def _resolve_max_in_flight_windows(
     resource_plan: WorkflowResourcePlan,
     cluster_summary,
 ) -> int:
+    del resource_plan, cluster_summary
     if requested is not None:
         resolved = requested
-    elif resource_plan.requires_gpu:
-        resolved = max(1, 2 * len(cluster_summary.gpu_workers))
     else:
         resolved = 1
 
@@ -498,7 +499,7 @@ def _requires_resource_boundary_preservation(
 ) -> bool:
     """Return whether optimization could fuse differently constrained layers."""
 
-    return len({node.resource for node in plan.nodes}) > 1
+    return len({node.worker_profile for node in plan.nodes}) > 1
 
 
 @dataclass
@@ -670,7 +671,7 @@ async def _execute_pending_windows(
         # Existing node layers retain their own resource annotations.
         with dask.annotate(
             brainflow_node_id="__window__",
-            execution_resource="any",
+            worker_profile="framework",
         ):
             window_collections = [
                 root_array[window.slices]
@@ -1311,6 +1312,8 @@ async def execute_graph(
     checkpoint_store: WindowCheckpointStore | None = None,
     release_active_execution: bool = True,
     external_cleanup_barrier: Callable[[], Awaitable[None]] | None = None,
+    worker_profiles: object = None,
+    worker_pools: object = None,
 ):
     """Execute true terminal roots in Full Graph or bounded Window mode."""
     tasks: dict = {}
@@ -1483,26 +1486,27 @@ async def execute_graph(
             selected_config,
         )
         logger.info(
-            "[Dask] Graph resource plan: cpu_workers=%s gpu_workers=%s "
-            "contributors=%s",
-            resource_plan.cpu_workers,
-            resource_plan.gpu_workers,
+            "[Dask] Graph Worker Profile requirements: %s contributors=%s",
+            resource_plan.required_worker_profiles,
             tuple(
-                (
-                    node.node_id,
-                    node.node_type,
-                    node.resource,
-                    node.workers,
-                )
+                (node.node_id, node.node_type, node.worker_profile)
                 for node in resource_plan.nodes
-                if node.workers
             ),
         )
-        client = await asyncio.to_thread(
-            dask_service.ensure_client,
-            cpu_workers=resource_plan.cpu_workers,
-            gpu_workers=resource_plan.gpu_workers,
-        )
+        # Profile requirements are not Worker counts. Slurm execution has
+        # already provisioned the browser-configured Pools; the local backend
+        # validates its independently managed compatibility cluster here.
+        if dask_service.uses_external_workers():
+            client = await asyncio.to_thread(dask_service.ensure_client)
+        elif worker_profiles is not None and worker_pools is not None:
+            client = await asyncio.to_thread(
+                dask_service.ensure_profile_client,
+                profiles=parse_worker_profiles(worker_profiles),
+                pools=parse_worker_pools(worker_pools),
+                required_profiles=resource_plan.required_worker_profiles,
+            )
+        else:
+            client = await asyncio.to_thread(dask_service.ensure_client)
         cluster_summary = await asyncio.to_thread(
             dask_service.get_cluster_resource_summary,
             client,

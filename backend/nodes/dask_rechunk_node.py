@@ -13,8 +13,7 @@ class DaskRechunk:
     PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/Dask"
     DISPLAY_NAME = "Dask Rechunk"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 1
+    required_worker_profile = "cpu-general"
 
     RETURN_TYPES = ("DASK_ARRAY[any]",)
     RETURN_NAMES = ("dask_arr",)

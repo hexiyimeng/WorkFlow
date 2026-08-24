@@ -12,6 +12,7 @@ from typing import Any
 import dask.config
 import numpy as np
 
+from core.execution_paths import execution_path_suffix, normalize_execution_path
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
@@ -40,22 +41,13 @@ def _lock_acquire_timeout_seconds() -> float:
 
 
 def _normalize_output_path(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("ZarrWriter output_path must be a literal string.")
-    raw = value.strip()
-    if not raw:
-        raise ValueError("ZarrWriter output_path cannot be empty.")
-    if "\x00" in raw:
-        raise ValueError("ZarrWriter output_path contains a null byte.")
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        raise ValueError("ZarrWriter output_path must be an absolute path.")
-    if path.suffix.lower() != ".zarr":
+    normalized = normalize_execution_path(value, name="ZarrWriter output_path")
+    if execution_path_suffix(normalized).lower() != ".zarr":
         raise ValueError(
             "ZarrWriter output_path must include the complete final '.zarr' suffix; "
             "the framework does not append file extensions."
         )
-    return str(path.resolve())
+    return normalized
 
 
 def _normalize_dataset_path(value: str | None) -> str:
@@ -543,8 +535,7 @@ class ZarrWriter(BaseMapBlocksNode):
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr Writer"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 6
+    required_worker_profile = "cpu-writer"
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_path"
 

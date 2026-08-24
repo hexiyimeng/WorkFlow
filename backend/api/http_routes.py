@@ -72,7 +72,12 @@ async def execution_preflight(payload: dict):
                     "mode": "window",
                     "windowShape": payload["windowShape"],
                 }
-            return await preflight_graph(graph, execution_config)
+            return await preflight_graph(
+                graph,
+                execution_config,
+                worker_profiles=payload.get("workerProfiles"),
+                worker_pools=payload.get("workerPools"),
+            )
     except Exception as exc:
         return JSONResponse(
             status_code=400,

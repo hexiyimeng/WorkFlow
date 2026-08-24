@@ -27,6 +27,61 @@ export type RecoveryLocation =
   | { mode: 'output_sidecar'; anchorNodeId: string }
   | { mode: 'custom'; directory: string };
 
+export interface WorkerPhysicalResources {
+  cpu: number;
+  memory: string;
+  gpu: number;
+}
+
+export interface WorkerProfile {
+  name: string;
+  physical_resources: WorkerPhysicalResources;
+  logical_resources: Record<string, number>;
+  capabilities: string[];
+  threads: number;
+}
+
+export interface WorkerPool {
+  profile: string;
+  processes: number;
+  scale: number;
+}
+
+export interface SlurmAllocationPlan {
+  partition: string;
+  timeLimit: string;
+  requiredWorkerProfiles: Record<string, number>;
+  workerCounts: Record<string, number>;
+  totalWorkers: number;
+  totalCpu: number;
+  totalGpu: number;
+  totalMemoryGiB: number;
+  jobs: Array<{
+    allocationId: string;
+    profile: string;
+    node: string;
+    workers: number;
+    processes: number;
+    threads: number;
+    slurm: {
+      nodes: 1;
+      cpus: number;
+      memoryGiB: number;
+      gpus: number;
+      nodelist: string[];
+    };
+    logicalResources: Record<string, number>;
+  }>;
+  nodes: Array<{
+    node: string;
+    workers: Record<string, number>;
+    cpu: number;
+    memoryGiB: number;
+    gpu: number;
+    jobs: string[];
+  }>;
+}
+
 /**
  * Informational result of the most recent successful, read-only preflight.
  * This is safe to persist with a workflow; it is never used as a substitute
@@ -35,7 +90,10 @@ export type RecoveryLocation =
 export interface LastPreflightSummary {
   outputShape?: number[];
   totalWindows?: number;
+  requiredWorkerProfiles?: Record<string, number>;
+  /** @deprecated Read-only migration support for settings saved before Phase 2. */
   cpuWorkers?: number;
+  /** @deprecated Read-only migration support for settings saved before Phase 2. */
   gpuWorkers?: number;
   validatedAt?: number;
 }
@@ -141,13 +199,8 @@ export interface ExecutionPreflightResponse {
   ndim?: number | null;
   reason?: string | null;
   requiredResources?: {
-    requiresCpu: boolean;
-    requiresGpu: boolean;
-    cpuWorkers: number;
-    gpuWorkers: number;
-    cpuNodes: ResourceNodeRequirement[];
-    gpuNodes: ResourceNodeRequirement[];
-    anyNodes?: ResourceNodeRequirement[];
+    requiredWorkerProfiles: Record<string, number>;
+    profileRequirements: WorkerProfileRequirement[];
   };
   availableResources?: {
     cpuWorkers: number | null;
@@ -157,16 +210,18 @@ export interface ExecutionPreflightResponse {
   };
   resourcesSatisfied?: boolean | null;
   resourceError?: string | null;
+  allocationPlan?: SlurmAllocationPlan | null;
+  preflightError?: {
+    type: string;
+    message: string;
+  } | null;
 }
 
-export type ExecutionResource = 'any' | 'cpu' | 'gpu';
-
-export interface ResourceNodeRequirement {
+export interface WorkerProfileRequirement {
   nodeId: string;
   nodeType: string;
   displayName: string;
-  workers: number;
-  resource?: ExecutionResource;
+  workerProfile: string;
 }
 
 export type RecoveryManifestStatus =
@@ -259,8 +314,7 @@ export interface NodeSpec {
   output: string[];
   output_name?: string[];
   output_node?: boolean;
-  execution_resource?: ExecutionResource;
-  execution_workers?: number;
+  required_worker_profile?: string;
 }
 
 export interface PluginLoadedEntry {

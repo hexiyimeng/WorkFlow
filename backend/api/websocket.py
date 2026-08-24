@@ -257,6 +257,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         execution_graph=graph,
                         attached_execution_id=execution_id,
                         attached_config=execution_config,
+                        attached_worker_profiles=data.get("workerProfiles"),
+                        attached_worker_pools=data.get("workerPools"),
                         gate=start_gate,
                     ):
                         await gate.wait()
@@ -264,6 +266,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             execution_graph,
                             attached_execution_id,
                             attached_config,
+                            worker_profiles=attached_worker_profiles,
+                            worker_pools=attached_worker_pools,
                         )
 
                     execution_task = asyncio.create_task(execute_after_ack())

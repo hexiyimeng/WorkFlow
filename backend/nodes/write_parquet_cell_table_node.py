@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from core.execution_paths import normalize_execution_path
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
@@ -22,17 +23,7 @@ CELL_LOCAL_ID_WIDTH = 6
 
 
 def _normalize_path(value: str, *, name: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{name} must be a literal string.")
-    raw = value.strip()
-    if not raw:
-        raise ValueError(f"{name} cannot be empty.")
-    if "\x00" in raw:
-        raise ValueError(f"{name} contains a null byte.")
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        raise ValueError(f"{name} must be an absolute path.")
-    return str(path.resolve())
+    return normalize_execution_path(value, name=name)
 
 
 def _block_id(block_index: tuple[int, ...]) -> str:
@@ -420,8 +411,7 @@ class WriteParquetCellTable(BaseMapBlocksNode):
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Write Parquet Cell Table"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 6
+    required_worker_profile = "cpu-writer"
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_dir"
     CHUNK_POLICY = {"mode": "rechunk_to_primary"}

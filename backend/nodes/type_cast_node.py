@@ -28,8 +28,7 @@ class DaskTypeCast(BaseMapBlocksNode):
     """Blockwise lazy dtype conversion with optional integer clipping."""
     CATEGORY = "WorkFlow/Utility"
     DISPLAY_NAME = "Type Cast"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 1
+    required_worker_profile = "cpu-general"
 
     @classmethod
     def INPUT_TYPES(cls):

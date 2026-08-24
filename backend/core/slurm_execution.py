@@ -96,95 +96,34 @@ def _slurm_time_seconds(value: object, *, name: str = "time_limit") -> int:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SlurmResourceRequest:
-    """Validated homogeneous Slurm allocation for one execution.
+    """Concrete Slurm resources supplied by the Resource Planner."""
 
-    ``cpu_workers`` and ``gpu_workers`` are workflow-wide totals.  ``cpus``,
-    ``gpus`` and ``memory_gib`` are deliberately *per-node* Slurm requests;
-    homogeneous allocations apply those values to every allocated node.  The
-    explicit Worker placement lets the compute launcher start only the planned
-    processes on each node while keeping the single-node representation fully
-    backward compatible.
-    """
-
-    cpu_workers: int
-    gpu_workers: int
     nodes: int
     cpus: int
     gpus: int
     memory_gib: int
     time_limit: str
     partition: str
-    cpu_workers_by_node: tuple[int, ...] = ()
-    gpu_workers_by_node: tuple[int, ...] = ()
+    node_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _require_int(self.cpu_workers, name="cpu_workers", minimum=0)
-        _require_int(self.gpu_workers, name="gpu_workers", minimum=0)
-        if self.cpu_workers + self.gpu_workers <= 0:
-            raise ValueError("At least one CPU or GPU Worker must be requested.")
         nodes = _require_int(self.nodes, name="nodes", minimum=1)
-
-        cpu_placement = self.cpu_workers_by_node
-        if not cpu_placement:
-            if nodes != 1:
-                raise ValueError(
-                    "cpu_workers_by_node is required for a multi-node request."
-                )
-            cpu_placement = (self.cpu_workers,)
-        gpu_placement = self.gpu_workers_by_node
-        if not gpu_placement:
-            if nodes != 1:
-                raise ValueError(
-                    "gpu_workers_by_node is required for a multi-node request."
-                )
-            gpu_placement = (self.gpu_workers,)
-
-        for name, placement, expected_total in (
-            ("cpu_workers_by_node", cpu_placement, self.cpu_workers),
-            ("gpu_workers_by_node", gpu_placement, self.gpu_workers),
-        ):
-            if not isinstance(placement, tuple) or len(placement) != nodes:
-                raise ValueError(f"{name} must be a tuple with one entry per node.")
-            for index, value in enumerate(placement):
-                _require_int(value, name=f"{name}[{index}]", minimum=0)
-            if sum(placement) != expected_total:
-                raise ValueError(
-                    f"{name} sums to {sum(placement)}, expected {expected_total}."
-                )
-        if any(
-            cpu_count + gpu_count <= 0
-            for cpu_count, gpu_count in zip(cpu_placement, gpu_placement)
-        ):
-            raise ValueError("Every allocated node must run at least one Worker.")
-
-        object.__setattr__(self, "cpu_workers_by_node", cpu_placement)
-        object.__setattr__(self, "gpu_workers_by_node", gpu_placement)
-
         _require_int(self.cpus, name="cpus", minimum=1)
-        maximum_local_workers = max(
-            cpu_count + gpu_count
-            for cpu_count, gpu_count in zip(cpu_placement, gpu_placement)
-        )
-        if self.cpus < maximum_local_workers:
-            raise ValueError(
-                "cpus must provide at least one CPU slot for every CPU and GPU "
-                "Worker placed on one node."
-            )
         _require_int(self.gpus, name="gpus", minimum=0)
         _require_int(self.memory_gib, name="memory_gib", minimum=1)
-        maximum_local_gpu_workers = max(gpu_placement)
-        if self.gpus != maximum_local_gpu_workers:
-            raise ValueError(
-                "gpus must exactly equal the maximum GPU Worker count placed on "
-                "one node so every GPU Worker receives one allocated GPU."
-            )
         _slurm_time_seconds(self.time_limit)
         _validate_partition(self.partition)
+        if self.node_names:
+            if len(self.node_names) != nodes:
+                raise ValueError("node_names must contain one name per requested node.")
+            for index, name in enumerate(self.node_names):
+                if not isinstance(name, str) or _PARTITION_RE.fullmatch(name) is None:
+                    raise ValueError(f"node_names[{index}] is not a safe Slurm node name.")
+            if len(set(self.node_names)) != len(self.node_names):
+                raise ValueError("node_names must not contain duplicates.")
 
     @property
     def time(self) -> str:
-        """Alias matching Slurm's ``--time`` terminology."""
-
         return self.time_limit
 
     @property
@@ -201,8 +140,6 @@ class SlurmResourceRequest:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "cpuWorkers": self.cpu_workers,
-            "gpuWorkers": self.gpu_workers,
             "nodes": self.nodes,
             "cpus": self.cpus,
             "gpus": self.gpus,
@@ -210,25 +147,22 @@ class SlurmResourceRequest:
             "totalCpus": self.total_cpus,
             "totalGpus": self.total_gpus,
             "totalMemoryGiB": self.total_memory_gib,
-            "cpuWorkersByNode": list(self.cpu_workers_by_node),
-            "gpuWorkersByNode": list(self.gpu_workers_by_node),
             "timeLimit": self.time_limit,
             "partition": self.partition,
+            "nodeNames": list(self.node_names),
         }
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SlurmPolicy:
-    """Administrator-provided ceilings and per-Worker allocation policy."""
+    """Administrator-provided Slurm site limits.
+
+    Per-Worker CPU, GPU, and memory sizing no longer belongs here. A Phase 3
+    Resource Planner must provide an already concrete SlurmResourceRequest.
+    """
 
     partition: str
     time_limit: str
-    cpus_per_cpu_worker: int
-    cpus_per_gpu_worker: int
-    memory_gib_per_cpu_worker: int
-    memory_gib_per_gpu_worker: int
-    max_cpu_workers: int
-    max_gpu_workers: int
     max_cpus: int
     max_gpus: int
     max_memory_gib: int
@@ -236,8 +170,6 @@ class SlurmPolicy:
     cpus_per_node: int
     gpus_per_node: int
     memory_gib_per_node: int
-    base_cpus: int = 1
-    base_memory_gib: int = 1
     allowed_partitions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -245,11 +177,6 @@ class SlurmPolicy:
         _slurm_time_seconds(self.time_limit)
 
         for field_name in (
-            "base_cpus",
-            "cpus_per_cpu_worker",
-            "cpus_per_gpu_worker",
-            "memory_gib_per_cpu_worker",
-            "memory_gib_per_gpu_worker",
             "max_cpus",
             "max_memory_gib",
             "max_nodes",
@@ -258,15 +185,10 @@ class SlurmPolicy:
         ):
             _require_int(getattr(self, field_name), name=field_name, minimum=1)
         for field_name in (
-            "base_memory_gib",
-            "max_cpu_workers",
-            "max_gpu_workers",
             "max_gpus",
             "gpus_per_node",
         ):
             _require_int(getattr(self, field_name), name=field_name, minimum=0)
-        if self.max_cpu_workers + self.max_gpu_workers <= 0:
-            raise ValueError("The Slurm policy must allow at least one Worker.")
 
         raw_allowed = self.allowed_partitions
         if not isinstance(raw_allowed, tuple):
@@ -282,272 +204,26 @@ class SlurmPolicy:
             )
         object.__setattr__(self, "allowed_partitions", allowed)
 
-        if self.base_cpus > self.max_cpus:
-            raise ValueError("base_cpus exceeds max_cpus.")
-        if self.base_cpus > self.cpus_per_node:
-            raise ValueError("base_cpus exceeds cpus_per_node.")
-        if self.base_memory_gib > self.max_memory_gib:
-            raise ValueError("base_memory_gib exceeds max_memory_gib.")
-        if self.base_memory_gib > self.memory_gib_per_node:
-            raise ValueError("base_memory_gib exceeds memory_gib_per_node.")
-        if self.max_gpu_workers > self.max_gpus:
-            raise ValueError("max_gpu_workers exceeds max_gpus.")
+    def validate_request(self, request: SlurmResourceRequest) -> None:
+        """Validate a concrete request emitted by the Resource Planner."""
 
-    def resource_request(
-        self,
-        *,
-        cpu_workers: int,
-        gpu_workers: int,
-        partition: str | None = None,
-    ) -> SlurmResourceRequest:
-        """Convert graph Worker totals into a bounded homogeneous request."""
-
-        return build_slurm_resource_request(
-            self,
-            cpu_workers=cpu_workers,
-            gpu_workers=gpu_workers,
-            partition=partition,
-        )
-
-
-def _balanced_counts(total: int, nodes: int) -> tuple[int, ...]:
-    """Spread identical Workers deterministically with a difference of at most one."""
-
-    quotient, remainder = divmod(total, nodes)
-    return tuple(
-        quotient + (1 if index < remainder else 0)
-        for index in range(nodes)
-    )
-
-
-def _cpu_capacity_for_gpu_count(policy: SlurmPolicy, gpu_count: int) -> int:
-    """Return how many CPU Workers still fit beside ``gpu_count`` GPU Workers."""
-
-    remaining_cpus = (
-        policy.cpus_per_node
-        - policy.base_cpus
-        - gpu_count * policy.cpus_per_gpu_worker
-    )
-    remaining_memory = (
-        policy.memory_gib_per_node
-        - policy.base_memory_gib
-        - gpu_count * policy.memory_gib_per_gpu_worker
-    )
-    if remaining_cpus < 0 or remaining_memory < 0:
-        return -1
-    return min(
-        remaining_cpus // policy.cpus_per_cpu_worker,
-        remaining_memory // policy.memory_gib_per_cpu_worker,
-    )
-
-
-def _place_cpu_workers(
-    policy: SlurmPolicy,
-    *,
-    cpu_workers: int,
-    gpu_workers_by_node: tuple[int, ...],
-) -> tuple[int, ...] | None:
-    """Place CPU Workers without exceeding either per-node resource envelope.
-
-    GPU placement is balanced first because homogeneous ``--gres`` applies its
-    maximum to every node.  CPU Workers are then assigned to the node whose
-    projected CPU/memory utilization is lowest.  The stable node-index tie
-    breaker makes identical inputs produce an identical launcher plan.
-    """
-
-    capacities = tuple(
-        _cpu_capacity_for_gpu_count(policy, gpu_count)
-        for gpu_count in gpu_workers_by_node
-    )
-    if any(capacity < 0 for capacity in capacities):
-        return None
-    if sum(capacities) < cpu_workers:
-        return None
-
-    placement = [0] * len(gpu_workers_by_node)
-    remaining = cpu_workers
-
-    # Homogeneous allocations must not contain a node on which the launcher
-    # starts no Worker.  Reserve one CPU Worker for each GPU-free node first.
-    for index, gpu_count in enumerate(gpu_workers_by_node):
-        if gpu_count != 0:
-            continue
-        if remaining <= 0 or capacities[index] <= 0:
-            return None
-        placement[index] = 1
-        remaining -= 1
-
-    while remaining:
-        candidates: list[tuple[tuple[float, float, float, int, int], int]] = []
-        for index, (cpu_count, gpu_count, capacity) in enumerate(
-            zip(placement, gpu_workers_by_node, capacities)
-        ):
-            if cpu_count >= capacity:
-                continue
-            projected_cpu_count = cpu_count + 1
-            projected_cpus = (
-                policy.base_cpus
-                + projected_cpu_count * policy.cpus_per_cpu_worker
-                + gpu_count * policy.cpus_per_gpu_worker
+        if request.partition not in self.allowed_partitions:
+            raise ValueError(
+                f"partition {request.partition!r} is not allowed; expected one of "
+                f"{self.allowed_partitions!r}."
             )
-            projected_memory = (
-                policy.base_memory_gib
-                + projected_cpu_count * policy.memory_gib_per_cpu_worker
-                + gpu_count * policy.memory_gib_per_gpu_worker
-            )
-            cpu_fraction = projected_cpus / policy.cpus_per_node
-            memory_fraction = projected_memory / policy.memory_gib_per_node
-            candidates.append((
-                (
-                    max(cpu_fraction, memory_fraction),
-                    cpu_fraction,
-                    memory_fraction,
-                    projected_cpu_count,
-                    index,
-                ),
-                index,
-            ))
-        if not candidates:
-            return None
-        _, selected_index = min(candidates)
-        placement[selected_index] += 1
-        remaining -= 1
-
-    return tuple(placement)
-
-
-def build_slurm_resource_request(
-    policy: SlurmPolicy,
-    *,
-    cpu_workers: int,
-    gpu_workers: int,
-    partition: str | None = None,
-) -> SlurmResourceRequest:
-    """Build the smallest feasible homogeneous allocation for graph counts.
-
-    Placement is deterministic and uses no scheduler state.  That keeps
-    preflight read-only while allowing the service to persist the exact plan
-    before ``sbatch``.  Slurm may select any matching hosts; node ranks map to
-    the placement tuple after the allocation is granted.
-    """
-
-    cpu_workers = _require_int(cpu_workers, name="cpu_workers", minimum=0)
-    gpu_workers = _require_int(gpu_workers, name="gpu_workers", minimum=0)
-    if cpu_workers + gpu_workers <= 0:
-        raise ValueError("At least one CPU or GPU Worker must be requested.")
-    if cpu_workers > policy.max_cpu_workers:
-        raise ValueError(
-            f"cpu_workers={cpu_workers} exceeds policy limit "
-            f"{policy.max_cpu_workers}."
+        checks = (
+            (request.nodes, self.max_nodes, "nodes"),
+            (request.cpus, self.cpus_per_node, "cpus per node"),
+            (request.gpus, self.gpus_per_node, "gpus per node"),
+            (request.memory_gib, self.memory_gib_per_node, "memory GiB per node"),
+            (request.total_cpus, self.max_cpus, "total cpus"),
+            (request.total_gpus, self.max_gpus, "total gpus"),
+            (request.total_memory_gib, self.max_memory_gib, "total memory GiB"),
         )
-    if gpu_workers > policy.max_gpu_workers:
-        raise ValueError(
-            f"gpu_workers={gpu_workers} exceeds policy limit "
-            f"{policy.max_gpu_workers}."
-        )
-
-    selected_partition = policy.partition if partition is None else _validate_partition(partition)
-    if selected_partition not in policy.allowed_partitions:
-        raise ValueError(
-            f"partition {selected_partition!r} is not allowed; expected one of "
-            f"{policy.allowed_partitions!r}."
-        )
-
-    minimum_cpus = (
-        policy.base_cpus
-        + cpu_workers * policy.cpus_per_cpu_worker
-        + gpu_workers * policy.cpus_per_gpu_worker
-    )
-    minimum_memory_gib = (
-        policy.base_memory_gib
-        + cpu_workers * policy.memory_gib_per_cpu_worker
-        + gpu_workers * policy.memory_gib_per_gpu_worker
-    )
-
-    # These are optimistic whole-execution lower bounds (only one copy of the
-    # base overhead).  Rejecting them early preserves clear errors for requests
-    # that cannot fit under the global policy regardless of placement.
-    if minimum_cpus > policy.max_cpus:
-        raise ValueError(
-            f"Calculated cpus={minimum_cpus} exceeds policy limit {policy.max_cpus}."
-        )
-    if gpu_workers > policy.max_gpus:
-        raise ValueError(
-            f"Calculated gpus={gpu_workers} exceeds policy limit {policy.max_gpus}."
-        )
-    if minimum_memory_gib > policy.max_memory_gib:
-        raise ValueError(
-            f"Calculated memory_gib={minimum_memory_gib} exceeds policy limit "
-            f"{policy.max_memory_gib}."
-        )
-
-    maximum_useful_nodes = min(
-        policy.max_nodes,
-        cpu_workers + gpu_workers,
-    )
-    for nodes in range(1, maximum_useful_nodes + 1):
-        gpu_placement = _balanced_counts(gpu_workers, nodes)
-        if max(gpu_placement) > policy.gpus_per_node:
-            continue
-        cpu_placement = _place_cpu_workers(
-            policy,
-            cpu_workers=cpu_workers,
-            gpu_workers_by_node=gpu_placement,
-        )
-        if cpu_placement is None:
-            continue
-
-        node_cpus = tuple(
-            policy.base_cpus
-            + local_cpu_workers * policy.cpus_per_cpu_worker
-            + local_gpu_workers * policy.cpus_per_gpu_worker
-            for local_cpu_workers, local_gpu_workers in zip(
-                cpu_placement,
-                gpu_placement,
-            )
-        )
-        node_memory = tuple(
-            policy.base_memory_gib
-            + local_cpu_workers * policy.memory_gib_per_cpu_worker
-            + local_gpu_workers * policy.memory_gib_per_gpu_worker
-            for local_cpu_workers, local_gpu_workers in zip(
-                cpu_placement,
-                gpu_placement,
-            )
-        )
-        cpus = max(node_cpus)
-        gpus = max(gpu_placement)
-        memory_gib = max(node_memory)
-        if cpus > policy.cpus_per_node or memory_gib > policy.memory_gib_per_node:
-            continue
-
-        request = SlurmResourceRequest(
-            cpu_workers=cpu_workers,
-            gpu_workers=gpu_workers,
-            nodes=nodes,
-            cpus=cpus,
-            gpus=gpus,
-            memory_gib=memory_gib,
-            time_limit=policy.time_limit,
-            partition=selected_partition,
-            cpu_workers_by_node=cpu_placement,
-            gpu_workers_by_node=gpu_placement,
-        )
-        if (
-            request.total_cpus <= policy.max_cpus
-            and request.total_gpus <= policy.max_gpus
-            and request.total_memory_gib <= policy.max_memory_gib
-        ):
-            return request
-
-    raise ValueError(
-        "Graph Worker requirements cannot be placed in a homogeneous Slurm "
-        "allocation within the configured node and execution limits: "
-        f"cpu_workers={cpu_workers}, gpu_workers={gpu_workers}, "
-        f"max_nodes={policy.max_nodes}, cpus_per_node={policy.cpus_per_node}, "
-        f"gpus_per_node={policy.gpus_per_node}, "
-        f"memory_gib_per_node={policy.memory_gib_per_node}."
-    )
+        for actual, maximum, label in checks:
+            if actual > maximum:
+                raise ValueError(f"Planned {label}={actual} exceeds site limit {maximum}.")
 
 
 def _safe_argv_value(value: os.PathLike[str] | str, *, name: str) -> str:
@@ -624,6 +300,8 @@ def build_sbatch_argv(
         )
     if request.gpus:
         argv.append(f"--gres=gpu:{request.gpus}")
+    if request.node_names:
+        argv.append(f"--nodelist={','.join(request.node_names)}")
 
     argv.append(script)
     argv.extend(
@@ -798,7 +476,6 @@ __all__ = [
     "SlurmPolicy",
     "SlurmResourceRequest",
     "build_sbatch_argv",
-    "build_slurm_resource_request",
     "parse_sbatch_job_id",
     "parse_sbatch_submission",
     "parse_scontrol_job_record",

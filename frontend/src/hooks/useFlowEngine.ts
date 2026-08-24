@@ -52,6 +52,7 @@ import {
   markExecutionConnectionLost,
   markExecutionInterrupted,
 } from '../utils/executionRuntime';
+import { workerResourcePayload } from '../utils/workerResources';
 
 // === Reset helper ===
 const resetRuntimeNodeState = (
@@ -1063,6 +1064,7 @@ export const useFlowEngine = (
         graph,
         executionId,
         executionConfig,
+        ...workerResourcePayload(),
       }));
       addLog(
         executionConfig.mode === 'window' && executionConfig.resumeAction === 'resume'
@@ -1160,7 +1162,11 @@ export const useFlowEngine = (
       const preflight = await fetchJson<ExecutionPreflightResponse>('/execution/preflight', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ graph, executionConfig }),
+        body: JSON.stringify({
+          graph,
+          executionConfig,
+          ...workerResourcePayload(),
+        }),
         signal: controller.signal,
       });
 

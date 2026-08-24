@@ -8,10 +8,12 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
-from core.execution_resources import (
+from core.worker_profiles import (
+    CPU_GENERAL_PROFILE,
     dask_annotation_kwargs,
-    normalize_execution_resource,
-    resolve_execution_resource,
+    normalize_worker_profile,
+    resolve_worker_profile,
+    worker_logical_resources,
 )
 from core.invocation_builder import declared_type_and_meta, get_node_input_defs, validate_dask_array_input
 from core.node_invocation import NodeInvocation, NodeRuntime
@@ -450,7 +452,7 @@ class BaseNode:
                 execution_id=runtime_data.get("execution_id", raw_inputs.get("_execution_id")),
                 is_preflight=bool(runtime_data.get("is_preflight", False)),
                 is_resuming=bool(runtime_data.get("is_resuming", False)),
-                execution_resource=resolve_execution_resource(type(self)),
+                worker_profile=resolve_worker_profile(type(self)),
             )
         undeclared_inputs = {
             key: value
@@ -995,9 +997,9 @@ class BlockContextFactory:
         )
         return ctx
 
-    def resolve_device_hint(self, expected_resource: str) -> str:
-        expected = normalize_execution_resource(
-            expected_resource,
+    def resolve_device_hint(self, worker_profile: str) -> str:
+        expected = normalize_worker_profile(
+            worker_profile,
             owner="NodeRuntime",
         )
         try:
@@ -1006,30 +1008,32 @@ class BlockContextFactory:
             worker = get_worker()
         except Exception as exc:
             raise RuntimeError(
-                f"{expected.upper()} block execution requires a configured "
+                f"{expected!r} block execution requires a configured "
                 "Dask Worker context."
             ) from exc
 
+        resources = worker_logical_resources(worker)
+        if float(resources.get(expected, 0) or 0) < 1:
+            worker_identity = (
+                getattr(worker, "name", None)
+                or getattr(worker, "address", None)
+                or "<unknown>"
+            )
+            raise RuntimeError(
+                f"Task requires Worker Profile {expected!r}, but the selected "
+                f"Worker {worker_identity!r} advertises {resources!r}."
+            )
         worker_role = getattr(worker, "worker_role", None)
-        if expected == "cpu":
+        if float(resources.get("GPU", 0) or 0) <= 0:
             if worker_role != "cpu":
                 raise RuntimeError(
-                    "CPU task was scheduled on a non-CPU Worker."
+                    f"CPU-only Profile {expected!r} was scheduled on a non-CPU Worker."
                 )
             return "cpu"
-
-        if expected == "any" and worker_role == "cpu":
-            return "cpu"
-
         if worker_role != "gpu":
-            if expected == "gpu":
-                raise RuntimeError(
-                    "GPU task was scheduled on a non-GPU Worker; "
-                    "CPU fallback is not supported."
-                )
             raise RuntimeError(
-                "ANY task was scheduled on an unmanaged "
-                "Worker; expected worker_role='cpu' or 'gpu'."
+                f"GPU Profile {expected!r} was scheduled on a non-GPU Worker; "
+                "CPU fallback is not supported."
             )
         assigned_gpu = getattr(worker, "assigned_gpu", None)
         if assigned_gpu != "cuda:0":
@@ -1131,15 +1135,15 @@ class ProcessBlockBinder:
         def wrapped(*blocks, block_info=None):
             block_info = block_info or {}
             named_blocks = dict(zip(input_plan.ordered_names, blocks))
-            expected_resource = runtime.execution_resource
+            expected_profile = runtime.worker_profile
             device_hint = context_factory.resolve_device_hint(
-                expected_resource
+                expected_profile
             )
             worker_role = "gpu" if device_hint == "cuda:0" else "cpu"
             context_resources = dict(preprocess_state or {})
             context_resources.update(
                 {
-                    "execution_resource": expected_resource,
+                    "worker_profile": expected_profile,
                     "worker_role": worker_role,
                 }
             )
@@ -1265,15 +1269,15 @@ class BaseDaskArrayMapNode(BaseDaskNode):
 
     def execute(self, **kwargs) -> Tuple:
         invocation = self.get_invocation(kwargs)
-        declared_resource = resolve_execution_resource(type(self))
-        runtime_resource = normalize_execution_resource(
-            invocation.runtime.execution_resource,
+        declared_profile = resolve_worker_profile(type(self))
+        runtime_profile = normalize_worker_profile(
+            invocation.runtime.worker_profile,
             owner="NodeRuntime",
         )
-        if runtime_resource != declared_resource:
+        if runtime_profile != declared_profile:
             raise RuntimeError(
-                f"{type(self).__name__} runtime resource {runtime_resource!r} "
-                f"does not match declared resource {declared_resource!r}."
+                f"{type(self).__name__} runtime Worker Profile {runtime_profile!r} "
+                f"does not match declared profile {declared_profile!r}."
             )
         input_planner = self.INPUT_PLANNER()
         output_resolver = self.OUTPUT_SPEC_RESOLVER()
@@ -1359,7 +1363,7 @@ class BaseDaskArrayMapNode(BaseDaskNode):
             "execution_id": runtime.execution_id,
             "is_preflight": runtime.is_preflight,
             "is_resuming": runtime.is_resuming,
-            "execution_resource": runtime.execution_resource,
+            "worker_profile": runtime.worker_profile,
         }
         try:
             sig = inspect.signature(preprocess)
@@ -1511,7 +1515,7 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         # ``wrapped_fn``.
         with dask.annotate(
             brainflow_node_id="__map_overlap__",
-            execution_resource="any",
+            worker_profile=CPU_GENERAL_PROFILE,
             resources={},
         ):
             result = da.map_overlap(

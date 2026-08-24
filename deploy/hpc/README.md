@@ -12,9 +12,9 @@ WorkFlow 在 HPC 上分成“服务进程”和“按工作流申请的计算资
   ├─ workflow Driver：在一次执行期间运行
   └─ Dask Scheduler：有工作流时按需启动，执行结束立即关闭
        ↓ TCP/TLS（集群内网）
-Slurm allocation（由当前 Graph 的 resourcePlan 动态决定）
-  ├─ compute node 0：一个 Worker agent → CPU/GPU Nannies/Workers
-  ├─ compute node 1：一个 Worker agent → CPU/GPU Nannies/Workers
+Slurm Pool jobs（由 Resource Planner 的具体计划决定）
+  ├─ compute node 0：launcher → Dask Nannies/Workers
+  ├─ compute node 1：launcher → Dask Nannies/Workers
   └─ ...
 ```
 
@@ -24,15 +24,9 @@ Slurm allocation（由当前 Graph 的 resourcePlan 动态决定）
 
 ## Slurm 怎样申请一个或多个 CN
 
-后端只分析当前 terminal outputs 可达的 Graph 节点。节点类通过 `EXECUTION_RESOURCE` 和 `EXECUTION_WORKERS` 声明 CPU/GPU Worker 需求。资源策略把全图 Worker 总数装箱到最少的可行节点数：
+后端只分析当前 terminal outputs 可达的 Graph 节点。节点类声明 `required_worker_profile`，分析结果只包含 `requiredWorkerProfiles`，不再把节点数量解释成 Worker 数量，也不再从固定 CPU/GPU Worker 配置猜测 CPU、GPU 或内存。
 
-1. 先尝试一个 CN。
-2. 如果该节点的 GPU、CPU 或内存容量装不下，就依次尝试 2、3……个 CN。
-3. 节点数不能超过 `WorkFlow_SLURM_MAX_NODES`，每个节点不能超过配置的 per-node envelope。
-4. 找到布局后，提交一个包含 N 个节点的 Slurm allocation。
-5. `srun --ntasks-per-node=1` 在每个已分配 CN 上启动一个 Worker agent；agent 按持久化布局启动该节点应有的 CPU/GPU Workers。
-
-Slurm 19.05 的 `--gres=gpu:N` 是同构的每节点申请。若最后一个节点只需较少 GPU，allocation 可能保守地多申请少量 GPU，但 Worker agent 不会把多余设备暴露给任何任务。例如 10 个 GPU Workers、每节点最多 4 张卡会形成逻辑布局 `4 + 3 + 3`，Slurm 同构申请为 3 个节点、每节点 4 张卡。
+Worker Profile/Pool 由页面按当前 Graph 需求配置并保存在浏览器。只读 preflight 使用 `scontrol show node` 的真实 `Gres=gpu:x`、CPU 和内存生成计划。GPU Pool 的一个 scale 副本对应一个 Slurm Job 和一个 Dask Worker；CPU Pool 的一个 scale 副本对应一个 Slurm Job，并在其中启动 `processes` 个同 Profile Worker。
 
 Graph 不能注入任意 `sbatch` 参数。partition、时限和容量均由管理员环境变量控制。若在 `MAX_NODES` 内仍装不下，preflight/提交会明确失败；不会把 Worker 回退到服务节点。
 
@@ -119,19 +113,11 @@ export WorkFlow_DASK_NANNY_PORT_RANGE=21000:21999
 默认值为 `MAX_NODES=8`、`CPUS_PER_NODE=64`、`GPUS_PER_NODE=8`、`MEMORY_GIB_PER_NODE=512`、Scheduler 端口 `8786`、Worker 端口 `20000:20999`、Nanny 端口 `21000:21999`。`WorkFlow_DASK_SCHEDULER_HOST` 没有默认值，必须显式设置。
 每个端口范围的宽度至少要覆盖“单个 CN 上可能启动的最大 Worker 数”，不同 CN 可以复用同一范围。
 
-全局上限和每 Worker 换算仍可配置：
+保留的站点级上限：
 
 ```text
 WorkFlow_SLURM_ALLOWED_PARTITIONS
 WorkFlow_SLURM_TIME_LIMIT
-WorkFlow_SLURM_BASE_CPUS
-WorkFlow_SLURM_BASE_MEMORY_GIB
-WorkFlow_SLURM_CPUS_PER_CPU_WORKER
-WorkFlow_SLURM_CPUS_PER_GPU_WORKER
-WorkFlow_SLURM_CPU_WORKER_MEMORY_GIB
-WorkFlow_SLURM_GPU_WORKER_MEMORY_GIB
-WorkFlow_SLURM_MAX_CPU_WORKERS
-WorkFlow_SLURM_MAX_GPU_WORKERS
 WorkFlow_SLURM_MAX_CPUS
 WorkFlow_SLURM_MAX_GPUS
 WorkFlow_SLURM_MAX_MEMORY_GIB
@@ -190,11 +176,11 @@ WorkFlow_DASK_SCHEDULER_PORT=8786 \
 
 1. 服务节点序列化当前 editor Graph，并进行只读 preflight/resource planning。
 2. Driver 在服务进程内按需启动固定 host/port 的 Scheduler。
-3. 后端持久化 execution/request/layout，再按 Graph 计划提交 `workflow_workers.sbatch`。
-4. Slurm 选择满足同构请求的一个或多个 CN；`srun` 每节点启动一个 Worker agent。
-5. 所有预期 CPU/GPU Workers 注册且身份、资源、设备拓扑验证通过后，Driver 才提交图。
+3. Resource Planner 将 Profile/Pool 放置到真实 CN，并为每个 Pool 副本生成目标节点和 Slurm 资源请求。
+4. 后端为每个计划作业提交一次 `workflow_workers.sbatch`；脚本直接启动该作业的 Dask Nanny/Worker 进程。
+5. 所有预期 Profile Workers 注册且身份、逻辑能力和 GPU 隔离验证通过后，Driver 才提交图。
 6. terminal output Futures 成功后，Driver 更新 Window completion bitmap。
-7. 成功、失败或取消都先停止计算并 `scancel` Worker allocation，再关闭 Scheduler。
+7. 成功、失败或取消都先逐个 `scancel` 并确认全部 Pool jobs 终止，再关闭 Scheduler。
 
 Window resume/restart 仍由 Recovery 界面显式发起，并使用 recovery 目录中的不可变 Graph。服务进程重启时无法让已经消失的 Driver 继续计算；启动清理必须取消孤儿 Worker allocation，之后由用户显式 Resume。普通 New Run 不会静默变成 Resume。
 
