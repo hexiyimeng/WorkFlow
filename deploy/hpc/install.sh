@@ -16,6 +16,13 @@ MODEL_URLS=(
   "https://hf-mirror.com/mouseland/cellpose-sam/resolve/main/cpsam"
 )
 
+if [[ ! "$WORKFLOW_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+  || [[ "$WORKFLOW_BRANCH" == *..* ]] \
+  || [[ "$WORKFLOW_BRANCH" == */ ]]; then
+  echo "WORKFLOW_BRANCH is not a valid deployable Git branch: $WORKFLOW_BRANCH" >&2
+  exit 2
+fi
+
 mkdir -p \
   "$(dirname "$UV_BIN")" \
   "$(dirname "$WORKFLOW_ROOT")" \
@@ -47,8 +54,19 @@ else
     echo "Refusing to update a dirty deployment: $WORKFLOW_ROOT" >&2
     exit 1
   fi
-  git -C "$WORKFLOW_ROOT" fetch origin "$WORKFLOW_BRANCH"
-  git -C "$WORKFLOW_ROOT" checkout "$WORKFLOW_BRANCH"
+  # An explicit refspec is required here. `git fetch origin branch` updates
+  # only FETCH_HEAD when an existing single-branch checkout has never seen the
+  # requested branch, so the following checkout cannot discover it.
+  git -C "$WORKFLOW_ROOT" fetch origin \
+    "+refs/heads/$WORKFLOW_BRANCH:refs/remotes/origin/$WORKFLOW_BRANCH"
+  if git -C "$WORKFLOW_ROOT" show-ref \
+    --verify --quiet "refs/heads/$WORKFLOW_BRANCH"; then
+    git -C "$WORKFLOW_ROOT" checkout "$WORKFLOW_BRANCH"
+  else
+    git -C "$WORKFLOW_ROOT" checkout \
+      --branch "$WORKFLOW_BRANCH" \
+      --track "origin/$WORKFLOW_BRANCH"
+  fi
   git -C "$WORKFLOW_ROOT" merge --ff-only "origin/$WORKFLOW_BRANCH"
 fi
 
