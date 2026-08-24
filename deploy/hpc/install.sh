@@ -57,8 +57,16 @@ else
   # An explicit refspec is required here. `git fetch origin branch` updates
   # only FETCH_HEAD when an existing single-branch checkout has never seen the
   # requested branch, so the following checkout cannot discover it.
+  # Also extend the remote's configured branch set. Without this, Git has the
+  # remote-tracking ref on disk but `checkout --track` still rejects it as
+  # "not a branch" because a prior --single-branch clone tracks only master.
+  branch_refspec="+refs/heads/$WORKFLOW_BRANCH:refs/remotes/origin/$WORKFLOW_BRANCH"
+  if ! git -C "$WORKFLOW_ROOT" config --get-all remote.origin.fetch \
+    | grep -Fqx "$branch_refspec"; then
+    git -C "$WORKFLOW_ROOT" remote set-branches --add origin "$WORKFLOW_BRANCH"
+  fi
   git -C "$WORKFLOW_ROOT" fetch origin \
-    "+refs/heads/$WORKFLOW_BRANCH:refs/remotes/origin/$WORKFLOW_BRANCH"
+    "$branch_refspec"
   if git -C "$WORKFLOW_ROOT" show-ref \
     --verify --quiet "refs/heads/$WORKFLOW_BRANCH"; then
     git -C "$WORKFLOW_ROOT" checkout "$WORKFLOW_BRANCH"
