@@ -19,7 +19,9 @@ PYTHON="$WORKFLOW_ROOT/backend/.venv/bin/python"
 PROBE="$SCRIPT_DIR/scheduler_connectivity_probe.py"
 HOST="${WorkFlow_DASK_SCHEDULER_HOST:-}"
 PORT="${WorkFlow_DASK_SCHEDULER_PORT:-8786}"
-PARTITION="${WorkFlow_SLURM_PARTITION:-compute}"
+PARTITION="${WorkFlow_SLURM_PARTITION:-}"
+SINFO_COMMAND="${WorkFlow_SLURM_SINFO:-sinfo}"
+EXCLUDED_PARTITIONS=",${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-control},"
 PROBE_TIME="${WORKFLOW_CONNECTIVITY_PROBE_TIME:-00:10:00}"
 SERVER_TIMEOUT="${WORKFLOW_CONNECTIVITY_PROBE_TIMEOUT_SECONDS:-1800}"
 
@@ -34,6 +36,31 @@ fi
 if ! command -v srun >/dev/null 2>&1; then
   echo "srun is unavailable; run this probe on an approved Slurm submit host." >&2
   exit 1
+fi
+if [[ -z "$PARTITION" ]]; then
+  if ! command -v "$SINFO_COMMAND" >/dev/null 2>&1; then
+    echo "sinfo is unavailable; cannot discover a probe partition." >&2
+    exit 1
+  fi
+  default_partition=""
+  first_partition=""
+  while IFS= read -r raw_partition; do
+    raw_partition="${raw_partition//[[:space:]]/}"
+    [[ -n "$raw_partition" ]] || continue
+    candidate="${raw_partition%\*}"
+    case "$EXCLUDED_PARTITIONS" in
+      *",$candidate,"*) continue ;;
+    esac
+    [[ -n "$first_partition" ]] || first_partition="$candidate"
+    if [[ "$raw_partition" == *\* ]]; then
+      default_partition="$candidate"
+    fi
+  done < <("$SINFO_COMMAND" --noheader --format=%P)
+  PARTITION="${default_partition:-$first_partition}"
+  if [[ -z "$PARTITION" ]]; then
+    echo "sinfo reported no eligible partition for the connectivity probe." >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$WORKFLOW_RUNTIME_DIR/test-runs"
@@ -89,5 +116,6 @@ if [[ ! -f "$RUN_DIRECTORY/result.json" ]]; then
   exit 1
 fi
 echo "Compute-to-service Scheduler TCP connectivity passed."
+echo "partition=$PARTITION"
 echo "result=$RUN_DIRECTORY/result.json"
 "$PYTHON" -m json.tool "$RUN_DIRECTORY/result.json"

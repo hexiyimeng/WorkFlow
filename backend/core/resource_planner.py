@@ -18,6 +18,7 @@ class SlurmJobRequirement:
     allocation_id: str
     profile: str
     node: str
+    partition: str
     workers: int
     processes: int
     threads: int
@@ -31,6 +32,7 @@ class SlurmJobRequirement:
             "allocationId": self.allocation_id,
             "profile": self.profile,
             "node": self.node,
+            "partition": self.partition,
             "workers": self.workers,
             "processes": self.processes,
             "threads": self.threads,
@@ -39,6 +41,7 @@ class SlurmJobRequirement:
                 "cpus": self.cpu,
                 "memoryGiB": self.memory_gib,
                 "gpus": self.gpu,
+                "partition": self.partition,
                 "nodelist": [self.node],
             },
             "logicalResources": dict(self.logical_resources),
@@ -48,6 +51,7 @@ class SlurmJobRequirement:
 @dataclass(frozen=True, slots=True)
 class NodeAllocation:
     node: str
+    partition: str
     workers: Mapping[str, int]
     cpu: int
     memory_gib: int
@@ -57,6 +61,7 @@ class NodeAllocation:
     def to_dict(self) -> dict[str, object]:
         return {
             "node": self.node,
+            "partition": self.partition,
             "workers": dict(sorted(self.workers.items())),
             "cpu": self.cpu,
             "memoryGiB": self.memory_gib,
@@ -67,12 +72,18 @@ class NodeAllocation:
 
 @dataclass(frozen=True, slots=True)
 class SlurmAllocationPlan:
-    partition: str
+    partitions: tuple[str, ...]
     time_limit: str
     required_worker_profiles: Mapping[str, int]
     worker_counts: Mapping[str, int]
     jobs: tuple[SlurmJobRequirement, ...]
     nodes: tuple[NodeAllocation, ...]
+
+    @property
+    def partition(self) -> str:
+        """Compatibility summary; submissions use each job's partition."""
+
+        return ",".join(self.partitions)
 
     @property
     def total_workers(self) -> int:
@@ -93,6 +104,7 @@ class SlurmAllocationPlan:
     def to_dict(self) -> dict[str, object]:
         return {
             "partition": self.partition,
+            "partitions": list(self.partitions),
             "timeLimit": self.time_limit,
             "requiredWorkerProfiles": dict(self.required_worker_profiles),
             "workerCounts": dict(self.worker_counts),
@@ -108,6 +120,7 @@ class SlurmAllocationPlan:
 @dataclass(slots=True)
 class _NodeCapacity:
     node: ClusterNode
+    partition: str
     cpu_used: int = 0
     memory_gib_used: int = 0
     gpu_used: int = 0
@@ -147,8 +160,10 @@ def plan_workflow_resources(
     pools: Sequence[WorkerPool],
     inventory: ClusterInventory,
     *,
-    partition: str,
     time_limit: str,
+    partition: str | None = None,
+    partitions: Sequence[str] | None = None,
+    excluded_nodes: Sequence[str] = (),
 ) -> SlurmAllocationPlan:
     if not workflow.required_worker_profiles:
         raise ResourcePlanningError("The workflow has no Worker Profile requirements.")
@@ -167,13 +182,37 @@ def plan_workflow_resources(
             "Configure Worker Pool(s): " + ", ".join(missing_pools) + "."
         )
 
-    candidates = [
-        _NodeCapacity(node=node)
-        for node in sorted(inventory.for_partition(partition), key=lambda item: item.name)
-    ]
+    if partition is not None and partitions is not None:
+        raise ResourcePlanningError("Specify partition or partitions, not both.")
+    selected_partitions = (
+        tuple(partitions)
+        if partitions is not None
+        else ((partition,) if partition is not None else inventory.partition_names)
+    )
+    if not selected_partitions:
+        raise ResourcePlanningError("No Slurm partition is eligible for this workflow.")
+    if len(set(selected_partitions)) != len(selected_partitions):
+        raise ResourcePlanningError("Eligible Slurm partitions must be unique.")
+
+    candidates = []
+    for node in sorted(
+        inventory.for_partitions(
+            selected_partitions,
+            excluded_nodes=excluded_nodes,
+        ),
+        key=lambda item: item.name,
+    ):
+        selected_partition = next(
+            name for name in selected_partitions if name in node.partitions
+        )
+        candidates.append(
+            _NodeCapacity(node=node, partition=selected_partition)
+        )
     if not candidates:
         raise ResourcePlanningError(
-            f"No available Slurm node was reported for partition {partition!r}."
+            "No available Slurm node was reported for eligible partition(s): "
+            + ", ".join(selected_partitions)
+            + "."
         )
 
     units: list[tuple[WorkerProfile, WorkerPool, int, int, int, int]] = []
@@ -227,6 +266,7 @@ def plan_workflow_resources(
             allocation_id=allocation_id,
             profile=profile.name,
             node=selected.node.name,
+            partition=selected.partition,
             workers=pool.processes,
             processes=pool.processes,
             threads=profile.threads,
@@ -241,6 +281,7 @@ def plan_workflow_resources(
     node_allocations = tuple(
         NodeAllocation(
             node=node_name,
+            partition=planned[0].partition,
             workers={
                 profile_name: sum(job.workers for job in planned if job.profile == profile_name)
                 for profile_name in sorted({job.profile for job in planned})
@@ -252,8 +293,11 @@ def plan_workflow_resources(
         )
         for node_name, planned in sorted(node_jobs.items())
     )
+    used_partitions = {job.partition for job in jobs}
     return SlurmAllocationPlan(
-        partition=partition,
+        partitions=tuple(
+            name for name in selected_partitions if name in used_partitions
+        ),
         time_limit=time_limit,
         required_worker_profiles=workflow.required_worker_profiles,
         worker_counts=dict(sorted(worker_counts.items())),

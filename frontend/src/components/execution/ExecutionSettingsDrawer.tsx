@@ -1000,9 +1000,15 @@ export default function ExecutionSettingsDrawer() {
                   <dd className="text-right font-mono">{allocationPlan.totalWorkers}</dd>
                   <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Jobs</dt>
                   <dd className="text-right font-mono">{allocationPlan.jobs.length}</dd>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Partitions</dt>
+                  <dd className="text-right font-mono">
+                    {allocationPlan.partitions.join(', ')}
+                  </dd>
                   <dt style={{ color: 'var(--color-text-muted)' }}>Target Nodes</dt>
                   <dd className="text-right font-mono">
-                    {allocationPlan.nodes.map(node => node.node).join(', ')}
+                    {allocationPlan.nodes
+                      .map(node => `${node.node} (${node.partition})`)
+                      .join(', ')}
                   </dd>
                   <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Resources</dt>
                   <dd className="text-right font-mono">

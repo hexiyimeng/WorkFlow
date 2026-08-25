@@ -49,6 +49,7 @@ export interface WorkerPool {
 
 export interface SlurmAllocationPlan {
   partition: string;
+  partitions: string[];
   timeLimit: string;
   requiredWorkerProfiles: Record<string, number>;
   workerCounts: Record<string, number>;
@@ -60,6 +61,7 @@ export interface SlurmAllocationPlan {
     allocationId: string;
     profile: string;
     node: string;
+    partition: string;
     workers: number;
     processes: number;
     threads: number;
@@ -68,12 +70,14 @@ export interface SlurmAllocationPlan {
       cpus: number;
       memoryGiB: number;
       gpus: number;
+      partition: string;
       nodelist: string[];
     };
     logicalResources: Record<string, number>;
   }>;
   nodes: Array<{
     node: string;
+    partition: string;
     workers: Record<string, number>;
     cpu: number;
     memoryGiB: number;

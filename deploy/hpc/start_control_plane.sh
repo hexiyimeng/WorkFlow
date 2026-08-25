@@ -168,11 +168,13 @@ case "$EXECUTION_SCRIPT" in
 esac
 SBATCH_COMMAND="${WorkFlow_SLURM_SBATCH:-sbatch}"
 SQUEUE_COMMAND="${WorkFlow_SLURM_SQUEUE:-squeue}"
+SINFO_COMMAND="${WorkFlow_SLURM_SINFO:-sinfo}"
 SCONTROL_COMMAND="${WorkFlow_SLURM_SCONTROL:-scontrol}"
 SCANCEL_COMMAND="${WorkFlow_SLURM_SCANCEL:-scancel}"
 for command_name in \
   "$SBATCH_COMMAND" \
   "$SQUEUE_COMMAND" \
+  "$SINFO_COMMAND" \
   "$SCONTROL_COMMAND" \
   "$SCANCEL_COMMAND"; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -183,6 +185,7 @@ for command_name in \
 done
 SBATCH_COMMAND="$(command -v "$SBATCH_COMMAND")"
 SQUEUE_COMMAND="$(command -v "$SQUEUE_COMMAND")"
+SINFO_COMMAND="$(command -v "$SINFO_COMMAND")"
 SCONTROL_COMMAND="$(command -v "$SCONTROL_COMMAND")"
 SCANCEL_COMMAND="$(command -v "$SCANCEL_COMMAND")"
 if [[ -v WorkFlow_SLURM_SACCT && -z "$WorkFlow_SLURM_SACCT" ]]; then
@@ -218,6 +221,7 @@ export WorkFlow_SLURM_EXECUTION_SCRIPT="$EXECUTION_SCRIPT"
 export WorkFlow_SLURM_RUNTIME_DIR="$WORKFLOW_RUNTIME_DIR"
 export WorkFlow_SLURM_SBATCH="$SBATCH_COMMAND"
 export WorkFlow_SLURM_SQUEUE="$SQUEUE_COMMAND"
+export WorkFlow_SLURM_SINFO="$SINFO_COMMAND"
 export WorkFlow_SLURM_SACCT="$SACCT_COMMAND"
 export WorkFlow_SLURM_SCONTROL="$SCONTROL_COMMAND"
 export WorkFlow_SLURM_SCANCEL="$SCANCEL_COMMAND"
@@ -247,12 +251,13 @@ printf '%s\n' \
   "execution_script=$EXECUTION_SCRIPT" \
   "driver=service-node-process" \
   "scheduler=on-demand:$SCHEDULER_HOST:$SCHEDULER_PORT" \
-  "workers=slurm-compute-nodes" \
+  "workers=slurm-nodes-discovered-by-sinfo-and-scontrol" \
   "worker_ports=$WORKER_PORT_RANGE" \
   "nanny_ports=$NANNY_PORT_RANGE" \
   "slurm_node_envelope=max_nodes:$SLURM_MAX_NODES,cpus:$SLURM_CPUS_PER_NODE,gpus:$SLURM_GPUS_PER_NODE,memory_gib:$SLURM_MEMORY_GIB_PER_NODE" \
   "dask_tls_files=$([[ -n "$TLS_CA" ]] && printf configured || printf absent-explicitly-allowed)" \
-  "slurm_commands=sbatch:$SBATCH_COMMAND,squeue:$SQUEUE_COMMAND,sacct:${SACCT_COMMAND:-unavailable},scontrol:$SCONTROL_COMMAND,scancel:$SCANCEL_COMMAND"
+  "slurm_partitions=${WorkFlow_SLURM_PARTITION:-${WorkFlow_SLURM_ALLOWED_PARTITIONS:-auto}},excluded:${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-control}" \
+  "slurm_commands=sbatch:$SBATCH_COMMAND,squeue:$SQUEUE_COMMAND,sacct:${SACCT_COMMAND:-unavailable},sinfo:$SINFO_COMMAND,scontrol:$SCONTROL_COMMAND,scancel:$SCANCEL_COMMAND"
 
 cd "$WORKFLOW_ROOT/backend"
 exec "$PYTHON" -m uvicorn main:app \

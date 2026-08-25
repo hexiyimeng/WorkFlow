@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
 import distributed
 
-from core.cluster_inventory import parse_scontrol_show_node
+from core.cluster_inventory import (
+    ClusterInventory,
+    ClusterInventoryService,
+    parse_scontrol_show_node,
+    parse_sinfo_partitions,
+)
 from core.resource_planner import plan_workflow_resources
 from core.worker_pool import WorkerPool
 from core.worker_profiles import (
@@ -23,6 +29,7 @@ from services.executor import _resolve_max_in_flight_windows
 from services.slurm_execution_service import (
     _worker_job_launcher_plan,
     _worker_job_request,
+    slurm_policy_from_environment,
 )
 from core.workflow_resources import (
     build_workflow_resource_plan,
@@ -81,6 +88,86 @@ def test_inventory_parses_gpu_from_gres_not_partition() -> None:
     )
     assert inventory.nodes[0].gpu == 6
     assert inventory.nodes[1].gpu == 0
+
+
+def test_sinfo_discovers_all_partitions_and_default_without_selecting_it() -> None:
+    partitions, default_partition = parse_sinfo_partitions(
+        "gpu\ncompute*\ncontrol\ntao\n"
+    )
+    assert partitions == ("gpu", "compute", "control", "tao")
+    assert default_partition == "compute"
+
+
+def test_inventory_service_queries_sinfo_before_node_resources() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv, **_kwargs):
+        calls.append(tuple(argv))
+        if argv[0] == "sinfo-test":
+            return subprocess.CompletedProcess(argv, 0, "gpu\ncompute*\ntao\n", "")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "NodeName=c001 CPUTot=96 RealMemory=1028000 "
+            "Gres=gpu:4 State=IDLE Partitions=compute\n",
+            "",
+        )
+
+    inventory = ClusterInventoryService(
+        sinfo_executable="sinfo-test",
+        scontrol_executable="scontrol-test",
+        command_runner=runner,
+    ).load()
+
+    assert [call[0] for call in calls] == ["sinfo-test", "scontrol-test"]
+    assert inventory.partition_names == ("gpu", "compute", "tao")
+    assert inventory.default_partition == "compute"
+
+
+def test_planner_uses_multiple_discovered_partitions_but_excludes_control() -> None:
+    workflow = build_workflow_resource_plan(
+        {"gpu": {"type": "Gpu", "inputs": {}}},
+        ["gpu"],
+        node_mappings={"Gpu": GpuNode},
+    )
+    profile = WorkerProfile(
+        name="gpu-cellpose",
+        physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
+        logical_resources={"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+        threads=1,
+    )
+    inventory_nodes = parse_scontrol_show_node(
+        "NodeName=aio CPUTot=80 RealMemory=1031000 Gres=gpu:4 State=IDLE Partitions=gpu\n"
+        "NodeName=c001 CPUTot=96 RealMemory=1028000 Gres=gpu:4 State=IDLE Partitions=compute\n"
+        "NodeName=mn02 CPUTot=80 RealMemory=1031000 Gres=gpu:8 State=IDLE Partitions=control\n"
+        "NodeName=t001 CPUTot=40 RealMemory=500000 Gres=gpu:2 State=IDLE Partitions=tao\n"
+        "NodeName=t002 CPUTot=40 RealMemory=500000 Gres=gpu:2 State=DOWN Partitions=tao\n"
+    )
+    inventory = ClusterInventory(
+        nodes=inventory_nodes.nodes,
+        partitions=("gpu", "compute", "control", "tao"),
+        default_partition="compute",
+    )
+    policy = slurm_policy_from_environment({})
+    partitions = policy.resolve_partitions(inventory.partition_names)
+    assert partitions == ("gpu", "compute", "tao")
+
+    allocation = plan_workflow_resources(
+        workflow,
+        [profile],
+        [WorkerPool(profile="gpu-cellpose", processes=1, scale=10)],
+        inventory,
+        partitions=partitions,
+        time_limit="01:00:00",
+    )
+
+    assert set(allocation.partitions) == {"gpu", "compute", "tao"}
+    assert {node.node for node in allocation.nodes} == {"aio", "c001", "t001"}
+    assert all(job.partition != "control" for job in allocation.jobs)
+    assert all(
+        _worker_job_request(allocation, job).partition == job.partition
+        for job in allocation.jobs
+    )
 
 
 def test_planner_places_eight_gpu_jobs_on_two_real_nodes() -> None:

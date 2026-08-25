@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 import subprocess
 from typing import Callable, Mapping, Sequence
@@ -89,6 +89,19 @@ class ClusterNode:
 @dataclass(frozen=True, slots=True)
 class ClusterInventory:
     nodes: tuple[ClusterNode, ...]
+    partitions: tuple[str, ...] = ()
+    default_partition: str | None = None
+
+    @property
+    def partition_names(self) -> tuple[str, ...]:
+        if self.partitions:
+            return self.partitions
+        discovered: list[str] = []
+        for node in self.nodes:
+            for partition in node.partitions:
+                if partition not in discovered:
+                    discovered.append(partition)
+        return tuple(discovered)
 
     def for_partition(self, partition: str) -> tuple[ClusterNode, ...]:
         return tuple(
@@ -96,8 +109,53 @@ class ClusterInventory:
             if node.belongs_to(partition) and node.is_available
         )
 
+    def for_partitions(
+        self,
+        partitions: Sequence[str],
+        *,
+        excluded_nodes: Sequence[str] = (),
+    ) -> tuple[ClusterNode, ...]:
+        selected = frozenset(partitions)
+        excluded = frozenset(excluded_nodes)
+        return tuple(
+            node for node in self.nodes
+            if node.name not in excluded
+            and node.is_available
+            and selected.intersection(node.partitions)
+        )
+
     def to_dict(self) -> dict[str, object]:
-        return {"nodes": [node.to_dict() for node in self.nodes]}
+        return {
+            "partitions": list(self.partition_names),
+            "defaultPartition": self.default_partition,
+            "nodes": [node.to_dict() for node in self.nodes],
+        }
+
+
+def parse_sinfo_partitions(output: str) -> tuple[tuple[str, ...], str | None]:
+    """Parse ``sinfo --noheader --format=%P`` without assuming one partition."""
+
+    if not isinstance(output, str):
+        raise TypeError("sinfo output must be text.")
+    partitions: list[str] = []
+    default_partition: str | None = None
+    for raw_line in output.replace("\r\n", "\n").splitlines():
+        value = raw_line.strip()
+        if not value:
+            continue
+        is_default = value.endswith("*")
+        name = value[:-1] if is_default else value
+        if not name:
+            continue
+        if name not in partitions:
+            partitions.append(name)
+        if is_default:
+            if default_partition is not None and default_partition != name:
+                raise ValueError("sinfo reported more than one default partition.")
+            default_partition = name
+    if not partitions:
+        raise ValueError("sinfo returned no Slurm partitions.")
+    return tuple(partitions), default_partition
 
 
 def _records(output: str) -> tuple[str, ...]:
@@ -157,13 +215,33 @@ class ClusterInventoryService:
     def __init__(
         self,
         *,
+        sinfo_executable: str = "sinfo",
         scontrol_executable: str = "scontrol",
         command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
+        self.sinfo_executable = sinfo_executable
         self.scontrol_executable = scontrol_executable
         self.command_runner = command_runner
 
     def load(self) -> ClusterInventory:
+        partition_result = self.command_runner(
+            (self.sinfo_executable, "--noheader", "--format=%P"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+        if partition_result.returncode != 0:
+            detail = (
+                partition_result.stderr
+                or partition_result.stdout
+                or "unknown error"
+            ).strip()
+            raise RuntimeError(f"sinfo partition discovery failed: {detail}")
+        partitions, default_partition = parse_sinfo_partitions(
+            partition_result.stdout
+        )
         completed = self.command_runner(
             (self.scontrol_executable, "show", "node", "--oneliner"),
             check=False,
@@ -175,7 +253,12 @@ class ClusterInventoryService:
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "unknown error").strip()
             raise RuntimeError(f"scontrol show node failed: {detail}")
-        return parse_scontrol_show_node(completed.stdout)
+        inventory = parse_scontrol_show_node(completed.stdout)
+        return replace(
+            inventory,
+            partitions=partitions,
+            default_partition=default_partition,
+        )
 
 
 __all__ = [
@@ -183,5 +266,6 @@ __all__ = [
     "ClusterInventoryService",
     "ClusterNode",
     "parse_gpu_gres",
+    "parse_sinfo_partitions",
     "parse_scontrol_show_node",
 ]

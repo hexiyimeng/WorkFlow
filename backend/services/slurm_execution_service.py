@@ -348,9 +348,19 @@ def slurm_policy_from_environment(
     """Parse Graph-to-allocation limits without touching the filesystem."""
 
     env = os.environ if environment is None else environment
-    partition = str(env.get("WorkFlow_SLURM_PARTITION", "compute")).strip()
-    allowed_raw = str(env.get("WorkFlow_SLURM_ALLOWED_PARTITIONS", partition))
+    # Empty means discover every eligible partition from sinfo.  The singular
+    # setting remains a backwards-compatible operator override.
+    partition = str(env.get("WorkFlow_SLURM_PARTITION", "")).strip()
+    allowed_raw = str(env.get("WorkFlow_SLURM_ALLOWED_PARTITIONS", ""))
     allowed = tuple(item.strip() for item in allowed_raw.split(",") if item.strip())
+    excluded_raw = str(env.get("WorkFlow_SLURM_EXCLUDED_PARTITIONS", "control"))
+    excluded = tuple(
+        item.strip() for item in excluded_raw.split(",") if item.strip()
+    )
+    excluded_nodes_raw = str(env.get("WorkFlow_SLURM_EXCLUDED_NODES", ""))
+    excluded_nodes = tuple(
+        item.strip() for item in excluded_nodes_raw.split(",") if item.strip()
+    )
     return SlurmPolicy(
         partition=partition,
         time_limit=str(env.get("WorkFlow_SLURM_TIME_LIMIT", "1-00:00:00")).strip(),
@@ -370,6 +380,8 @@ def slurm_policy_from_environment(
             env, "WorkFlow_SLURM_MEMORY_GIB_PER_NODE", 512
         ),
         allowed_partitions=allowed,
+        excluded_partitions=excluded,
+        excluded_nodes=excluded_nodes,
     )
 
 
@@ -383,6 +395,7 @@ class SlurmRuntimeConfig:
     sbatch_executable: str
     squeue_executable: str
     sacct_executable: str | None
+    sinfo_executable: str
     scontrol_executable: str
     scancel_executable: str
     poll_interval_seconds: float
@@ -464,6 +477,12 @@ class SlurmRuntimeConfig:
                     default="sacct",
                     search_path=env.get("PATH"),
                 )
+            ),
+            sinfo_executable=_resolved_executable(
+                env.get("WorkFlow_SLURM_SINFO"),
+                name="WorkFlow_SLURM_SINFO",
+                default="sinfo",
+                search_path=env.get("PATH"),
             ),
             scontrol_executable=_resolved_executable(
                 env.get("WorkFlow_SLURM_SCONTROL"),
@@ -690,15 +709,18 @@ def _plan_slurm_allocation(
             "Worker Profiles and Worker Pools are required for Slurm execution."
         )
     inventory = ClusterInventoryService(
+        sinfo_executable=config.sinfo_executable,
         scontrol_executable=config.scontrol_executable
     ).load()
+    partitions = config.policy.resolve_partitions(inventory.partition_names)
     return plan_workflow_resources(
         workflow_plan,
         parse_worker_profiles(worker_profiles),
         parse_worker_pools(worker_pools),
         inventory,
-        partition=config.policy.partition,
         time_limit=config.policy.time_limit,
+        partitions=partitions,
+        excluded_nodes=config.policy.excluded_nodes,
     )
 
 
@@ -713,7 +735,7 @@ def _allocation_holder_request(plan: SlurmAllocationPlan) -> SlurmResourceReques
         gpus=max(node.gpu for node in plan.nodes),
         memory_gib=max(node.memory_gib for node in plan.nodes),
         time_limit=plan.time_limit,
-        partition=plan.partition,
+        partition=plan.jobs[0].partition,
         node_names=tuple(node.node for node in plan.nodes),
     )
 
@@ -722,8 +744,12 @@ def validate_allocation_plan_policy(
     plan: SlurmAllocationPlan,
     policy: SlurmPolicy,
 ) -> None:
-    if plan.partition not in policy.allowed_partitions:
-        raise ValueError(f"Planned partition {plan.partition!r} is not allowed.")
+    for partition in plan.partitions:
+        if partition in policy.excluded_partitions or (
+            policy.allowed_partitions
+            and partition not in policy.allowed_partitions
+        ):
+            raise ValueError(f"Planned partition {partition!r} is not allowed.")
     checks = (
         (len(plan.nodes), policy.max_nodes, "nodes"),
         (plan.total_cpu, policy.max_cpus, "total cpus"),
@@ -757,7 +783,7 @@ def _worker_job_request(
         gpus=job.gpu,
         memory_gib=job.memory_gib,
         time_limit=plan.time_limit,
-        partition=plan.partition,
+        partition=job.partition,
         node_names=(job.node,),
     )
 
@@ -769,7 +795,8 @@ def _worker_job_launcher_plan(
     """Return the exact one-job slice consumed by one compute-node launcher."""
 
     return {
-        "partition": plan.partition,
+        "partition": job.partition,
+        "partitions": [job.partition],
         "timeLimit": plan.time_limit,
         "requiredWorkerProfiles": dict(plan.required_worker_profiles),
         "workerCounts": {job.profile: job.workers},
@@ -780,6 +807,7 @@ def _worker_job_launcher_plan(
         "jobs": [job.to_dict()],
         "nodes": [{
             "node": job.node,
+            "partition": job.partition,
             "workers": {job.profile: job.workers},
             "cpu": job.cpu,
             "memoryGiB": job.memory_gib,

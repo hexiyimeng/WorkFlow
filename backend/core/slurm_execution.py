@@ -171,9 +171,13 @@ class SlurmPolicy:
     gpus_per_node: int
     memory_gib_per_node: int
     allowed_partitions: tuple[str, ...] = ()
+    excluded_partitions: tuple[str, ...] = ()
+    excluded_nodes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        partition = _validate_partition(self.partition)
+        partition = self.partition
+        if partition:
+            _validate_partition(partition)
         _slurm_time_seconds(self.time_limit)
 
         for field_name in (
@@ -193,24 +197,71 @@ class SlurmPolicy:
         raw_allowed = self.allowed_partitions
         if not isinstance(raw_allowed, tuple):
             raise ValueError("allowed_partitions must be a tuple of partition names.")
-        allowed = raw_allowed or (partition,)
+        allowed = raw_allowed or ((partition,) if partition else ())
         if len(set(allowed)) != len(allowed):
             raise ValueError("allowed_partitions must not contain duplicates.")
         for index, candidate in enumerate(allowed):
             _validate_partition(candidate, name=f"allowed_partitions[{index}]")
-        if partition not in allowed:
+        if partition and partition not in allowed:
             raise ValueError(
                 f"partition {partition!r} is not present in allowed_partitions."
             )
         object.__setattr__(self, "allowed_partitions", allowed)
 
+        for field_name in ("excluded_partitions", "excluded_nodes"):
+            value = getattr(self, field_name)
+            if not isinstance(value, tuple):
+                raise ValueError(f"{field_name} must be a tuple.")
+            if len(set(value)) != len(value):
+                raise ValueError(f"{field_name} must not contain duplicates.")
+            if any(not item or item != item.strip() for item in value):
+                raise ValueError(f"{field_name} contains an empty or invalid name.")
+        for index, candidate in enumerate(self.excluded_partitions):
+            _validate_partition(candidate, name=f"excluded_partitions[{index}]")
+        overlap = set(allowed).intersection(self.excluded_partitions)
+        if overlap:
+            raise ValueError(
+                "Allowed and excluded Slurm partitions overlap: "
+                + ", ".join(sorted(overlap))
+                + "."
+            )
+
+    def resolve_partitions(self, discovered: Iterable[str]) -> tuple[str, ...]:
+        """Apply operator overrides to partitions discovered from ``sinfo``."""
+
+        discovered_names = tuple(dict.fromkeys(discovered))
+        for index, candidate in enumerate(discovered_names):
+            _validate_partition(candidate, name=f"discovered[{index}]")
+        requested = (
+            (self.partition,)
+            if self.partition
+            else (self.allowed_partitions or discovered_names)
+        )
+        missing = [name for name in requested if name not in discovered_names]
+        if missing:
+            raise ValueError(
+                "Configured Slurm partition(s) were not reported by sinfo: "
+                + ", ".join(missing)
+                + "."
+            )
+        eligible = tuple(
+            name for name in requested if name not in self.excluded_partitions
+        )
+        if not eligible:
+            raise ValueError(
+                "No Slurm partitions remain after applying the site exclusions."
+            )
+        return eligible
+
     def validate_request(self, request: SlurmResourceRequest) -> None:
         """Validate a concrete request emitted by the Resource Planner."""
 
-        if request.partition not in self.allowed_partitions:
+        if request.partition in self.excluded_partitions or (
+            self.allowed_partitions
+            and request.partition not in self.allowed_partitions
+        ):
             raise ValueError(
-                f"partition {request.partition!r} is not allowed; expected one of "
-                f"{self.allowed_partitions!r}."
+                f"partition {request.partition!r} is not allowed by site policy."
             )
         checks = (
             (request.nodes, self.max_nodes, "nodes"),

@@ -109,15 +109,18 @@ async def preflight_graph(
             return result
         policy = slurm_policy_from_environment()
         inventory = ClusterInventoryService(
+            sinfo_executable=os.getenv("WorkFlow_SLURM_SINFO", "sinfo"),
             scontrol_executable=os.getenv("WorkFlow_SLURM_SCONTROL", "scontrol")
         ).load()
+        partitions = policy.resolve_partitions(inventory.partition_names)
         allocation = plan_workflow_resources(
             workflow_plan,
             profiles,
             pools,
             inventory,
-            partition=policy.partition,
             time_limit=policy.time_limit,
+            partitions=partitions,
+            excluded_nodes=policy.excluded_nodes,
         )
         validate_allocation_plan_policy(allocation, policy)
     except (ValueError, RuntimeError) as exc:
