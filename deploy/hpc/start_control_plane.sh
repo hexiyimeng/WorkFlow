@@ -155,8 +155,9 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "Run deploy/hpc/install.sh first." >&2
   exit 1
 fi
-if [[ ! -f "$EXECUTION_SCRIPT" ]]; then
-  echo "Missing Slurm execution script: $EXECUTION_SCRIPT" >&2
+if [[ ! -f "$EXECUTION_SCRIPT" || -L "$EXECUTION_SCRIPT" || ! -x "$EXECUTION_SCRIPT" ]]; then
+  echo "Slurm execution script must be a regular executable non-symlink file: $EXECUTION_SCRIPT" >&2
+  echo "Re-run deploy/hpc/install.sh from a revision that preserves its executable bit." >&2
   exit 1
 fi
 case "$EXECUTION_SCRIPT" in
