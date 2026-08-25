@@ -290,6 +290,10 @@ def test_active_slurm_execution_submits_workers_through_slurmcluster() -> None:
     assert "start_slurm_jobqueue_scheduler" in source
     assert "submit_slurm_jobqueue_workers" in source
     assert "build_sbatch_argv" not in source
+    profile_activation = inspect.signature(
+        DaskService.activate_external_worker_profiles
+    ).parameters
+    assert "submission_tokens" in profile_activation
 
 
 def test_planned_slurmcluster_owns_submit_and_scale_down_lifecycle(

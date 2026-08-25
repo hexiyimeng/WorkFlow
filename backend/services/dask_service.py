@@ -1857,6 +1857,7 @@ class DaskService:
         timeout: float,
         execution_id: str | None = None,
         submission_token: str | None = None,
+        submission_tokens: Sequence[str] | None = None,
     ) -> ClusterResourceSummary:
         """Wait for an exact set of logical Worker Profile capabilities."""
 
