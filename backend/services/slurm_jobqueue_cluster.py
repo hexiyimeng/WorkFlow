@@ -34,6 +34,28 @@ def _absolute_file(value: Path | str, *, name: str) -> Path:
     return path
 
 
+def _absolute_executable(value: Path | str, *, name: str) -> Path:
+    """Return the canonical executable behind an absolute path.
+
+    POSIX virtual environments normally expose ``bin/python`` as a symbolic
+    link.  Rejecting that standard layout makes a valid uv-created environment
+    unusable on Slurm hosts.  Resolve the link strictly, then validate the
+    canonical target instead of weakening validation for launcher/request
+    files, which must remain non-symlinks.
+    """
+
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{name} must be an absolute executable file.")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{name} must resolve to an existing executable file.") from exc
+    if not resolved.is_file():
+        raise ValueError(f"{name} must resolve to a regular executable file.")
+    return resolved
+
+
 def _absolute_directory(value: Path | str, *, name: str) -> Path:
     path = Path(value)
     if not path.is_absolute() or not path.is_dir() or path.is_symlink():
@@ -192,7 +214,7 @@ def build_planned_slurm_worker_spec(
     request = _absolute_file(request_path, name="request_path")
     root = _absolute_directory(project_root, name="project_root")
     logs = _absolute_directory(run_directory, name="run_directory")
-    python = _absolute_file(python_executable, name="python_executable")
+    python = _absolute_executable(python_executable, name="python_executable")
     allocation_tag = hashlib.sha256(
         job.allocation_id.encode("utf-8")
     ).hexdigest()[:10]
