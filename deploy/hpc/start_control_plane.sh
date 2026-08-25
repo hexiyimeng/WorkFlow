@@ -251,6 +251,7 @@ printf '%s\n' \
   "execution_script=$EXECUTION_SCRIPT" \
   "driver=service-node-process" \
   "scheduler=on-demand:$SCHEDULER_HOST:$SCHEDULER_PORT" \
+  "cluster_manager=dask_jobqueue.SLURMCluster" \
   "workers=slurm-nodes-discovered-by-sinfo-and-scontrol" \
   "worker_ports=$WORKER_PORT_RANGE" \
   "nanny_ports=$NANNY_PORT_RANGE" \

@@ -1640,6 +1640,134 @@ class DaskService:
             )
             return client
 
+    def start_slurm_jobqueue_scheduler(
+        self,
+        *,
+        host: str,
+        port: int,
+        template_job: Any,
+        time_limit: str,
+        shared_temp_directory: str,
+        python_executable: str,
+    ) -> Client:
+        """Start one service-node Scheduler owned by ``SLURMCluster``.
+
+        Worker specs are added separately after their immutable launcher
+        requests contain this Scheduler's address.
+        """
+
+        from services.slurm_jobqueue_cluster import PlannedSLURMCluster
+
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError("SLURMCluster Scheduler host must be non-empty.")
+        if type(port) is not int or port < 0 or port > 65535:
+            raise ValueError("SLURMCluster Scheduler port must be 0..65535.")
+        with self._cluster_lock:
+            if self.client is not None or self.cluster is not None:
+                raise RuntimeError(
+                    "A Dask runtime is already active; it must be stopped before "
+                    "starting SLURMCluster."
+                )
+            security, _security_paths = _external_cluster_security_from_environment()
+            cluster: PlannedSLURMCluster | None = None
+            client: WorkflowClient | None = None
+            try:
+                cluster = PlannedSLURMCluster(
+                    n_workers=0,
+                    queue=template_job.partition,
+                    cores=template_job.cpu,
+                    memory=f"{template_job.memory_gib}GiB",
+                    processes=template_job.processes,
+                    nanny=False,
+                    walltime=time_limit,
+                    job_cpu=template_job.cpu,
+                    job_mem=f"{template_job.memory_gib}G",
+                    worker_extra_args=[],
+                    python=python_executable,
+                    shared_temp_directory=shared_temp_directory,
+                    scheduler_options={
+                        "host": host.strip(),
+                        "port": port,
+                        "dashboard": False,
+                        "dashboard_address": None,
+                    },
+                    security=security,
+                    asynchronous=False,
+                    name="WorkFlow-Planned-SLURMCluster",
+                )
+                client = WorkflowClient(
+                    cluster.scheduler_address,
+                    security=cluster.security,
+                    timeout=min(60.0, _cluster_start_timeout()),
+                    set_as_default=True,
+                )
+            except BaseException:
+                if client is not None:
+                    try:
+                        client.close(timeout=5.0)
+                    except Exception:
+                        logger.exception(
+                            "[Dask] Failed to close SLURMCluster Driver Client."
+                        )
+                if cluster is not None:
+                    try:
+                        cluster.close(timeout=10.0)
+                    except Exception:
+                        logger.exception("[Dask] Failed to close SLURMCluster.")
+                raise
+
+            self.cluster = cluster
+            self.client = client
+            self.active_cpu_workers = 0
+            self.active_gpu_workers = 0
+            self.active_gpu_ids = ()
+            self._external_workers = True
+            self._cluster_poisoned = False
+            logger.info(
+                "[Dask] Planner-aware SLURMCluster Scheduler ready: %s",
+                cluster.scheduler_address,
+            )
+            return client
+
+    def submit_slurm_jobqueue_workers(
+        self,
+        specs: Sequence[Any],
+    ) -> tuple[Any, ...]:
+        """Submit heterogeneous Worker specs through the active SLURMCluster."""
+
+        with self._cluster_lock:
+            cluster = self.cluster
+            if not self._external_workers or cluster is None:
+                raise RuntimeError("No active planner-aware SLURMCluster exists.")
+        submit = getattr(cluster, "submit_planned_jobs", None)
+        if not callable(submit):
+            raise RuntimeError("The active Dask cluster is not a PlannedSLURMCluster.")
+        return tuple(submit(specs))
+
+    def stop_slurm_jobqueue_workers(self) -> None:
+        """Ask SLURMCluster to cancel Worker jobs but keep Scheduler alive."""
+
+        with self._cluster_lock:
+            cluster = self.cluster
+            if not self._external_workers or cluster is None:
+                return
+        stop = getattr(cluster, "stop_planned_jobs", None)
+        if not callable(stop):
+            raise RuntimeError("The active Dask cluster is not a PlannedSLURMCluster.")
+        stop()
+
+    def submitted_slurm_jobqueue_jobs(self) -> tuple[Any, ...]:
+        """Return durable identities already accepted by Slurm."""
+
+        with self._cluster_lock:
+            cluster = self.cluster
+            if not self._external_workers or cluster is None:
+                return ()
+        records = getattr(cluster, "submitted_job_records", None)
+        if not callable(records):
+            return ()
+        return tuple(records())
+
     def activate_external_workers(
         self,
         *,

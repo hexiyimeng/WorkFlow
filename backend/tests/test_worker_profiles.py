@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import inspect
+from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import distributed
+from dask_jobqueue import SLURMCluster
 
 from core.cluster_inventory import (
     ClusterInventory,
@@ -22,14 +26,21 @@ from core.worker_profiles import (
 )
 from nodes.base.block_map import BlockContextFactory
 from services.dask_service import (
+    DaskService,
     build_local_profile_cluster_specs,
     cluster_resource_summary_from_scheduler_info,
 )
 from services.executor import _resolve_max_in_flight_windows
 from services.slurm_execution_service import (
+    SlurmExecutionService,
     _worker_job_launcher_plan,
     _worker_job_request,
     slurm_policy_from_environment,
+)
+from services.slurm_jobqueue_cluster import (
+    PlannedSLURMCluster,
+    PlannedSLURMJob,
+    build_planned_slurm_worker_spec,
 )
 from core.workflow_resources import (
     build_workflow_resource_plan,
@@ -209,6 +220,195 @@ def test_planner_places_eight_gpu_jobs_on_two_real_nodes() -> None:
     first_launcher_plan = _worker_job_launcher_plan(allocation, allocation.jobs[0])
     assert len(first_launcher_plan["jobs"]) == 1
     assert first_launcher_plan["totalWorkers"] == 1
+
+
+def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
+    tmp_path: Path,
+) -> None:
+    workflow = build_workflow_resource_plan(
+        {"gpu": {"type": "Gpu", "inputs": {}}},
+        ["gpu"],
+        node_mappings={"Gpu": GpuNode},
+    )
+    profile = WorkerProfile(
+        name="gpu-cellpose",
+        physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
+        logical_resources={"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+        threads=1,
+    )
+    inventory = parse_scontrol_show_node(
+        "NodeName=t001 CPUTot=40 RealMemory=385349 "
+        "Gres=gpu:2 State=IDLE Partitions=tao\n"
+    )
+    allocation = plan_workflow_resources(
+        workflow,
+        [profile],
+        [WorkerPool(profile="gpu-cellpose", processes=1, scale=1)],
+        inventory,
+        partition="tao",
+        time_limit="01:00:00",
+    )
+    launcher = tmp_path / "workflow_workers.sbatch"
+    launcher.write_text("#!/bin/bash\n", encoding="utf-8")
+    request = tmp_path / "worker-request.json"
+    request.write_text("{}\n", encoding="utf-8")
+    spec = build_planned_slurm_worker_spec(
+        allocation,
+        allocation.jobs[0],
+        execution_id="12345678-1234-1234-1234-123456789abc",
+        submission_token="wf:abcdef:1",
+        request_path=request,
+        launcher_script=launcher,
+        project_root=tmp_path,
+        run_directory=tmp_path,
+        python_executable=Path(sys.executable),
+        sbatch_executable="/usr/bin/sbatch",
+        scancel_executable="/usr/bin/scancel",
+        interface=None,
+        protocol="tcp://",
+        security=None,
+    )
+    job = PlannedSLURMJob(
+        "tcp://mn02:8786",
+        name=spec.allocation_id,
+        **spec.options,
+    )
+    script = job.job_script()
+
+    assert issubclass(PlannedSLURMCluster, SLURMCluster)
+    assert "#SBATCH -p tao" in script
+    assert "#SBATCH --nodelist=t001" in script
+    assert "#SBATCH --gres=gpu:1" in script
+    assert "#SBATCH --comment=wf:abcdef:1" in script
+    assert "exec " in script
+    assert str(launcher) in script
+    assert str(request) in script
+
+
+def test_active_slurm_execution_submits_workers_through_slurmcluster() -> None:
+    source = inspect.getsource(SlurmExecutionService._execute_graph_impl)
+    assert "start_slurm_jobqueue_scheduler" in source
+    assert "submit_slurm_jobqueue_workers" in source
+    assert "build_sbatch_argv" not in source
+
+
+def test_planned_slurmcluster_owns_submit_and_scale_down_lifecycle(
+    monkeypatch,
+) -> None:
+    submitted = 0
+    cancelled: list[str] = []
+
+    async def fake_submit(self, _script_filename):
+        nonlocal submitted
+        submitted += 1
+        return f"Submitted batch job {55000 + submitted}"
+
+    async def fake_close(job_id, _cancel_command):
+        cancelled.append(str(job_id))
+
+    monkeypatch.setattr(PlannedSLURMJob, "_submit_job", fake_submit)
+    monkeypatch.setattr(PlannedSLURMJob, "_close_job", staticmethod(fake_close))
+    cluster = PlannedSLURMCluster(
+        n_workers=0,
+        queue="compute",
+        cores=4,
+        memory="4GiB",
+        processes=1,
+        nanny=False,
+        walltime="01:00:00",
+        worker_extra_args=[],
+        scheduler_options={
+            "host": "127.0.0.1",
+            "port": 0,
+            "dashboard": False,
+            "dashboard_address": None,
+        },
+        asynchronous=False,
+        name="WorkFlow-SLURMCluster-test",
+    )
+    try:
+        from services.slurm_jobqueue_cluster import PlannedSlurmWorkerSpec
+
+        spec = PlannedSlurmWorkerSpec(
+            allocation_id="gpu-cellpose-1",
+            submission_token="wf:abcdef:1",
+            options={
+                "allocation_id": "gpu-cellpose-1",
+                "submission_token": "wf:abcdef:1",
+                "queue": "compute",
+                "cores": 4,
+                "memory": "4GiB",
+                "processes": 1,
+                "nanny": False,
+                "walltime": "01:00:00",
+                "worker_extra_args": [],
+            },
+        )
+        records = cluster.submit_planned_jobs((spec,))
+        assert [(item.allocation_id, item.job_id) for item in records] == [
+            ("gpu-cellpose-1", "55001")
+        ]
+        assert set(cluster.workers) == {"gpu-cellpose-1"}
+
+        cluster.stop_planned_jobs()
+        assert cluster.workers == {}
+        assert cancelled == ["55001"]
+    finally:
+        cluster.close(timeout=10)
+
+
+def test_dask_service_owns_planned_slurmcluster_scheduler_and_cleanup(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    async def fake_submit(self, _script_filename):
+        return "Submitted batch job 55100"
+
+    async def fake_close(_job_id, _cancel_command):
+        return None
+
+    monkeypatch.setenv("WorkFlow_DASK_ALLOW_INSECURE_CLUSTER", "1")
+    monkeypatch.setattr(PlannedSLURMJob, "_submit_job", fake_submit)
+    monkeypatch.setattr(PlannedSLURMJob, "_close_job", staticmethod(fake_close))
+    service = DaskService()
+    template = SimpleNamespace(
+        partition="compute",
+        cpu=4,
+        memory_gib=4,
+        processes=1,
+    )
+    from services.slurm_jobqueue_cluster import PlannedSlurmWorkerSpec
+
+    service.start_slurm_jobqueue_scheduler(
+        host="127.0.0.1",
+        port=0,
+        template_job=template,
+        time_limit="01:00:00",
+        shared_temp_directory=str(tmp_path),
+        python_executable=sys.executable,
+    )
+    try:
+        records = service.submit_slurm_jobqueue_workers((
+            PlannedSlurmWorkerSpec(
+                allocation_id="cpu-reader-1",
+                submission_token="wf:abcdef:1",
+                options={
+                    "allocation_id": "cpu-reader-1",
+                    "submission_token": "wf:abcdef:1",
+                    "queue": "compute",
+                    "cores": 4,
+                    "memory": "4GiB",
+                    "processes": 1,
+                    "nanny": False,
+                    "walltime": "01:00:00",
+                    "worker_extra_args": [],
+                },
+            ),
+        ))
+        assert records[0].job_id == "55100"
+        service.stop_slurm_jobqueue_workers()
+    finally:
+        assert service.stop_cluster() is True
 
 
 def test_cpu_pool_scale_multiplies_processes_without_changing_requirements() -> None:
