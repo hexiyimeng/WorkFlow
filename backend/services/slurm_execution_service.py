@@ -286,6 +286,22 @@ def _port_range(value: object, *, name: str) -> str:
     return f"{start}:{stop}"
 
 
+def _loopback_dashboard_address(value: object) -> str:
+    text = str(value or "127.0.0.1:8787").strip()
+    match = re.fullmatch(r"127\.0\.0\.1:([0-9]{1,5})", text)
+    if match is None:
+        raise ValueError(
+            "WorkFlow_DASK_DASHBOARD_ADDRESS must bind to "
+            "127.0.0.1:PORT so it is only reachable through an SSH tunnel."
+        )
+    port = int(match.group(1))
+    if port < 1024 or port > 65535:
+        raise ValueError(
+            "WorkFlow_DASK_DASHBOARD_ADDRESS must use an unprivileged valid port."
+        )
+    return f"127.0.0.1:{port}"
+
+
 def _resolved_executable(
     value: object,
     *,
@@ -402,6 +418,7 @@ class SlurmRuntimeConfig:
     cancel_grace_seconds: float
     scheduler_host: str = "127.0.0.1"
     scheduler_port: int = 8786
+    dashboard_address: str = "127.0.0.1:8787"
     worker_port_range: str = "20000:20999"
     nanny_port_range: str = "21000:21999"
     worker_start_timeout_seconds: float = 600.0
@@ -411,6 +428,14 @@ class SlurmRuntimeConfig:
         nanny = tuple(int(item) for item in self.nanny_port_range.split(":"))
         if not (worker[1] < nanny[0] or nanny[1] < worker[0]):
             raise ValueError("Dask Worker and Nanny port ranges must not overlap.")
+        dashboard_port = int(self.dashboard_address.rsplit(":", 1)[1])
+        if dashboard_port == self.scheduler_port:
+            raise ValueError("Dask Scheduler and Dashboard ports must be different.")
+        for start, stop in (worker, nanny):
+            if start <= dashboard_port <= stop:
+                raise ValueError(
+                    "Dask Dashboard port must not overlap Worker or Nanny ports."
+                )
 
     @classmethod
     def from_environment(
@@ -510,6 +535,9 @@ class SlurmRuntimeConfig:
                 env,
                 "WorkFlow_DASK_SCHEDULER_PORT",
                 8786,
+            ),
+            dashboard_address=_loopback_dashboard_address(
+                env.get("WorkFlow_DASK_DASHBOARD_ADDRESS")
             ),
             worker_port_range=_port_range(
                 env.get("WorkFlow_DASK_WORKER_PORT_RANGE", "20000:20999"),
@@ -2373,6 +2401,7 @@ class SlurmExecutionService:
                 python_executable=str(
                     config.project_root / "backend" / ".venv" / "bin" / "python"
                 ),
+                dashboard_address=config.dashboard_address,
             )
             scheduler_started = True
             scheduler_address = str(client.scheduler.address)

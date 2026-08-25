@@ -24,6 +24,7 @@ EXECUTION_SCRIPT="${WorkFlow_SLURM_EXECUTION_SCRIPT:-$WORKFLOW_ROOT/deploy/hpc/s
 WEB_PORT="${WORKFLOW_WEB_PORT:-8000}"
 SCHEDULER_HOST="${WorkFlow_DASK_SCHEDULER_HOST:-}"
 SCHEDULER_PORT="${WorkFlow_DASK_SCHEDULER_PORT:-8786}"
+DASHBOARD_ADDRESS="${WorkFlow_DASK_DASHBOARD_ADDRESS:-127.0.0.1:8787}"
 WORKER_PORT_RANGE="${WorkFlow_DASK_WORKER_PORT_RANGE:-20000:20999}"
 NANNY_PORT_RANGE="${WorkFlow_DASK_NANNY_PORT_RANGE:-21000:21999}"
 SLURM_MAX_NODES="${WorkFlow_SLURM_MAX_NODES:-8}"
@@ -64,6 +65,19 @@ if [[ ! "$SCHEDULER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
 fi
 if [[ ! "$SCHEDULER_PORT" =~ ^[0-9]+$ ]] || (( SCHEDULER_PORT < 1 || SCHEDULER_PORT > 65535 )); then
   echo "WorkFlow_DASK_SCHEDULER_PORT must be an integer between 1 and 65535." >&2
+  exit 2
+fi
+if [[ ! "$DASHBOARD_ADDRESS" =~ ^127\.0\.0\.1:([0-9]+)$ ]]; then
+  echo "WorkFlow_DASK_DASHBOARD_ADDRESS must use 127.0.0.1:PORT." >&2
+  exit 2
+fi
+DASHBOARD_PORT="${BASH_REMATCH[1]}"
+if (( DASHBOARD_PORT < 1024 || DASHBOARD_PORT > 65535 )); then
+  echo "WorkFlow_DASK_DASHBOARD_ADDRESS must use an unprivileged valid port." >&2
+  exit 2
+fi
+if (( DASHBOARD_PORT == WEB_PORT || DASHBOARD_PORT == SCHEDULER_PORT )); then
+  echo "Dashboard, web and Scheduler ports must be different." >&2
   exit 2
 fi
 resource_settings=(
@@ -121,6 +135,11 @@ for reserved_port in "$WEB_PORT" "$SCHEDULER_PORT"; do
     exit 2
   fi
 done
+if (( (DASHBOARD_PORT >= WORKER_PORT_MIN && DASHBOARD_PORT <= WORKER_PORT_MAX) ||
+      (DASHBOARD_PORT >= NANNY_PORT_MIN && DASHBOARD_PORT <= NANNY_PORT_MAX) )); then
+  echo "Dashboard port must not fall inside a Worker or Nanny port range." >&2
+  exit 2
+fi
 
 TLS_CA="${WorkFlow_DASK_TLS_CA:-}"
 TLS_CERT="${WorkFlow_DASK_TLS_CERT:-}"
@@ -228,6 +247,7 @@ export WorkFlow_SLURM_SCONTROL="$SCONTROL_COMMAND"
 export WorkFlow_SLURM_SCANCEL="$SCANCEL_COMMAND"
 export WorkFlow_DASK_SCHEDULER_HOST="$SCHEDULER_HOST"
 export WorkFlow_DASK_SCHEDULER_PORT="$SCHEDULER_PORT"
+export WorkFlow_DASK_DASHBOARD_ADDRESS="$DASHBOARD_ADDRESS"
 export WorkFlow_DASK_WORKER_PORT_RANGE="$WORKER_PORT_RANGE"
 export WorkFlow_DASK_NANNY_PORT_RANGE="$NANNY_PORT_RANGE"
 export WorkFlow_DASK_ALLOW_INSECURE_CLUSTER="$ALLOW_INSECURE_CLUSTER"
@@ -252,6 +272,7 @@ printf '%s\n' \
   "execution_script=$EXECUTION_SCRIPT" \
   "driver=service-node-process" \
   "scheduler=on-demand:$SCHEDULER_HOST:$SCHEDULER_PORT" \
+  "dashboard=on-demand-loopback:http://$DASHBOARD_ADDRESS/status" \
   "cluster_manager=dask_jobqueue.SLURMCluster" \
   "workers=slurm-nodes-discovered-by-sinfo-and-scontrol" \
   "worker_ports=$WORKER_PORT_RANGE" \

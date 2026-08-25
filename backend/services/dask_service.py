@@ -1645,6 +1645,7 @@ class DaskService:
         *,
         host: str,
         port: int,
+        dashboard_address: str,
         template_job: Any,
         time_limit: str,
         shared_temp_directory: str,
@@ -1688,8 +1689,11 @@ class DaskService:
                     scheduler_options={
                         "host": host.strip(),
                         "port": port,
-                        "dashboard": False,
-                        "dashboard_address": None,
+                        # Keep diagnostics on service-node loopback. Operators
+                        # reach it through an explicit SSH local forward; CNs
+                        # only need the separate Scheduler protocol address.
+                        "dashboard": True,
+                        "dashboard_address": dashboard_address,
                     },
                     security=security,
                     asynchronous=False,

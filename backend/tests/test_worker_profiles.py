@@ -33,6 +33,7 @@ from services.dask_service import (
 from services.executor import _resolve_max_in_flight_windows
 from services.slurm_execution_service import (
     SlurmExecutionService,
+    _loopback_dashboard_address,
     _worker_job_launcher_plan,
     _worker_job_request,
     slurm_policy_from_environment,
@@ -59,6 +60,18 @@ class GpuNode:
 
 class DefaultProfileNode:
     pass
+
+
+def test_slurm_dashboard_must_remain_on_service_node_loopback() -> None:
+    assert _loopback_dashboard_address(None) == "127.0.0.1:8787"
+    assert _loopback_dashboard_address("127.0.0.1:18787") == "127.0.0.1:18787"
+    for unsafe in ("0.0.0.0:8787", "mn02:8787", "127.0.0.1:80"):
+        try:
+            _loopback_dashboard_address(unsafe)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Unsafe Dashboard binding was accepted: {unsafe}")
 
 
 def test_node_without_profile_uses_cpu_general_default() -> None:
@@ -386,6 +399,7 @@ def test_dask_service_owns_planned_slurmcluster_scheduler_and_cleanup(
     service.start_slurm_jobqueue_scheduler(
         host="127.0.0.1",
         port=0,
+        dashboard_address="127.0.0.1:0",
         template_job=template,
         time_limit="01:00:00",
         shared_temp_directory=str(tmp_path),
