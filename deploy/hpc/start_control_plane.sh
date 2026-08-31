@@ -260,7 +260,7 @@ printf '%s\n' \
   "nanny_ports=$NANNY_PORT_RANGE" \
   "slurm_node_envelope=max_nodes:$SLURM_MAX_NODES,cpus:$SLURM_CPUS_PER_NODE,gpus:$SLURM_GPUS_PER_NODE,memory_gib:$SLURM_MEMORY_GIB_PER_NODE" \
   "dask_tls_files=$([[ -n "$TLS_CA" ]] && printf configured || printf absent-explicitly-allowed)" \
-  "slurm_partitions=${WorkFlow_SLURM_PARTITION:-${WorkFlow_SLURM_ALLOWED_PARTITIONS:-auto}},excluded:${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn}" \
+  "slurm_partitions=${WorkFlow_SLURM_PARTITION:-${WorkFlow_SLURM_ALLOWED_PARTITIONS:-auto}},excluded:${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn,control}" \
   "slurm_commands=sbatch:$SBATCH_COMMAND,squeue:$SQUEUE_COMMAND,sacct:${SACCT_COMMAND:-unavailable},sinfo:$SINFO_COMMAND,scontrol:$SCONTROL_COMMAND,scancel:$SCANCEL_COMMAND"
 
 cd "$WORKFLOW_ROOT/backend"

@@ -88,9 +88,12 @@ def _resolve_group_array(group, requested_path: str | None, multiscale_index: in
             array_path = array_paths[0] if len(array_paths) == 1 else None
 
     if array_path is None:
+        available = ", ".join(repr(path) for path in array_paths) or "none"
         raise ValueError(
-            "Could not infer an array dataset from the zarr group. "
-            "Provide array_path explicitly, for example '0' or 'labels/cells/0'."
+            "Could not infer one array dataset from the zarr group because it "
+            f"contains multiple candidate arrays: {available}. Set the Reader "
+            "array_path explicitly, for example 's0', 's1', '0', or "
+            "'labels/cells/0'."
         )
     return group[array_path], array_path
 

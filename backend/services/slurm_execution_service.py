@@ -353,7 +353,9 @@ def slurm_policy_from_environment(
     partition = str(env.get("WorkFlow_SLURM_PARTITION", "")).strip()
     allowed_raw = str(env.get("WorkFlow_SLURM_ALLOWED_PARTITIONS", ""))
     allowed = tuple(item.strip() for item in allowed_raw.split(",") if item.strip())
-    excluded_raw = str(env.get("WorkFlow_SLURM_EXCLUDED_PARTITIONS", "mn"))
+    excluded_raw = str(
+        env.get("WorkFlow_SLURM_EXCLUDED_PARTITIONS", "mn,control")
+    )
     excluded = tuple(
         item.strip() for item in excluded_raw.split(",") if item.strip()
     )
@@ -2140,6 +2142,62 @@ class SlurmExecutionService:
                 )
             await asyncio.sleep(config.poll_interval_seconds)
 
+    async def _assert_worker_allocations_alive(
+        self,
+        *,
+        config: SlurmRuntimeConfig,
+        submitted_jobs: Sequence[
+            tuple[str, str | None, str, SlurmResourceRequest]
+        ],
+        run_directory: Path,
+    ) -> None:
+        """Fail registration promptly when an already-running Worker job exits."""
+
+        for job_id, cluster, submission_token, _request in submitted_jobs:
+            query_ok, queue_state = await self._query_queue_state(
+                config,
+                job_id,
+                cluster,
+                submission_token,
+            )
+            if not query_ok:
+                # A failed scheduler query is not proof that the allocation
+                # ended. Preserve the registration deadline and retry later.
+                continue
+            if queue_state is not None:
+                state, _node, reason = queue_state
+                if state not in _SLURM_TERMINAL_STATES:
+                    continue
+                raise SlurmSubmissionError(
+                    f"Slurm Worker job {job_id} ended during Dask registration: "
+                    f"state={state}, reason={reason or 'unknown'}. Inspect "
+                    f"{run_directory}/*-{job_id}.err and *-{job_id}.out."
+                )
+
+            found, terminal = await self._query_terminal_state(
+                config,
+                job_id,
+                cluster,
+                submission_token,
+            )
+            if terminal is not None:
+                state, exit_code, node = terminal
+                raise SlurmSubmissionError(
+                    f"Slurm Worker job {job_id} ended during Dask registration: "
+                    f"state={state}, exitCode={exit_code or 'unknown'}, "
+                    f"node={node or 'unknown'}. Inspect "
+                    f"{run_directory}/*-{job_id}.err and *-{job_id}.out."
+                )
+            if found:
+                # The controller still has an exact non-terminal record even
+                # though squeue briefly omitted it.
+                continue
+            raise SlurmSubmissionError(
+                f"Slurm Worker job {job_id} disappeared during Dask "
+                "registration without a terminal controller record. Inspect "
+                f"{run_directory}/*-{job_id}.err and *-{job_id}.out."
+            )
+
     async def reconcile_active_job(self) -> str | None:
         """Terminate orphan Worker allocations; a dead local Driver cannot resume."""
         config = SlurmRuntimeConfig.from_environment()
@@ -2495,13 +2553,36 @@ class SlurmExecutionService:
                     wait.cancel()
                 await asyncio.gather(*allocation_waits, return_exceptions=True)
                 raise
-            await asyncio.to_thread(
-                dask_service.activate_external_worker_profiles,
-                expected_profiles=allocation_plan.worker_counts,
-                timeout=config.worker_start_timeout_seconds,
-                execution_id=execution_id,
-                submission_tokens=tuple(item[2] for item in submitted_jobs),
+            registration_deadline = (
+                time.monotonic() + config.worker_start_timeout_seconds
             )
+            while True:
+                registration_remaining = registration_deadline - time.monotonic()
+                if registration_remaining <= 0:
+                    raise TimeoutError(
+                        "Dask Worker registration timed out after "
+                        f"{config.worker_start_timeout_seconds:g} seconds: "
+                        f"expected profiles={allocation_plan.worker_counts}. "
+                        f"Inspect Worker logs in {run_directory}."
+                    )
+                try:
+                    # Use short bounded waits so an allocation that exits after
+                    # reaching RUNNING is detected immediately instead of being
+                    # hidden behind one blocking 10-minute Dask wait.
+                    await asyncio.to_thread(
+                        dask_service.activate_external_worker_profiles,
+                        expected_profiles=allocation_plan.worker_counts,
+                        timeout=min(2.0, registration_remaining),
+                        execution_id=execution_id,
+                        submission_tokens=tuple(item[2] for item in submitted_jobs),
+                    )
+                    break
+                except TimeoutError:
+                    await self._assert_worker_allocations_alive(
+                        config=config,
+                        submitted_jobs=submitted_jobs,
+                        run_directory=run_directory,
+                    )
             _atomic_write_json(job_path, {
                 "schemaVersion": JOB_SCHEMA_VERSION,
                 "executionId": execution_id,

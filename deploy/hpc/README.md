@@ -28,7 +28,7 @@ Slurm Pool jobs（由 Resource Planner 的具体计划决定）
 
 Worker Profile/Pool 由页面按当前 Graph 需求配置并保存在浏览器。每次正式 Run 在提交任何 Job 之前执行一次新的只读资源快照：`sinfo --Node` 提供节点/分区/CPU idle 状态，`scontrol show node` 提供 CPUAlloc、RealMemory/AllocMem、`Gres=gpu:x` 与 AllocTRES。Planner 使用二者交集的当前可用量，不按 partition 名猜测 GPU。GPU Pool 的一个 scale 副本对应一个 Slurm Job 和一个 Dask Worker；CPU Pool 的一个 scale 副本对应一个 Slurm Job，并由标准 `SLURMJob` 在其中启动 `processes` 个同 Profile Worker。
 
-没有显式设置 `WorkFlow_SLURM_PARTITION` 或 `WorkFlow_SLURM_ALLOWED_PARTITIONS` 时，Planner 会考虑 `sinfo` 发现的所有分区，默认只排除管理分区 `mn`。一个 Job 仍只属于一个 partition/一个目标 node，但同一次 workflow 的不同 Job 可以跨 partition、跨 node。节点 GPU 能力只由 GRES/TRES 决定，因此 `compute`、`tao` 等非 `gpu` 命名的分区同样可以承载 GPU Worker。
+没有显式设置 `WorkFlow_SLURM_PARTITION` 或 `WorkFlow_SLURM_ALLOWED_PARTITIONS` 时，Planner 会考虑 `sinfo` 发现的所有分区，默认排除管理分区 `mn` 和 `control`。一个 Job 仍只属于一个 partition/一个目标 node，但同一次 workflow 的不同 Job 可以跨 partition、跨 node。节点 GPU 能力只由 GRES/TRES 决定，因此 `compute`、`tao` 等非 `gpu` 命名的分区同样可以承载 GPU Worker。
 
 Planner 必须先为所有 Profile/Pool 生成完整计划。任意 Profile 无法放置时，preflight 整体失败且不会提交任何 Job。快照之后若发生并发竞争，导致部分 Job 已运行而其余 Job 长时间无法启动，达到 `WorkFlow_SLURM_QUEUE_START_TIMEOUT_SECONDS` 后会把整个 `SLURMCluster` scale 到 0，而不是留下部分 Worker 占用资源。
 

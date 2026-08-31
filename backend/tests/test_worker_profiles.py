@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from pathlib import Path
 import subprocess
@@ -199,7 +200,7 @@ def test_sinfo_node_snapshot_tracks_each_partition_and_idle_cpu() -> None:
     assert nodes[0].cpu_idle == 76
 
 
-def test_planner_uses_multiple_discovered_partitions_but_excludes_mn() -> None:
+def test_planner_uses_multiple_discovered_partitions_but_excludes_management() -> None:
     workflow = build_workflow_resource_plan(
         {"gpu": {"type": "Gpu", "inputs": {}}},
         ["gpu"],
@@ -215,12 +216,13 @@ def test_planner_uses_multiple_discovered_partitions_but_excludes_mn() -> None:
         "NodeName=aio CPUTot=80 RealMemory=1031000 Gres=gpu:4 State=IDLE Partitions=gpu\n"
         "NodeName=c001 CPUTot=96 RealMemory=1028000 Gres=gpu:4 State=IDLE Partitions=compute\n"
         "NodeName=mn02 CPUTot=80 RealMemory=1031000 Gres=gpu:8 State=IDLE Partitions=mn\n"
+        "NodeName=mn01 CPUTot=80 RealMemory=1031000 Gres=gpu:8 State=IDLE Partitions=control\n"
         "NodeName=t001 CPUTot=40 RealMemory=500000 Gres=gpu:2 State=IDLE Partitions=tao\n"
         "NodeName=t002 CPUTot=40 RealMemory=500000 Gres=gpu:2 State=DOWN Partitions=tao\n"
     )
     inventory = ClusterInventory(
         nodes=inventory_nodes.nodes,
-        partitions=("gpu", "compute", "mn", "tao"),
+        partitions=("gpu", "compute", "mn", "control", "tao"),
         default_partition="compute",
     )
     policy = slurm_policy_from_environment({})
@@ -238,7 +240,7 @@ def test_planner_uses_multiple_discovered_partitions_but_excludes_mn() -> None:
 
     assert set(allocation.partitions) == {"gpu", "compute", "tao"}
     assert {node.node for node in allocation.nodes} == {"aio", "c001", "t001"}
-    assert all(job.partition != "mn" for job in allocation.jobs)
+    assert all(job.partition not in {"mn", "control"} for job in allocation.jobs)
     assert all(
         _worker_job_request(allocation, job).partition == job.partition
         for job in allocation.jobs
@@ -471,6 +473,33 @@ def test_active_slurm_execution_submits_workers_through_slurmcluster() -> None:
         DaskService.activate_external_worker_profiles
     ).parameters
     assert "submission_tokens" in profile_activation
+
+
+def test_worker_registration_detects_an_exited_slurm_job_immediately(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    service = SlurmExecutionService()
+
+    async def missing_from_queue(*_args, **_kwargs):
+        return True, None
+
+    async def failed_in_controller(*_args, **_kwargs):
+        return True, ("FAILED", "127:0", "t001")
+
+    monkeypatch.setattr(service, "_query_queue_state", missing_from_queue)
+    monkeypatch.setattr(service, "_query_terminal_state", failed_in_controller)
+    request = SimpleNamespace()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"57093.*FAILED.*127:0.*57093\.err",
+    ):
+        asyncio.run(service._assert_worker_allocations_alive(
+            config=SimpleNamespace(),
+            submitted_jobs=(("57093", None, "wf:test:1", request),),
+            run_directory=tmp_path,
+        ))
 
 
 def test_planned_slurmcluster_owns_submit_and_scale_down_lifecycle(

@@ -578,14 +578,21 @@ export default function ExecutionSettingsDrawer() {
   const requiredResources = executionPreflight?.requiredResources;
   const availableResources = executionPreflight?.availableResources;
   const lastPreflight = savedSettings.lastPreflight;
-  const summaryOutputShape = outputShape.length > 0
-    ? outputShape
+  const currentPreflightFailed = Boolean(executionPreflight?.preflightError);
+  // A current failed preflight must not be visually replaced by an older
+  // successful summary. Cached values are useful only before a fresh response
+  // exists, for example immediately after browser reload.
+  const summaryOutputShape = executionPreflight
+    ? (outputShape.length > 0 ? outputShape : undefined)
     : lastPreflight?.outputShape;
-  const totalWindows = Number.isSafeInteger(executionPreflight?.totalWindows)
-    ? Number(executionPreflight?.totalWindows)
+  const totalWindows = executionPreflight
+    ? (Number.isSafeInteger(executionPreflight.totalWindows)
+      ? Number(executionPreflight.totalWindows)
+      : undefined)
     : lastPreflight?.totalWindows;
-  const requiredWorkerProfiles = requiredResources?.requiredWorkerProfiles
-    ?? lastPreflight?.requiredWorkerProfiles;
+  const requiredWorkerProfiles = executionPreflight
+    ? requiredResources?.requiredWorkerProfiles
+    : lastPreflight?.requiredWorkerProfiles;
   const profileSummary = requiredWorkerProfiles
     ? Object.entries(requiredWorkerProfiles)
       .map(([profile, count]) => `${profile} (${count} nodes)`)
@@ -593,8 +600,10 @@ export default function ExecutionSettingsDrawer() {
     : '—';
   const allocationPlan = executionPreflight?.allocationPlan;
   const workerProfileNames = Object.keys(requiredWorkerProfiles ?? {}).sort();
+  const preflightErrorMessage = executionPreflight?.preflightError?.message?.trim();
   const generalError = actionError
     ?? executionSettingsValidation?.generalError
+    ?? (preflightErrorMessage ? `Preflight failed: ${preflightErrorMessage}` : undefined)
     ?? (versionError
       ? `${versionError} Use Reset, review the values, and Save Settings to migrate explicitly.`
       : undefined)
@@ -968,11 +977,15 @@ export default function ExecutionSettingsDrawer() {
             <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[10px]">
               <dt style={{ color: 'var(--color-text-muted)' }}>Output Shape</dt>
               <dd className="text-right font-mono">
-                {summaryOutputShape?.length ? summaryOutputShape.join(' × ') : 'Not checked'}
+                {currentPreflightFailed
+                  ? 'Preflight failed'
+                  : summaryOutputShape?.length ? summaryOutputShape.join(' × ') : 'Not checked'}
               </dd>
               <dt style={{ color: 'var(--color-text-muted)' }}>Total Windows</dt>
               <dd className="text-right font-mono">
-                {totalWindows === undefined ? 'Not checked' : totalWindows.toLocaleString()}
+                {currentPreflightFailed
+                  ? 'Preflight failed'
+                  : totalWindows === undefined ? 'Not checked' : totalWindows.toLocaleString()}
               </dd>
               <dt style={{ color: 'var(--color-text-muted)' }}>Required Profiles</dt>
               <dd className="text-right font-mono">{profileSummary}</dd>
