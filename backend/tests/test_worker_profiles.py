@@ -29,11 +29,16 @@ from core.worker_profiles import (
     resolve_worker_profile,
     worker_logical_resources,
 )
+from core.worker_ownership import (
+    execution_ownership_resource,
+    submission_ownership_resource,
+)
 from nodes.base.block_map import BlockContextFactory
 from services.dask_service import (
     DaskService,
     build_local_profile_cluster_specs,
     cluster_resource_summary_from_scheduler_info,
+    validate_external_worker_ownership,
 )
 from services.executor import _resolve_max_in_flight_windows
 from services.slurm_execution_service import (
@@ -357,6 +362,11 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
     assert "workflow_workers.sbatch" not in script
     assert "--tls-" not in script
     assert "--tls-ca-file None" not in script
+    assert execution_ownership_resource(
+        "12345678-1234-1234-1234-123456789abc"
+    ) in script
+    assert submission_ownership_resource("wf:abcdef:1") in script
+    assert "wf:abcdef:1=1" not in script
 
 
 def test_slurmcluster_derives_worker_threads_from_cores_and_processes(
@@ -892,6 +902,54 @@ def test_profile_worker_role_counts_are_disjoint() -> None:
         "cpu-reader": 1,
         "gpu-cellpose": 1,
     }
+
+
+def test_external_worker_ownership_uses_registered_hidden_resources() -> None:
+    execution_id = "12345678-1234-1234-1234-123456789abc"
+    submission_token = "wf:abcdef:1"
+    scheduler_info = {
+        "address": "tcp://mn02:8786",
+        "workers": {
+            "tcp://t001:20000": {
+                "resources": {
+                    "gpu-cellpose": 1,
+                    "CPU": 4,
+                    "GPU": 1,
+                    execution_ownership_resource(execution_id): 1,
+                    submission_ownership_resource(submission_token): 1,
+                },
+            },
+        },
+    }
+
+    validate_external_worker_ownership(
+        scheduler_info,
+        execution_id=execution_id,
+        submission_tokens=(submission_token,),
+    )
+    summary = cluster_resource_summary_from_scheduler_info(scheduler_info)
+    assert summary.worker_profile_slots == {"gpu-cellpose": 1}
+
+
+def test_external_worker_ownership_rejects_another_execution() -> None:
+    submission_token = "wf:abcdef:1"
+    scheduler_info = {
+        "workers": {
+            "tcp://t001:20000": {
+                "resources": {
+                    execution_ownership_resource("another-execution"): 1,
+                    submission_ownership_resource(submission_token): 1,
+                },
+            },
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="execution ownership mismatch"):
+        validate_external_worker_ownership(
+            scheduler_info,
+            execution_id="expected-execution",
+            submission_tokens=(submission_token,),
+        )
 
 
 def test_window_concurrency_defaults_to_one() -> None:

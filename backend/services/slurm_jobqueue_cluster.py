@@ -20,6 +20,10 @@ from dask_jobqueue.slurm import SLURMJob
 from distributed.deploy.spec import ProcessInterface
 
 from core.resource_planner import SlurmAllocationPlan, SlurmJobRequirement
+from core.worker_ownership import (
+    execution_ownership_resource,
+    submission_ownership_resource,
+)
 
 
 _JOB_ID_RE = re.compile(r"[1-9][0-9]*\Z")
@@ -256,8 +260,11 @@ def build_planned_slurm_worker_spec(
             f"Planned job {job.allocation_id!r} CPU count must divide exactly "
             "across its Worker processes."
         )
+    worker_resources = dict(job.logical_resources)
+    worker_resources[execution_ownership_resource(execution_id)] = 1
+    worker_resources[submission_ownership_resource(submission_token)] = 1
     resources = ",".join(
-        f"{name}={amount:g}" for name, amount in sorted(job.logical_resources.items())
+        f"{name}={amount:g}" for name, amount in sorted(worker_resources.items())
     )
     backend = root / "backend"
     fallback_scratch = logs / f"worker-scratch-{allocation_tag}"

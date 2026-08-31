@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import hashlib
 import math
 import os
 import asyncio
@@ -22,6 +21,11 @@ from core.logger import logger
 from core.platform import dask_spill_dir, should_schedule_malloc_trim
 from core.worker_pool import WorkerPool
 from core.worker_profiles import WorkerProfile, worker_logical_resources
+from core.worker_ownership import (
+    execution_ownership_resource,
+    is_ownership_resource,
+    submission_ownership_resource,
+)
 
 
 CPU_RESOURCE_NAME = "CPU"
@@ -926,7 +930,10 @@ def cluster_resource_summary_from_scheduler_info(
         if gpu_slots > 0:
             gpu_workers.append(str(worker_address))
         for name, amount in resources.items():
-            if name in {CPU_RESOURCE_NAME, GPU_RESOURCE_NAME}:
+            if (
+                name in {CPU_RESOURCE_NAME, GPU_RESOURCE_NAME}
+                or is_ownership_resource(name)
+            ):
                 continue
             worker_profile_slots[name] = worker_profile_slots.get(name, 0.0) + float(amount)
 
@@ -938,6 +945,47 @@ def cluster_resource_summary_from_scheduler_info(
         total_gpu_slots=total_gpu_slots,
         worker_profile_slots=dict(sorted(worker_profile_slots.items())),
     )
+
+
+def validate_external_worker_ownership(
+    scheduler_info: Mapping[str, Any],
+    *,
+    execution_id: str,
+    submission_tokens: Sequence[str],
+) -> None:
+    """Validate Worker ownership from Scheduler-registered logical resources.
+
+    Nanny-launched Worker subprocesses do not reliably expose the launcher's
+    ambient environment through ``Client.run`` on every Distributed version.
+    Logical resources are part of Worker registration itself, so they bind the
+    exact Worker identity observed by the Scheduler without exposing raw
+    submission tokens.
+    """
+
+    execution_resource = execution_ownership_resource(execution_id)
+    token_resources = {
+        submission_ownership_resource(token) for token in submission_tokens
+    }
+    if not token_resources:
+        raise ValueError("At least one Slurm submission token is required.")
+
+    errors: list[str] = []
+    workers = dict(scheduler_info.get("workers", {}) or {})
+    for address, worker_info in workers.items():
+        resources = dict(worker_info.get("resources", {}) or {})
+        if float(resources.get(execution_resource, 0) or 0) != 1:
+            errors.append(f"{address} execution ownership mismatch")
+        matched_tokens = [
+            name
+            for name in token_resources
+            if float(resources.get(name, 0) or 0) == 1
+        ]
+        if len(matched_tokens) != 1:
+            errors.append(f"{address} submission token mismatch")
+    if errors:
+        raise RuntimeError(
+            "External Worker ownership validation failed: " + "; ".join(errors)
+        )
 
 
 def get_fresh_scheduler_info(
@@ -1481,7 +1529,6 @@ class DaskService:
                 f"before timeout: expected={normalized}."
             )
 
-        diagnostics = self.get_worker_diagnostics(active_client)
         if execution_id is not None:
             if submission_token is not None and submission_tokens is not None:
                 raise ValueError(
@@ -1492,18 +1539,11 @@ class DaskService:
                 if submission_tokens is not None
                 else (() if submission_token is None else (submission_token,))
             )
-            token_hashes = {
-                hashlib.sha256(token.encode("utf-8")).hexdigest()
-                for token in token_values
-            }
-            errors: list[str] = []
-            for address, item in diagnostics.items():
-                if item.get("executionId") != execution_id:
-                    errors.append(f"{address} execution ownership mismatch")
-                if token_hashes and item.get("submissionTokenHash") not in token_hashes:
-                    errors.append(f"{address} submission token mismatch")
-            if errors:
-                raise RuntimeError("External Worker ownership validation failed: " + "; ".join(errors))
+            validate_external_worker_ownership(
+                scheduler_info,
+                execution_id=execution_id,
+                submission_tokens=token_values,
+            )
         return summary
 
     def uses_external_workers(self, client: Client | None = None) -> bool:
