@@ -19,6 +19,7 @@ from core.cluster_inventory import (
     parse_sinfo_nodes,
 )
 from core.resource_planner import ResourcePlanningError, plan_workflow_resources
+from core.platform import rewrite_dashboard_url
 from core.worker_pool import WorkerPool
 from core.worker_profiles import (
     CPU_GENERAL_PROFILE,
@@ -86,6 +87,13 @@ def test_slurm_dashboard_must_remain_on_service_node_loopback() -> None:
             pass
         else:
             raise AssertionError(f"Unsafe Dashboard binding was accepted: {unsafe}")
+
+
+def test_dashboard_browser_host_override_preserves_dask_status_path() -> None:
+    assert rewrite_dashboard_url(
+        "http://127.0.0.1:8787/status",
+        "127.0.0.1:18787",
+    ) == "http://127.0.0.1:18787/status"
 
 
 def test_node_without_profile_uses_cpu_general_default() -> None:
@@ -469,6 +477,9 @@ def test_active_slurm_execution_submits_workers_through_slurmcluster() -> None:
     assert "start_slurm_jobqueue_scheduler" in source
     assert "submit_slurm_jobqueue_workers" in source
     assert "build_sbatch_argv" not in source
+    assert source.index('"type": "dashboard_ready"') < source.index(
+        "activate_external_worker_profiles"
+    )
     profile_activation = inspect.signature(
         DaskService.activate_external_worker_profiles
     ).parameters

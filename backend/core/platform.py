@@ -102,6 +102,11 @@ def rewrite_dashboard_url(dashboard_link: str | None, custom_host: str | None) -
         scheme = parsed_custom.scheme or parsed_link.scheme or "http"
         port = parsed_custom.port or parsed_link.port
         netloc = f"{host}:{port}" if port else host
-        return urlunparse((scheme, netloc, parsed_custom.path.rstrip("/"), "", "", ""))
+        # A host-only browser override changes the SSH-forwarded host/port but
+        # must retain Dask's application path (normally ``/status``). Dropping
+        # it opens Tornado's root route, which is a valid server but returns
+        # a misleading 404.
+        path = parsed_custom.path.rstrip("/") or parsed_link.path
+        return urlunparse((scheme, netloc, path, "", "", ""))
 
     return custom_host

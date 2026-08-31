@@ -411,6 +411,7 @@ export type WSMessageType =
   | 'execution_not_found'
   | 'window_progress'
   | 'execution_control_ack'
+  | 'dashboard_ready'
   | 'cluster_ready'
   | 'slurm_job_submitted'
   | 'slurm_job_state'

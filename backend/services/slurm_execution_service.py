@@ -33,6 +33,7 @@ from core.slurm_execution import (
     validate_execution_id,
 )
 from core.cluster_inventory import ClusterInventoryService
+from core.platform import rewrite_dashboard_url
 from core.resource_planner import (
     SlurmAllocationPlan,
     SlurmJobRequirement,
@@ -2419,6 +2420,28 @@ class SlurmExecutionService:
             )
             scheduler_started = True
             scheduler_address = str(client.scheduler.address)
+            dashboard_url = str(
+                rewrite_dashboard_url(
+                    getattr(client, "dashboard_link", None),
+                    os.getenv("WorkFlow_DASHBOARD_HOST"),
+                )
+                or ""
+            )
+            dashboard_message = (
+                "Dask Scheduler dashboard ready; waiting for Slurm Workers to "
+                f"register: {dashboard_url or 'unavailable'}"
+            )
+            state_manager.add_log(
+                dashboard_message,
+                "info",
+                execution_id=execution_id,
+            )
+            await state_manager.broadcast(execution_id, {
+                "type": "dashboard_ready",
+                "executionId": execution_id,
+                "dashboardUrl": dashboard_url,
+                "message": dashboard_message,
+            })
             _atomic_write_json(job_path, {
                 "schemaVersion": JOB_SCHEMA_VERSION,
                 "executionId": execution_id,

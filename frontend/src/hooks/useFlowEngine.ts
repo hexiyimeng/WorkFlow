@@ -518,6 +518,15 @@ export const useFlowEngine = (
           return;
         }
 
+        if (msgType === 'dashboard_ready') {
+          setDashboardUrl(normalizeDashboardUrl(msg.dashboardUrl));
+          addLog(
+            msg.message || 'Dask Scheduler dashboard ready; waiting for Workers.',
+            'info',
+          );
+          return;
+        }
+
         if (msgType === 'cluster_ready') {
           setDashboardUrl(normalizeDashboardUrl(msg.dashboardUrl));
           const cpuWorkers = Number.isSafeInteger(msg.cpuWorkers)
