@@ -36,8 +36,7 @@ export const isWorkerProfile = (value: unknown): value is WorkerProfile => {
     && positiveMemory(physical.memory)
     && nonnegativeInteger(physical.gpu)
     && Number(physical.gpu) <= 1
-    && positiveInteger(value.threads)
-    && Number(value.threads) <= Number(physical.cpu)
+    && Number(value.threads) === Number(physical.cpu)
     && isRecord(logical)
     && Number(logical[value.name]) === 1
     && Number(logical.CPU) === Number(physical.cpu)
@@ -71,9 +70,8 @@ const workerProfileError = (value: unknown, index: number): string | null => {
   if (!nonnegativeInteger(physical.gpu) || Number(physical.gpu) > 1) {
     return `${label}: GPU / Worker must be 0 or 1.`;
   }
-  if (!positiveInteger(value.threads)) return `${label}: Threads / Worker must be a positive integer.`;
-  if (Number(value.threads) > Number(physical.cpu)) {
-    return `${label}: Threads / Worker cannot exceed CPU / Worker.`;
+  if (Number(value.threads) !== Number(physical.cpu)) {
+    return `${label}: Threads / Worker must equal CPU / Worker for SLURMCluster.`;
   }
   const logical = value.logical_resources;
   if (!isRecord(logical) || Number(logical[value.name]) !== 1) {
@@ -116,9 +114,20 @@ const parseArray = <T>(key: string, validate: (value: unknown) => value is T): T
   }
 };
 
-export const loadWorkerProfiles = (): WorkerProfile[] => (
-  parseArray(WORKER_PROFILES_STORAGE_KEY, isWorkerProfile)
-);
+export const loadWorkerProfiles = (): WorkerProfile[] => {
+  try {
+    const raw = localStorage.getItem(WORKER_PROFILES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map(value => {
+      if (!isRecord(value) || !isRecord(value.physical_resources)) return value;
+      return { ...value, threads: Number(value.physical_resources.cpu) };
+    }).filter(isWorkerProfile);
+  } catch {
+    return [];
+  }
+};
 
 export const loadWorkerPools = (): WorkerPool[] => (
   parseArray(WORKER_POOLS_STORAGE_KEY, isWorkerPool)
@@ -186,7 +195,7 @@ export const defaultWorkerProfile = (name: string): WorkerProfile => {
     physical_resources: { cpu, memory: '32GB', gpu },
     logical_resources: { [name]: 1, CPU: cpu, ...(gpu ? { GPU: gpu } : {}) },
     capabilities: [name],
-    threads: gpu > 0 ? 1 : cpu,
+    threads: cpu,
   };
 };
 
@@ -198,6 +207,7 @@ export const defaultWorkerPool = (profile: string): WorkerPool => ({
 
 export const synchronizeLogicalResources = (profile: WorkerProfile): WorkerProfile => ({
   ...profile,
+  threads: profile.physical_resources.cpu,
   logical_resources: {
     [profile.name]: 1,
     CPU: profile.physical_resources.cpu,

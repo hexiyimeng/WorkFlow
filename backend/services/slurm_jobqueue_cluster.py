@@ -1,9 +1,9 @@
 """Planner-aware ``dask-jobqueue`` integration for heterogeneous Slurm jobs.
 
 One :class:`PlannedSLURMCluster` owns the service-node Scheduler for a workflow.
-Each Resource Planner allocation becomes a distinct ``SLURMJob`` worker spec,
-so profiles may use different partitions, nodes, CPU, memory, GPU and process
-counts while retaining the lifecycle semantics of ``SLURMCluster``.
+Each Resource Planner allocation becomes a distinct standard ``SLURMJob``
+worker spec, so profiles may use different partitions, nodes, CPU, memory, GPU
+and process counts while retaining SLURMCluster's Worker command and lifecycle.
 """
 
 from __future__ import annotations
@@ -27,21 +27,15 @@ _SAFE_JOB_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}\Z")
 
 
-def _absolute_file(value: Path | str, *, name: str) -> Path:
-    path = Path(value)
-    if not path.is_absolute() or not path.is_file() or path.is_symlink():
-        raise ValueError(f"{name} must be an absolute regular non-symlink file.")
-    return path
-
-
 def _absolute_executable(value: Path | str, *, name: str) -> Path:
-    """Return the canonical executable behind an absolute path.
+    """Validate an absolute executable while preserving its venv path.
 
     POSIX virtual environments normally expose ``bin/python`` as a symbolic
     link.  Rejecting that standard layout makes a valid uv-created environment
     unusable on Slurm hosts.  Resolve the link strictly, then validate the
-    canonical target instead of weakening validation for launcher/request
-    files, which must remain non-symlinks.
+    canonical target.  Return the original ``.venv/bin/python`` path so Python
+    retains virtual-environment discovery instead of launching through the
+    resolved base interpreter path.
     """
 
     path = Path(value)
@@ -53,7 +47,7 @@ def _absolute_executable(value: Path | str, *, name: str) -> Path:
         raise ValueError(f"{name} must resolve to an existing executable file.") from exc
     if not resolved.is_file():
         raise ValueError(f"{name} must resolve to a regular executable file.")
-    return resolved
+    return path
 
 
 def _absolute_directory(value: Path | str, *, name: str) -> Path:
@@ -84,15 +78,13 @@ class SubmittedSlurmJob:
 
 
 class PlannedSLURMJob(SLURMJob):
-    """A ``SLURMJob`` whose payload is WorkFlow's validated Worker launcher."""
+    """A standard ``SLURMJob`` carrying immutable planner ownership metadata."""
 
     def __init__(
         self,
         *args,
         allocation_id: str | None = None,
         submission_token: str | None = None,
-        launcher_script: str | None = None,
-        request_path: str | None = None,
         submit_command: str | None = None,
         cancel_command: str | None = None,
         **kwargs,
@@ -104,21 +96,16 @@ class PlannedSLURMJob(SLURMJob):
             self.submit_command = submit_command
         if cancel_command:
             self.cancel_command = cancel_command
-        if launcher_script is None and request_path is None:
-            return
-        if launcher_script is None or request_path is None:
-            raise ValueError("launcher_script and request_path must be provided together.")
-        launcher = _absolute_file(launcher_script, name="launcher_script")
-        request = _absolute_file(request_path, name="request_path")
-        self._command_template = (
-            f"exec {shlex.quote(str(launcher))} {shlex.quote(str(request))}"
-        )
 
     async def close(self) -> None:
         """Cancel through dask-jobqueue and publish a terminal SpecCluster state."""
 
         try:
-            await SLURMJob.close(self)
+            # A heterogeneous correction may create several Job objects while
+            # one sbatch call fails.  Only the objects with a validated Slurm
+            # job id may invoke dask-jobqueue's scancel path.
+            if _JOB_ID_RE.fullmatch(str(self.job_id or "")) is not None:
+                await SLURMJob.close(self)
         finally:
             await ProcessInterface.close(self)
 
@@ -197,9 +184,8 @@ def build_planned_slurm_worker_spec(
     *,
     execution_id: str,
     submission_token: str,
-    request_path: Path,
-    launcher_script: Path,
     project_root: Path,
+    runtime_directory: Path,
     run_directory: Path,
     python_executable: Path,
     sbatch_executable: str,
@@ -207,12 +193,13 @@ def build_planned_slurm_worker_spec(
     interface: str | None,
     protocol: str | None,
     security: object,
+    worker_port_range: str,
+    nanny_port_range: str,
 ) -> PlannedSlurmWorkerSpec:
-    """Translate one Resource Planner job into one heterogeneous worker spec."""
+    """Translate one planner job into a standard SLURMJob Worker command."""
 
-    launcher = _absolute_file(launcher_script, name="launcher_script")
-    request = _absolute_file(request_path, name="request_path")
     root = _absolute_directory(project_root, name="project_root")
+    runtime = _absolute_directory(runtime_directory, name="runtime_directory")
     logs = _absolute_directory(run_directory, name="run_directory")
     python = _absolute_executable(python_executable, name="python_executable")
     allocation_tag = hashlib.sha256(
@@ -234,18 +221,63 @@ def build_planned_slurm_worker_spec(
     if job.gpu:
         directives.append(f"--gres=gpu:{job.gpu}")
 
+    threads_per_worker = job.cpu // job.processes
+    if threads_per_worker <= 0 or threads_per_worker * job.processes != job.cpu:
+        raise ValueError(
+            f"Planned job {job.allocation_id!r} CPU count must divide exactly "
+            "across its Worker processes."
+        )
+    resources = ",".join(
+        f"{name}={amount:g}" for name, amount in sorted(job.logical_resources.items())
+    )
+    backend = root / "backend"
+    fallback_scratch = logs / f"worker-scratch-{allocation_tag}"
+    token_hash = hashlib.sha256(submission_token.encode("utf-8")).hexdigest()
+    prologue = [
+        "set -euo pipefail",
+        "umask 077",
+        f"export PATH={shlex.quote(str(python.parent))}:/usr/local/bin:/usr/bin:/bin",
+        f"export PYTHONPATH={shlex.quote(str(backend))}",
+        "export PYTHONUNBUFFERED=1",
+        "export WORKFLOW_DASK_WORKER_PROCESS=1",
+        f"export WORKFLOW_EXECUTION_ID={shlex.quote(execution_id)}",
+        f"export WORKFLOW_SUBMISSION_TOKEN_HASH={shlex.quote(token_hash)}",
+        f"export WORKFLOW_WORKER_PROFILE={shlex.quote(job.profile)}",
+        f"export WORKFLOW_WORKER_ROLE={'gpu' if job.gpu else 'cpu'}",
+        f"export OMP_NUM_THREADS={threads_per_worker}",
+        f"export MKL_NUM_THREADS={threads_per_worker}",
+        f"export OPENBLAS_NUM_THREADS={threads_per_worker}",
+        f"export NUMEXPR_NUM_THREADS={threads_per_worker}",
+        f"export WorkFlow_MODELS_DIR={shlex.quote(str(runtime / 'models'))}",
+        f"export CELLPOSE_LOCAL_MODELS_PATH={shlex.quote(str(runtime / 'models' / 'cellpose'))}",
+        f"WORKFLOW_FALLBACK_SCRATCH={shlex.quote(str(fallback_scratch))}",
+        'export WORKFLOW_DASK_LOCAL_DIRECTORY="${SLURM_TMPDIR:-$WORKFLOW_FALLBACK_SCRATCH}"',
+        "mkdir -p \"$WORKFLOW_DASK_LOCAL_DIRECTORY\"",
+    ]
+    if job.gpu:
+        prologue.extend((
+            'if [[ -z "${CUDA_VISIBLE_DEVICES:-}" || "${CUDA_VISIBLE_DEVICES}" == *,* ]]; then '
+            'echo "SLURMCluster GPU Worker must receive exactly one CUDA device" >&2; exit 2; fi',
+            'export WORKFLOW_LOCAL_GPU_ID="${CUDA_VISIBLE_DEVICES}"',
+            'export WORKFLOW_PHYSICAL_GPU_ID="${SLURMD_NODENAME:-${HOSTNAME}}:${CUDA_VISIBLE_DEVICES}"',
+        ))
+    else:
+        prologue.extend((
+            'export CUDA_VISIBLE_DEVICES=""',
+            'export WORKFLOW_LOCAL_GPU_ID=""',
+            'export WORKFLOW_PHYSICAL_GPU_ID=""',
+        ))
+
     options: dict[str, object] = {
         "allocation_id": job.allocation_id,
         "submission_token": submission_token,
-        "launcher_script": str(launcher),
-        "request_path": str(request),
         "submit_command": sbatch_executable,
         "cancel_command": scancel_executable,
         "queue": job.partition,
         "cores": job.cpu,
         "memory": f"{job.memory_gib}GiB",
         "processes": job.processes,
-        "nanny": False,
+        "nanny": True,
         "walltime": plan.time_limit,
         "job_cpu": job.cpu,
         "job_mem": f"{job.memory_gib}G",
@@ -254,7 +286,17 @@ def build_planned_slurm_worker_spec(
         "log_directory": str(logs),
         "shebang": "#!/bin/bash",
         "python": str(python),
-        "worker_extra_args": [],
+        "worker_command": "distributed.cli.dask_worker",
+        "worker_extra_args": [
+            "--resources", resources,
+            "--preload", "services.slurm_worker_preload",
+            "--worker-port", worker_port_range,
+            "--nanny-port", nanny_port_range,
+            "--no-dashboard",
+        ],
+        "death_timeout": 120,
+        "local_directory": '"$WORKFLOW_DASK_LOCAL_DIRECTORY"',
+        "job_script_prologue": prologue,
         "interface": interface,
         "protocol": protocol,
         "security": security,

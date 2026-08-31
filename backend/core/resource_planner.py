@@ -21,7 +21,6 @@ class SlurmJobRequirement:
     partition: str
     workers: int
     processes: int
-    threads: int
     cpu: int
     memory_gib: int
     gpu: int
@@ -35,7 +34,7 @@ class SlurmJobRequirement:
             "partition": self.partition,
             "workers": self.workers,
             "processes": self.processes,
-            "threads": self.threads,
+            "threads": self.cpu // self.processes,
             "slurm": {
                 "nodes": 1,
                 "cpus": self.cpu,
@@ -269,7 +268,6 @@ def plan_workflow_resources(
             partition=selected.partition,
             workers=pool.processes,
             processes=pool.processes,
-            threads=profile.threads,
             cpu=cpu,
             memory_gib=memory_gib,
             gpu=gpu,

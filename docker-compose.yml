@@ -13,7 +13,6 @@ services:
       WorkFlow_CUDA_MODE: "disabled"
       WorkFlow_DASK_LOCAL_DIR: "/tmp/workflow_dask_spill"
       WorkFlow_DASHBOARD_HOST: "localhost:8787"
-      WorkFlow_WORKERS: "1"
     volumes:
       - ./backend/models:/app/backend/models
       - ./backend/demo_data:/app/backend/demo_data

@@ -20,7 +20,6 @@ if [[ -z "${WORKFLOW_RUNTIME_DIR:-}" ]]; then
 fi
 
 PYTHON="$WORKFLOW_ROOT/backend/.venv/bin/python"
-EXECUTION_SCRIPT="${WorkFlow_SLURM_EXECUTION_SCRIPT:-$WORKFLOW_ROOT/deploy/hpc/slurm/workflow_workers.sbatch}"
 WEB_PORT="${WORKFLOW_WEB_PORT:-8000}"
 SCHEDULER_HOST="${WorkFlow_DASK_SCHEDULER_HOST:-}"
 SCHEDULER_PORT="${WorkFlow_DASK_SCHEDULER_PORT:-8786}"
@@ -39,10 +38,6 @@ esac
 case "$WORKFLOW_RUNTIME_DIR" in
   /*) ;;
   *) echo "WORKFLOW_RUNTIME_DIR must be an absolute path." >&2; exit 2 ;;
-esac
-case "$EXECUTION_SCRIPT" in
-  /*) ;;
-  *) echo "WorkFlow_SLURM_EXECUTION_SCRIPT must be an absolute path." >&2; exit 2 ;;
 esac
 if [[ ! "$WEB_PORT" =~ ^[0-9]+$ ]] || (( WEB_PORT < 1 || WEB_PORT > 65535 )); then
   echo "WORKFLOW_WEB_PORT must be an integer between 1 and 65535." >&2
@@ -174,18 +169,6 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "Run deploy/hpc/install.sh first." >&2
   exit 1
 fi
-if [[ ! -f "$EXECUTION_SCRIPT" || -L "$EXECUTION_SCRIPT" || ! -x "$EXECUTION_SCRIPT" ]]; then
-  echo "Slurm execution script must be a regular executable non-symlink file: $EXECUTION_SCRIPT" >&2
-  echo "Re-run deploy/hpc/install.sh from a revision that preserves its executable bit." >&2
-  exit 1
-fi
-case "$EXECUTION_SCRIPT" in
-  */workflow_execution.sbatch)
-    echo "workflow_execution.sbatch is the removed compute-node Driver entrypoint." >&2
-    echo "Use deploy/hpc/slurm/workflow_workers.sbatch so only Workers run on compute nodes." >&2
-    exit 2
-    ;;
-esac
 SBATCH_COMMAND="${WorkFlow_SLURM_SBATCH:-sbatch}"
 SQUEUE_COMMAND="${WorkFlow_SLURM_SQUEUE:-squeue}"
 SINFO_COMMAND="${WorkFlow_SLURM_SINFO:-sinfo}"
@@ -225,7 +208,6 @@ fi
 mkdir -p \
   "$WORKFLOW_RUNTIME_DIR/logs" \
   "$WORKFLOW_RUNTIME_DIR/state" \
-  "$WORKFLOW_RUNTIME_DIR/requests" \
   "$WORKFLOW_RUNTIME_DIR/jobs" \
   "$WORKFLOW_RUNTIME_DIR/models" \
   "$WORKFLOW_RUNTIME_DIR/output" \
@@ -237,7 +219,6 @@ mkdir -p \
 # Slurm and never run in this service process.
 export PYTHONPATH="$WORKFLOW_ROOT/backend"
 export WorkFlow_EXECUTION_BACKEND="slurm"
-export WorkFlow_SLURM_EXECUTION_SCRIPT="$EXECUTION_SCRIPT"
 export WorkFlow_SLURM_RUNTIME_DIR="$WORKFLOW_RUNTIME_DIR"
 export WorkFlow_SLURM_SBATCH="$SBATCH_COMMAND"
 export WorkFlow_SLURM_SQUEUE="$SQUEUE_COMMAND"
@@ -269,7 +250,7 @@ printf '%s\n' \
   "runtime=$WORKFLOW_RUNTIME_DIR" \
   "listen=http://127.0.0.1:$WEB_PORT" \
   "execution_backend=slurm" \
-  "execution_script=$EXECUTION_SCRIPT" \
+  "worker_command=dask_jobqueue.SLURMJob" \
   "driver=service-node-process" \
   "scheduler=on-demand:$SCHEDULER_HOST:$SCHEDULER_PORT" \
   "dashboard=on-demand-loopback:http://$DASHBOARD_ADDRESS/status" \
@@ -279,7 +260,7 @@ printf '%s\n' \
   "nanny_ports=$NANNY_PORT_RANGE" \
   "slurm_node_envelope=max_nodes:$SLURM_MAX_NODES,cpus:$SLURM_CPUS_PER_NODE,gpus:$SLURM_GPUS_PER_NODE,memory_gib:$SLURM_MEMORY_GIB_PER_NODE" \
   "dask_tls_files=$([[ -n "$TLS_CA" ]] && printf configured || printf absent-explicitly-allowed)" \
-  "slurm_partitions=${WorkFlow_SLURM_PARTITION:-${WorkFlow_SLURM_ALLOWED_PARTITIONS:-auto}},excluded:${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-control}" \
+  "slurm_partitions=${WorkFlow_SLURM_PARTITION:-${WorkFlow_SLURM_ALLOWED_PARTITIONS:-auto}},excluded:${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn}" \
   "slurm_commands=sbatch:$SBATCH_COMMAND,squeue:$SQUEUE_COMMAND,sacct:${SACCT_COMMAND:-unavailable},sinfo:$SINFO_COMMAND,scontrol:$SCONTROL_COMMAND,scancel:$SCANCEL_COMMAND"
 
 cd "$WORKFLOW_ROOT/backend"

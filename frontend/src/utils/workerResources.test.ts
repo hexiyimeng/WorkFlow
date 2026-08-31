@@ -42,6 +42,11 @@ assert(loadWorkerPools()[0]?.scale === 8, 'Pool scale must be persisted');
 assert(workerResourcePayload().workerProfiles[0]?.name === 'gpu-cellpose',
   'Run payload must load browser Worker Profiles');
 
+values.set(WORKER_PROFILES_STORAGE_KEY, JSON.stringify([{ ...gpu, threads: 1 }]));
+assert(loadWorkerProfiles()[0]?.threads === 4,
+  'Legacy independent thread values must migrate to CPU / Worker');
+saveWorkerResources(loadWorkerProfiles(), [gpuPool]);
+
 let gpuProcessesRejected = false;
 try {
   saveWorkerResources([gpu], [{ ...gpuPool, processes: 2 }]);

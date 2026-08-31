@@ -49,6 +49,9 @@ class ClusterNode:
     memory_mib: int
     gpu: int
     state: str
+    cpu_total: int = 0
+    memory_total_mib: int = 0
+    gpu_total: int = 0
 
     def __post_init__(self) -> None:
         if not self.name or self.name != self.name.strip():
@@ -58,6 +61,17 @@ class ClusterNode:
         _positive_or_zero(self.cpu, name=f"{self.name}.cpu")
         _positive_or_zero(self.memory_mib, name=f"{self.name}.memory_mib")
         _positive_or_zero(self.gpu, name=f"{self.name}.gpu")
+        for field_name, available, configured in (
+            ("cpu_total", self.cpu, self.cpu_total),
+            ("memory_total_mib", self.memory_mib, self.memory_total_mib),
+            ("gpu_total", self.gpu, self.gpu_total),
+        ):
+            total = _positive_or_zero(configured, name=f"{self.name}.{field_name}")
+            if total == 0:
+                total = available
+            if total < available:
+                raise ValueError(f"{self.name}.{field_name} cannot be below available capacity.")
+            object.__setattr__(self, field_name, total)
         if not self.state:
             raise ValueError(f"Cluster node {self.name!r} has no state.")
 
@@ -78,9 +92,15 @@ class ClusterNode:
             "name": self.name,
             "partitions": list(self.partitions),
             "cpu": self.cpu,
+            "cpuTotal": self.cpu_total,
+            "cpuAllocated": self.cpu_total - self.cpu,
             "memoryMiB": self.memory_mib,
             "memoryGiB": self.memory_gib,
+            "memoryTotalMiB": self.memory_total_mib,
+            "memoryAllocatedMiB": self.memory_total_mib - self.memory_mib,
             "gpu": self.gpu,
+            "gpuTotal": self.gpu_total,
+            "gpuAllocated": self.gpu_total - self.gpu,
             "state": self.state,
             "available": self.is_available,
         }
@@ -158,6 +178,84 @@ def parse_sinfo_partitions(output: str) -> tuple[tuple[str, ...], str | None]:
     return tuple(partitions), default_partition
 
 
+@dataclass(frozen=True, slots=True)
+class SinfoNodeResources:
+    name: str
+    partitions: tuple[str, ...]
+    cpu_allocated: int
+    cpu_idle: int
+    cpu_other: int
+    cpu_total: int
+    state: str
+
+
+def parse_sinfo_nodes(
+    output: str,
+) -> tuple[tuple[SinfoNodeResources, ...], tuple[str, ...], str | None]:
+    """Parse one uncompressed ``sinfo --Node`` resource snapshot."""
+
+    if not isinstance(output, str):
+        raise TypeError("sinfo output must be text.")
+    nodes: dict[str, SinfoNodeResources] = {}
+    partition_order: list[str] = []
+    default_partition: str | None = None
+    for line_number, raw_line in enumerate(output.replace("\r\n", "\n").splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        parts = [part.strip() for part in raw_line.split("|")]
+        if len(parts) != 4:
+            raise ValueError(f"Invalid sinfo node row at line {line_number}: {raw_line!r}.")
+        name, raw_partition, raw_cpu_state, state = parts
+        is_default = raw_partition.endswith("*")
+        partition = raw_partition[:-1] if is_default else raw_partition
+        if not name or not partition or not state:
+            raise ValueError(f"Incomplete sinfo node row at line {line_number}.")
+        if partition not in partition_order:
+            partition_order.append(partition)
+        if is_default:
+            if default_partition is not None and default_partition != partition:
+                raise ValueError("sinfo reported more than one default partition.")
+            default_partition = partition
+        cpu_parts = raw_cpu_state.split("/")
+        if len(cpu_parts) != 4:
+            raise ValueError(
+                f"sinfo CPU state for {name!r} must be allocated/idle/other/total."
+            )
+        allocated, idle, other, total = (
+            _positive_or_zero(value, name=f"{name}.cpuState") for value in cpu_parts
+        )
+        if allocated + idle + other != total:
+            raise ValueError(f"sinfo CPU state for {name!r} does not add up to total CPU.")
+        existing = nodes.get(name)
+        if existing is None:
+            nodes[name] = SinfoNodeResources(
+                name=name,
+                partitions=(partition,),
+                cpu_allocated=allocated,
+                cpu_idle=idle,
+                cpu_other=other,
+                cpu_total=total,
+                state=state,
+            )
+        else:
+            if (
+                existing.cpu_allocated,
+                existing.cpu_idle,
+                existing.cpu_other,
+                existing.cpu_total,
+                existing.state.upper(),
+            ) != (allocated, idle, other, total, state.upper()):
+                raise ValueError(f"sinfo reported conflicting resource rows for {name!r}.")
+            if partition not in existing.partitions:
+                nodes[name] = replace(
+                    existing,
+                    partitions=(*existing.partitions, partition),
+                )
+    if not nodes:
+        raise ValueError("sinfo returned no per-node resource rows.")
+    return tuple(nodes.values()), tuple(partition_order), default_partition
+
+
 def _records(output: str) -> tuple[str, ...]:
     normalized = output.replace("\r\n", "\n")
     starts = [match.start() for match in re.finditer(r"(?m)(?<!\S)NodeName=", normalized)]
@@ -177,6 +275,41 @@ def _fields(record: str) -> dict[str, str]:
     return result
 
 
+def _tres_fields(value: object) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in str(value or "").split(","):
+        if "=" not in item:
+            continue
+        name, amount = item.split("=", 1)
+        result[name.strip().lower()] = amount.strip()
+    return result
+
+
+def _memory_mib(value: object, *, name: str) -> int:
+    text = str(value or "0").strip()
+    match = re.fullmatch(r"([0-9]+)([KMGTP]?)", text, re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"{name} has an invalid Slurm memory value: {value!r}.")
+    amount = int(match.group(1))
+    suffix = match.group(2).upper()
+    multipliers = {"": 1, "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 ** 2, "P": 1024 ** 3}
+    return int(amount * multipliers[suffix])
+
+
+def _allocated_gpu(fields: Mapping[str, str]) -> int:
+    tres = _tres_fields(fields.get("AllocTRES"))
+    if "gres/gpu" in tres:
+        return _positive_or_zero(tres["gres/gpu"], name="AllocTRES.gres/gpu")
+    typed = [
+        _positive_or_zero(amount, name=f"AllocTRES.{name}")
+        for name, amount in tres.items()
+        if name.startswith("gres/gpu:")
+    ]
+    if typed:
+        return sum(typed)
+    return parse_gpu_gres(fields.get("GresUsed"))
+
+
 def parse_scontrol_show_node(output: str) -> ClusterInventory:
     if not isinstance(output, str):
         raise TypeError("scontrol output must be text.")
@@ -189,19 +322,36 @@ def parse_scontrol_show_node(output: str) -> ClusterInventory:
             item for item in partitions_text.split(",")
             if item and item.lower() not in {"(null)", "n/a"}
         )
+        cpu_total = _positive_or_zero(
+            fields.get("CPUTot", fields.get("CPUs", 0)),
+            name=f"{name}.CPUTot",
+        )
+        cpu_allocated = _positive_or_zero(
+            fields.get("CPUAlloc", 0),
+            name=f"{name}.CPUAlloc",
+        )
+        memory_total = _positive_or_zero(
+            fields.get("RealMemory", 0),
+            name=f"{name}.RealMemory",
+        )
+        alloc_tres = _tres_fields(fields.get("AllocTRES"))
+        memory_allocated = (
+            _memory_mib(fields["AllocMem"], name=f"{name}.AllocMem")
+            if "AllocMem" in fields
+            else _memory_mib(alloc_tres.get("mem", 0), name=f"{name}.AllocTRES.mem")
+        )
+        gpu_total = parse_gpu_gres(fields.get("Gres"))
+        gpu_allocated = _allocated_gpu(fields)
         nodes.append(ClusterNode(
             name=name,
             partitions=partitions,
-            cpu=_positive_or_zero(
-                fields.get("CPUTot", fields.get("CPUs", 0)),
-                name=f"{name}.CPUTot",
-            ),
-            memory_mib=_positive_or_zero(
-                fields.get("RealMemory", 0),
-                name=f"{name}.RealMemory",
-            ),
-            gpu=parse_gpu_gres(fields.get("Gres")),
+            cpu=max(0, cpu_total - cpu_allocated),
+            memory_mib=max(0, memory_total - memory_allocated),
+            gpu=max(0, gpu_total - gpu_allocated),
             state=fields.get("State", "UNKNOWN").split("(", 1)[0],
+            cpu_total=cpu_total,
+            memory_total_mib=memory_total,
+            gpu_total=gpu_total,
         ))
     if not nodes:
         raise ValueError("scontrol show node returned no NodeName records.")
@@ -225,7 +375,12 @@ class ClusterInventoryService:
 
     def load(self) -> ClusterInventory:
         partition_result = self.command_runner(
-            (self.sinfo_executable, "--noheader", "--format=%P"),
+            (
+                self.sinfo_executable,
+                "--Node",
+                "--noheader",
+                "--format=%N|%P|%C|%T",
+            ),
             check=False,
             capture_output=True,
             text=True,
@@ -239,7 +394,7 @@ class ClusterInventoryService:
                 or "unknown error"
             ).strip()
             raise RuntimeError(f"sinfo partition discovery failed: {detail}")
-        partitions, default_partition = parse_sinfo_partitions(
+        sinfo_nodes, partitions, default_partition = parse_sinfo_nodes(
             partition_result.stdout
         )
         completed = self.command_runner(
@@ -254,8 +409,24 @@ class ClusterInventoryService:
             detail = (completed.stderr or completed.stdout or "unknown error").strip()
             raise RuntimeError(f"scontrol show node failed: {detail}")
         inventory = parse_scontrol_show_node(completed.stdout)
+        sinfo_by_name = {node.name: node for node in sinfo_nodes}
+        merged_nodes: list[ClusterNode] = []
+        for node in inventory.nodes:
+            snapshot = sinfo_by_name.get(node.name)
+            if snapshot is None:
+                continue
+            merged_nodes.append(replace(
+                node,
+                partitions=snapshot.partitions,
+                cpu=min(node.cpu, snapshot.cpu_idle),
+                cpu_total=snapshot.cpu_total,
+                state=snapshot.state,
+            ))
+        if not merged_nodes:
+            raise RuntimeError("sinfo and scontrol reported no common Slurm nodes.")
         return replace(
             inventory,
+            nodes=tuple(merged_nodes),
             partitions=partitions,
             default_partition=default_partition,
         )
@@ -267,5 +438,6 @@ __all__ = [
     "ClusterNode",
     "parse_gpu_gres",
     "parse_sinfo_partitions",
+    "parse_sinfo_nodes",
     "parse_scontrol_show_node",
 ]

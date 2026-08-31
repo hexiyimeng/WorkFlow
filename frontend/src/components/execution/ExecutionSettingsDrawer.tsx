@@ -119,14 +119,13 @@ const FieldError = ({ message }: { message?: string }) => (
   ) : null
 );
 
-type WorkerDraftField = 'cpu' | 'memoryGB' | 'gpu' | 'threads' | 'processes' | 'scale';
+type WorkerDraftField = 'cpu' | 'memoryGB' | 'gpu' | 'processes' | 'scale';
 type WorkerDraftErrors = Partial<Record<WorkerDraftField, string>>;
 
 const WORKER_FIELD_LABELS: Record<WorkerDraftField, string> = {
   cpu: 'CPU / Worker',
   memoryGB: 'Memory / Worker',
   gpu: 'GPU / Worker',
-  threads: 'Threads / Worker',
   processes: 'Processes / Job',
   scale: 'Scale (Slurm Jobs)',
 };
@@ -135,7 +134,6 @@ interface WorkerResourceDraft {
   cpu: string;
   memoryGB: string;
   gpu: string;
-  threads: string;
   processes: string;
   scale: string;
 }
@@ -201,7 +199,6 @@ const WorkerResourcesSection = ({
         cpu: String(profile.physical_resources.cpu),
         memoryGB: memoryAmount(profile.physical_resources.memory),
         gpu: String(profile.physical_resources.gpu),
-        threads: String(profile.threads),
         processes: String(pool.processes),
         scale: String(pool.scale),
       }];
@@ -215,7 +212,7 @@ const WorkerResourcesSection = ({
       ...current,
       [name]: {
         ...(current[name] ?? {
-          cpu: '', memoryGB: '', gpu: '', threads: '', processes: '', scale: '',
+          cpu: '', memoryGB: '', gpu: '', processes: '', scale: '',
         }),
         [field]: value,
       },
@@ -237,15 +234,9 @@ const WorkerResourcesSection = ({
         const cpu = positiveIntegerDraft(draft?.cpu ?? '');
         const memoryGB = positiveNumberDraft(draft?.memoryGB ?? '');
         const gpu = nonnegativeIntegerDraft(draft?.gpu ?? '');
-        const threads = positiveIntegerDraft(draft?.threads ?? '');
         if (cpu === null) errors.cpu = 'Enter a positive whole number.';
         if (memoryGB === null) errors.memoryGB = 'Enter a positive number.';
         if (gpu === null || gpu > 1) errors.gpu = 'Enter 0 or 1.';
-        if (threads === null) {
-          errors.threads = 'Enter a positive whole number.';
-        } else if (cpu !== null && threads > cpu) {
-          errors.threads = 'Threads cannot exceed CPU / Worker.';
-        }
         if (Object.keys(errors).length > 0) nextErrors[profile.name] = errors;
         return synchronizeLogicalResources({
           ...profile,
@@ -254,7 +245,7 @@ const WorkerResourcesSection = ({
             memory: `${memoryGB ?? 0}GB`,
             gpu: gpu ?? 0,
           },
-          threads: threads ?? 0,
+          threads: cpu ?? 0,
         });
       });
       const nextPools = pools.map(pool => {
@@ -317,7 +308,7 @@ const WorkerResourcesSection = ({
       </div>
       {profiles.map(profile => {
         const draft = drafts[profile.name] ?? {
-          cpu: '', memoryGB: '', gpu: '', threads: '', processes: '', scale: '',
+          cpu: '', memoryGB: '', gpu: '', processes: '', scale: '',
         };
         const errors = fieldErrors[profile.name] ?? {};
         const gpuProfile = draft.gpu === '1';
@@ -363,13 +354,12 @@ const WorkerResourcesSection = ({
                   className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
                 <FieldError message={errors.gpu} />
               </label>
-              <label>Threads / Worker
-                <input type="number" min="1" max={draft.cpu || undefined} step="1"
-                  value={draft.threads} aria-invalid={Boolean(errors.threads)}
-                  onChange={event => updateDraft(profile.name, 'threads', event.target.value)}
-                  className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
-                <FieldError message={errors.threads} />
-              </label>
+              <div>Threads / Worker
+                <div className="mt-1 flex h-8 items-center rounded border px-2 font-mono"
+                  style={{ borderColor: 'var(--color-border-subtle)', color: 'var(--color-text-muted)' }}>
+                  {positiveIntegerDraft(draft.cpu) ?? '—'} (derived from CPU / Worker)
+                </div>
+              </div>
               <label>Processes / Job
                 <input type="number" min="1" step="1" value={gpuProfile ? '1' : draft.processes}
                   aria-invalid={Boolean(errors.processes)}

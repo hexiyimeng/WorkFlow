@@ -236,21 +236,6 @@ def _absolute_directory(value: object, *, name: str, create: bool = False) -> Pa
     return resolved
 
 
-def _absolute_regular_file(value: object, *, name: str) -> Path:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{name} must be a non-empty absolute path.")
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        raise ValueError(f"{name} must be an absolute path: {path}")
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError as exc:
-        raise ValueError(f"{name} does not exist: {path}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"{name} must be a regular non-symlink file: {path}")
-    return path.resolve(strict=True)
-
-
 def _safe_command(value: object, *, name: str, default: str) -> str:
     selected = default if value is None or not str(value).strip() else str(value).strip()
     if not _SLURM_SAFE_COMMAND_RE.fullmatch(selected):
@@ -368,7 +353,7 @@ def slurm_policy_from_environment(
     partition = str(env.get("WorkFlow_SLURM_PARTITION", "")).strip()
     allowed_raw = str(env.get("WorkFlow_SLURM_ALLOWED_PARTITIONS", ""))
     allowed = tuple(item.strip() for item in allowed_raw.split(",") if item.strip())
-    excluded_raw = str(env.get("WorkFlow_SLURM_EXCLUDED_PARTITIONS", "control"))
+    excluded_raw = str(env.get("WorkFlow_SLURM_EXCLUDED_PARTITIONS", "mn"))
     excluded = tuple(
         item.strip() for item in excluded_raw.split(",") if item.strip()
     )
@@ -404,7 +389,6 @@ def slurm_policy_from_environment(
 class SlurmRuntimeConfig:
     runtime_directory: Path
     execution_root: Path
-    execution_script: Path
     project_root: Path
     policy: SlurmPolicy
     sbatch_executable: str
@@ -422,6 +406,7 @@ class SlurmRuntimeConfig:
     worker_port_range: str = "20000:20999"
     nanny_port_range: str = "21000:21999"
     worker_start_timeout_seconds: float = 600.0
+    queue_start_timeout_seconds: float = 300.0
 
     def __post_init__(self) -> None:
         worker = tuple(int(item) for item in self.worker_port_range.split(":"))
@@ -456,28 +441,16 @@ class SlurmRuntimeConfig:
         execution_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         execution_root = execution_root.resolve(strict=True)
 
-        execution_script = _absolute_regular_file(
-            env.get("WorkFlow_SLURM_EXECUTION_SCRIPT"),
-            name="WorkFlow_SLURM_EXECUTION_SCRIPT",
-        )
-        if execution_script.name != "workflow_workers.sbatch":
-            raise ValueError(
-                "WorkFlow_SLURM_EXECUTION_SCRIPT must select the Worker-only "
-                "workflow_workers.sbatch launcher; compute-node graph runners "
-                "are no longer supported."
-            )
-        # <checkout>/deploy/hpc/slurm/workflow_workers.sbatch
-        project_root = execution_script.parents[3]
+        project_root = Path(__file__).resolve().parents[2]
         if not (project_root / "backend" / "main.py").is_file():
             raise ValueError(
-                "WorkFlow_SLURM_EXECUTION_SCRIPT is not inside a WorkFlow checkout."
+                "Slurm execution service is not inside a WorkFlow checkout."
             )
 
         policy = slurm_policy_from_environment(env)
         return cls(
             runtime_directory=runtime,
             execution_root=execution_root,
-            execution_script=execution_script,
             project_root=project_root,
             policy=policy,
             sbatch_executable=_safe_command(
@@ -549,6 +522,9 @@ class SlurmRuntimeConfig:
             ),
             worker_start_timeout_seconds=_env_positive_float(
                 env, "WorkFlow_DASK_CLUSTER_START_TIMEOUT_SECONDS", 600.0
+            ),
+            queue_start_timeout_seconds=_env_positive_float(
+                env, "WorkFlow_SLURM_QUEUE_START_TIMEOUT_SECONDS", 300.0
             ),
         )
 
@@ -813,35 +789,6 @@ def _worker_job_request(
         partition=job.partition,
         node_names=(job.node,),
     )
-
-
-def _worker_job_launcher_plan(
-    plan: SlurmAllocationPlan,
-    job: SlurmJobRequirement,
-) -> dict[str, object]:
-    """Return the exact one-job slice consumed by one compute-node launcher."""
-
-    return {
-        "partition": job.partition,
-        "partitions": [job.partition],
-        "timeLimit": plan.time_limit,
-        "requiredWorkerProfiles": dict(plan.required_worker_profiles),
-        "workerCounts": {job.profile: job.workers},
-        "totalWorkers": job.workers,
-        "totalCpu": job.cpu,
-        "totalGpu": job.gpu,
-        "totalMemoryGiB": job.memory_gib,
-        "jobs": [job.to_dict()],
-        "nodes": [{
-            "node": job.node,
-            "partition": job.partition,
-            "workers": {job.profile: job.workers},
-            "cpu": job.cpu,
-            "memoryGiB": job.memory_gib,
-            "gpu": job.gpu,
-            "jobs": [job.allocation_id],
-        }],
-    }
 
 
 def _apply_external_event(execution_id: str, event: Mapping[str, Any]) -> None:
@@ -2129,14 +2076,21 @@ class SlurmExecutionService:
     ) -> None:
         """Wait for Slurm scheduling without consuming Worker startup time.
 
-        Multi-node allocations may remain PENDING for substantially longer
-        than Dask Worker process startup.  The registration timeout starts
-        only after the allocation enters a running/configuring state; queue
-        time is governed by the Slurm job time/policy and remains cancellable.
+        The Dask registration timeout starts only after every allocation is
+        running.  Queue wait has its own bound so a partially runnable set is
+        cancelled instead of retaining resources indefinitely.
         """
 
         last_state: tuple[str, str, str] | None = None
+        deadline = time.monotonic() + config.queue_start_timeout_seconds
         while True:
+            if time.monotonic() >= deadline:
+                raise SlurmSubmissionError(
+                    "The complete Worker allocation did not become runnable "
+                    f"within {config.queue_start_timeout_seconds:g} seconds. "
+                    "The execution is being rolled back so partial Worker Jobs "
+                    "do not retain cluster resources."
+                )
             query_ok, queue_state = await self._query_queue_state(
                 config,
                 job_id,
@@ -2316,8 +2270,10 @@ class SlurmExecutionService:
                     "the busiest compute node."
                 )
         code_revision = await asyncio.to_thread(_git_revision, config.project_root)
-        security_payload = self._worker_security_payload(config)
-
+        # Standard SLURMJob Worker commands receive these paths directly from
+        # dask-jobqueue; validate that compute nodes can read them before any
+        # Scheduler or Job is created.
+        self._worker_security_payload(config)
         run_directory = resolve_execution_directory(
             config.execution_root, execution_id
         )
@@ -2405,20 +2361,6 @@ class SlurmExecutionService:
             )
             scheduler_started = True
             scheduler_address = str(client.scheduler.address)
-            request_payload_base = {
-                "schemaVersion": REQUEST_SCHEMA_VERSION,
-                "executionId": execution_id,
-                "codeRevision": code_revision,
-                "schedulerAddress": scheduler_address,
-                "runtimeDirectory": str(config.runtime_directory),
-                "security": security_payload,
-                "allowInsecure": security_payload is None,
-                "networkInterface": (
-                    os.getenv("WorkFlow_DASK_INTERFACE", "").strip() or None
-                ),
-                "workerPortRange": config.worker_port_range,
-                "nannyPortRange": config.nanny_port_range,
-            }
             _atomic_write_json(job_path, {
                 "schemaVersion": JOB_SCHEMA_VERSION,
                 "executionId": execution_id,
@@ -2445,22 +2387,13 @@ class SlurmExecutionService:
                 config.policy.validate_request(job_request)
                 job_requests[planned_job.allocation_id] = job_request
                 submission_token = f"{submission_token_prefix}:{job_index}"
-                request_path = run_directory / f"worker-{planned_job.allocation_id}.json"
-                _atomic_write_json(request_path, {
-                    **request_payload_base,
-                    "submissionToken": submission_token,
-                    "allocationPlan": _worker_job_launcher_plan(
-                        allocation_plan, planned_job
-                    ),
-                })
                 planned_specs.append(build_planned_slurm_worker_spec(
                     allocation_plan,
                     planned_job,
                     execution_id=execution_id,
                     submission_token=submission_token,
-                    request_path=request_path,
-                    launcher_script=config.execution_script,
                     project_root=config.project_root,
+                    runtime_directory=config.runtime_directory,
                     run_directory=run_directory,
                     python_executable=(
                         config.project_root / "backend" / ".venv" / "bin" / "python"
@@ -2470,6 +2403,8 @@ class SlurmExecutionService:
                     interface=interface,
                     protocol=protocol,
                     security=client.security,
+                    worker_port_range=config.worker_port_range,
+                    nanny_port_range=config.nanny_port_range,
                 ))
 
             _atomic_write_json(job_path, {
@@ -2539,17 +2474,27 @@ class SlurmExecutionService:
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
             # Queue time does not consume the bounded Dask registration clock.
-            await asyncio.gather(*(
-                self._wait_for_worker_allocation_running(
+            # All waits are one logical allocation: if any member fails or
+            # times out, stop its sibling waits and let the outer cleanup
+            # barrier scale the complete SLURMCluster back to zero.
+            allocation_waits = [
+                asyncio.create_task(self._wait_for_worker_allocation_running(
                     config=config,
                     execution_id=execution_id,
                     job_id=job_id,
                     cluster=cluster_name,
                     submission_token=token,
                     resource_request=job_request,
-                )
+                ))
                 for job_id, cluster_name, token, job_request in submitted_jobs
-            ))
+            ]
+            try:
+                await asyncio.gather(*allocation_waits)
+            except BaseException:
+                for wait in allocation_waits:
+                    wait.cancel()
+                await asyncio.gather(*allocation_waits, return_exceptions=True)
+                raise
             await asyncio.to_thread(
                 dask_service.activate_external_worker_profiles,
                 expected_profiles=allocation_plan.worker_counts,

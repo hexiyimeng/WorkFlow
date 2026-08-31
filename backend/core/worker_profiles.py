@@ -139,8 +139,11 @@ class WorkerProfile:
         if not isinstance(self.physical_resources, PhysicalResources):
             raise ValueError("physical_resources must be PhysicalResources.")
         threads = _positive_integer(self.threads, name="threads")
-        if threads > self.physical_resources.cpu:
-            raise ValueError("threads must not exceed physical_resources.cpu.")
+        if threads != self.physical_resources.cpu:
+            raise ValueError(
+                "threads must equal physical_resources.cpu under the strict "
+                "SLURMCluster cores/processes model."
+            )
         logical = _logical_resources(
             self.logical_resources,
             profile_name=name,
@@ -201,7 +204,10 @@ class WorkerProfile:
                 profile_name=name,
                 physical=physical,
             ),
-            threads=_positive_integer(value.get("threads", 1), name=f"{name}.threads"),
+            # Threads are derived from CPU / Worker. Accepting an independent
+            # value would conflict with SLURMCluster's
+            # nthreads = cores / processes contract.
+            threads=physical.cpu,
         )
 
 

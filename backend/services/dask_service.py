@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import hashlib
 import math
-import operator
 import os
 import asyncio
 import threading
@@ -18,9 +17,9 @@ from dask.distributed import Client, Nanny, Scheduler, Security, SpecCluster
 from distributed import WorkerPlugin, get_worker
 from distributed.core import Status
 
-from core.config import _get_system_memory_gb, _is_main_process, config
+from core.config import _is_main_process, config
 from core.logger import logger
-from core.platform import current_platform, dask_spill_dir, should_schedule_malloc_trim
+from core.platform import dask_spill_dir, should_schedule_malloc_trim
 from core.worker_pool import WorkerPool
 from core.worker_profiles import WorkerProfile, worker_logical_resources
 
@@ -28,23 +27,13 @@ from core.worker_profiles import WorkerProfile, worker_logical_resources
 CPU_RESOURCE_NAME = "CPU"
 GPU_RESOURCE_NAME = "GPU"
 
-# ``build_local_cluster_specs`` is deliberately a same-host cluster: the
+# The local Worker Profile cluster is deliberately same-host: the
 # Driver, Scheduler, Nannies, and Workers all live in one desktop process tree
 # (or in one single-node Slurm allocation).  Advertising a physical NIC here
 # makes a Windows Driver hairpin through firewall/VPN/RDP network policy merely
 # to reach its own Scheduler.  That became unreliable as the number of Nanny
 # connections grew.  Loopback is the only address these local processes need.
 LOCAL_CLUSTER_HOST = "127.0.0.1"
-
-# GPU inference Workers retain model state and large native/PyTorch workspaces
-# that Dask cannot spill.  Give them a larger share of the same bounded host
-# memory budget instead of dividing that budget equally with lightweight CPU
-# orchestration/writer Workers.  The weighted limits still add up to at most
-# 70% of physical host memory when no explicit per-role override is configured.
-CPU_WORKER_HOST_MEMORY_WEIGHT = 1.0
-GPU_WORKER_HOST_MEMORY_WEIGHT = 3.0
-AUTO_WORKER_MEMORY_BUDGET_FRACTION = 0.70
-
 
 @dataclass(frozen=True)
 class ClusterResourceSummary:
@@ -91,21 +80,6 @@ class WorkflowClient(Client):
             raise
 
 
-def _normalize_worker_count(value: object, *, name: str) -> int:
-    """Return a non-negative integral Worker count."""
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
-    try:
-        count = int(operator.index(value))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            f"{name} must be a non-negative integer, got {value!r}."
-        ) from exc
-    if count < 0:
-        raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
-    return count
-
-
 def _positive_timeout_from_env(name: str, default: float) -> float:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -116,6 +90,14 @@ def _positive_timeout_from_env(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a positive number, got {raw_value!r}.") from exc
     if value <= 0:
         raise ValueError(f"{name} must be a positive number, got {raw_value!r}.")
+    return value
+
+
+def _nonnegative_worker_count(value: object, *, name: str) -> int:
+    """Validate exact planned Worker counts without accepting bool/float coercion."""
+
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
     return value
 
 
@@ -282,7 +264,7 @@ def resolve_gpu_worker_ids(
     *,
     detected_gpu_count: int,
     configured_gpu_ids: tuple[str, ...] | None,
-    configured_gpu_workers: int | None,
+    requested_gpu_workers: int | None,
     parent_cuda_visible_devices: str | None,
 ) -> tuple[str, ...]:
     """Resolve the physical identifiers assigned to individual GPU Workers.
@@ -293,8 +275,8 @@ def resolve_gpu_worker_ids(
     """
     if detected_gpu_count < 0:
         raise ValueError("detected_gpu_count must be non-negative.")
-    if configured_gpu_workers is not None and configured_gpu_workers < 0:
-        raise ValueError("WorkFlow_GPU_WORKERS must be a non-negative integer.")
+    if requested_gpu_workers is not None and requested_gpu_workers < 0:
+        raise ValueError("The Worker Pool GPU count must be non-negative.")
 
     if parent_cuda_visible_devices is None:
         available_ids = tuple(str(index) for index in range(detected_gpu_count))
@@ -325,10 +307,10 @@ def resolve_gpu_worker_ids(
                 f"process: {unavailable!r}. Available devices are {available_ids!r}."
             )
 
-    worker_count = len(selected_ids) if configured_gpu_workers is None else configured_gpu_workers
+    worker_count = len(selected_ids) if requested_gpu_workers is None else requested_gpu_workers
     if worker_count > len(selected_ids):
         raise ValueError(
-            "WorkFlow_GPU_WORKERS cannot exceed the number of selected visible GPUs "
+            "The Worker Pool GPU count cannot exceed the number of selected visible GPUs "
             f"({worker_count} requested, {len(selected_ids)} available)."
         )
     return selected_ids[:worker_count]
@@ -360,76 +342,6 @@ def _get_dask_memory_thresholds() -> dict[str, float]:
             else:
                 logger.debug(message)
     return result
-
-
-def _compute_worker_memory_limit(
-    n_workers: int | None = None,
-    *,
-    configured_limit_gb: float | None = None,
-    allocation_weight: float = 1.0,
-    total_allocation_weight: float | None = None,
-) -> str:
-    """Compute one Worker's bounded share of host memory.
-
-    ``_get_system_memory_gb`` returns binary GiB.  Explicit ``*_GB`` settings
-    retain their historical decimal-GB contract, while automatically computed
-    limits use the matching ``GiB`` unit.
-    """
-    worker_count = max(1, int(n_workers or config.N_WORKERS or 1))
-    explicit_limit = (
-        config.WORKER_MEMORY_LIMIT_GB
-        if configured_limit_gb is None
-        else configured_limit_gb
-    )
-    if explicit_limit > 0:
-        return f"{explicit_limit:.1f}GB"
-
-    try:
-        weight = float(allocation_weight)
-        total_weight = float(
-            worker_count
-            if total_allocation_weight is None
-            else total_allocation_weight
-        )
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("Worker memory allocation weights must be positive numbers.") from exc
-    if (
-        not math.isfinite(weight)
-        or not math.isfinite(total_weight)
-        or weight <= 0
-        or total_weight <= 0
-    ):
-        raise ValueError("Worker memory allocation weights must be positive numbers.")
-
-    system_memory_gb = _get_system_memory_gb()
-    if system_memory_gb is None:
-        logger.warning(
-            "[Dask] Could not detect system memory; using memory_limit=auto. "
-            "Set a CPU/GPU worker memory limit to override."
-        )
-        return "auto"
-
-    per_worker_gib = (
-        system_memory_gb
-        * AUTO_WORKER_MEMORY_BUDGET_FRACTION
-        * weight
-        / total_weight
-    )
-    if per_worker_gib <= 0:
-        return "auto"
-
-    # Round down so the sum of all automatically assigned limits never grows
-    # beyond the configured fraction merely because of display precision.
-    rounded_down_gib = math.floor(per_worker_gib * 10.0) / 10.0
-    if rounded_down_gib <= 0:
-        rounded_down_mib = math.floor(per_worker_gib * 1024.0)
-        if rounded_down_mib > 0:
-            return f"{rounded_down_mib}MiB"
-        rounded_down_bytes = math.floor(per_worker_gib * (1024.0 ** 3))
-        if rounded_down_bytes > 0:
-            return f"{rounded_down_bytes}B"
-        return "auto"
-    return f"{rounded_down_gib:.1f}GiB"
 
 
 def _get_dask_local_dir() -> str:
@@ -608,87 +520,6 @@ def _schedule_malloc_trim_on_scheduler(dask_scheduler: Any) -> None:
     dask_scheduler.loop.call_later(60, _malloc_trim_once)
 
 
-def build_local_cluster_specs(
-    *,
-    cpu_workers: int,
-    gpu_ids: tuple[str, ...],
-    cpu_memory_limit: str,
-    gpu_memory_limit: str,
-    local_directory: str,
-    dashboard_address: str,
-    worker_start_timeout: float | None = None,
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """Build one Scheduler spec and a strict heterogeneous Worker spec."""
-    if cpu_workers < 0:
-        raise ValueError("CPU Worker count must be non-negative.")
-    if cpu_workers == 0 and not gpu_ids:
-        raise ValueError("At least one CPU or GPU Worker must be configured.")
-
-    scheduler_spec: dict[str, Any] = {
-        "cls": Scheduler,
-        "options": {
-            "host": LOCAL_CLUSTER_HOST,
-            "dashboard_address": dashboard_address,
-        },
-    }
-    worker_specs: dict[str, dict[str, Any]] = {}
-
-    for index in range(cpu_workers):
-        worker_specs[f"cpu-{index}"] = {
-            "cls": Nanny,
-            "options": {
-                "host": LOCAL_CLUSTER_HOST,
-                "nthreads": 1,
-                "resources": {CPU_RESOURCE_NAME: 1},
-                "env": {
-                    "WORKFLOW_WORKER_ROLE": "cpu",
-                    "WORKFLOW_DASK_WORKER_PROCESS": "1",
-                    "CUDA_VISIBLE_DEVICES": "",
-                },
-                "memory_limit": cpu_memory_limit,
-                "local_directory": local_directory,
-                "silence_logs": logging.WARNING,
-                "plugins": (WorkerDevicePlugin(),),
-                "startup_information": {
-                    "workflowDevice": worker_device_startup_information,
-                },
-            },
-        }
-
-    for index, physical_gpu_id in enumerate(gpu_ids):
-        worker_specs[f"gpu-{index}"] = {
-            "cls": Nanny,
-            "options": {
-                "host": LOCAL_CLUSTER_HOST,
-                "nthreads": 1,
-                "resources": {GPU_RESOURCE_NAME: 1},
-                "env": {
-                    "WORKFLOW_WORKER_ROLE": "gpu",
-                    "WORKFLOW_DASK_WORKER_PROCESS": "1",
-                    "WORKFLOW_PHYSICAL_GPU_ID": physical_gpu_id,
-                    "CUDA_VISIBLE_DEVICES": physical_gpu_id,
-                },
-                "memory_limit": gpu_memory_limit,
-                "local_directory": local_directory,
-                "silence_logs": logging.WARNING,
-                "plugins": (WorkerDevicePlugin(),),
-                "startup_information": {
-                    "workflowDevice": worker_device_startup_information,
-                },
-            },
-        }
-
-    if worker_start_timeout is not None:
-        if worker_start_timeout <= 0:
-            raise ValueError("worker_start_timeout must be positive when provided.")
-        # Bound each Nanny in a Worker-start batch independently from the
-        # longer, whole-cluster startup deadline.  Without this, one stuck
-        # Nanny can block its batch forever.
-        for worker_spec in worker_specs.values():
-            worker_spec["options"]["death_timeout"] = worker_start_timeout
-    return scheduler_spec, worker_specs
-
-
 def build_local_profile_cluster_specs(
     *,
     profiles: Mapping[str, WorkerProfile],
@@ -830,37 +661,6 @@ def _exception_cause_chain(error: BaseException) -> tuple[dict[str, str], ...]:
         })
         current = current.__cause__ or current.__context__
     return tuple(result)
-
-
-def _cluster_startup_diagnostics(cluster: Any) -> dict[str, object]:
-    workers = dict(getattr(cluster, "workers", {}) or {})
-    pending = dict(
-        getattr(cluster, "_workflow_pending_worker_starts", {}) or {}
-    )
-    known_ids = {id(nanny) for nanny in workers.values()}
-    known_ids.update(id(nanny) for nanny, _task in pending.values())
-    created_only = [
-        nanny
-        for nanny in tuple(getattr(cluster, "_created", ()) or ())
-        if id(nanny) not in known_ids
-    ]
-    return {
-        "workers": {
-            str(name): _nanny_startup_diagnostic(nanny)
-            for name, nanny in workers.items()
-        },
-        "pending": {
-            str(name): {
-                **_nanny_startup_diagnostic(nanny),
-                "taskDone": bool(start_task.done()),
-                "taskCancelled": bool(start_task.cancelled()),
-            }
-            for name, (nanny, start_task) in pending.items()
-        },
-        "createdOnly": [
-            _nanny_startup_diagnostic(nanny) for nanny in created_only
-        ],
-    }
 
 
 _TERMINAL_NANNY_STATUSES = frozenset({Status.closed, Status.failed})
@@ -1467,11 +1267,7 @@ class DaskService:
     _instance: DaskService | None = None
     client: Client | None = None
     cluster: SpecCluster | None = None
-    active_cpu_workers: int = 0
-    active_gpu_workers: int = 0
-    active_gpu_ids: tuple[str, ...] = ()
     active_worker_profile_topology: tuple[tuple[object, ...], ...] = ()
-    _cluster_poisoned: bool = False
     _external_workers: bool = False
     _cluster_lock = threading.RLock()
 
@@ -1487,158 +1283,12 @@ class DaskService:
         # isolation validation.
         return self.client
 
-    def ensure_client(
-        self,
-        *,
-        cpu_workers: int | None = None,
-        gpu_workers: int | None = None,
-    ) -> Client:
-        """Return a service-owned client sized for the requested topology."""
+    def require_active_client(self) -> Client:
+        """Return the service-owned Client for an already provisioned runtime."""
         with self._cluster_lock:
-            if self._external_workers:
-                if self.client is None:
-                    raise RuntimeError(
-                        "The external Dask runtime has no live Driver Client."
-                    )
-                if cpu_workers is None and gpu_workers is None:
-                    return self.client
-                expected_cpu = _normalize_worker_count(
-                    0 if cpu_workers is None else cpu_workers,
-                    name="cpu_workers",
-                )
-                expected_gpu = _normalize_worker_count(
-                    0 if gpu_workers is None else gpu_workers,
-                    name="gpu_workers",
-                )
-                if (
-                    self.active_cpu_workers != expected_cpu
-                    or self.active_gpu_workers != expected_gpu
-                ):
-                    raise RuntimeError(
-                        "The externally provisioned Slurm Worker topology does "
-                        "not match the Graph resource plan: "
-                        f"active CPU/GPU={self.active_cpu_workers}/"
-                        f"{self.active_gpu_workers}, requested={expected_cpu}/"
-                        f"{expected_gpu}."
-                    )
-                self._wait_for_stable_topology(
-                    expected_cpu_workers=expected_cpu,
-                    expected_gpu_workers=expected_gpu,
-                    expected_gpu_ids=None,
-                    expected_total_workers=expected_cpu + expected_gpu,
-                    deadline=time.monotonic() + _cluster_start_timeout(),
-                    client=self.client,
-                )
-                return self.client
             if self.client is None:
-                try:
-                    Client.current()
-                except Exception as exc:
-                    logger.debug(
-                        "[Dask] No current client before local startup: %s",
-                        exc,
-                    )
-                else:
-                    raise RuntimeError(
-                        "An unmanaged Dask Client is already current. WorkFlow will "
-                        "not adopt a cluster that has not passed strict Worker role "
-                        "and CUDA visibility-isolation validation."
-                    )
-
-            return self.start_cluster(
-                cpu_workers=cpu_workers,
-                gpu_workers=gpu_workers,
-            )
-
-    def start_external_scheduler(
-        self,
-        *,
-        host: str,
-        port: int = 0,
-        dashboard_address: str | None = None,
-    ) -> Client:
-        """Start a service-node Scheduler/Client with no local Workers.
-
-        Slurm Worker launchers connect to the returned Scheduler address from
-        one or more compute nodes.  This path deliberately performs no CUDA
-        detection on the service node.
-        """
-        if not isinstance(host, str) or not host.strip():
-            raise ValueError("External Dask Scheduler host must be non-empty.")
-        if type(port) is not int or port < 0 or port > 65535:
-            raise ValueError("External Dask Scheduler port must be 0..65535.")
-        with self._cluster_lock:
-            if self.client is not None or self.cluster is not None:
-                raise RuntimeError(
-                    "A Dask runtime is already active; it must be stopped before "
-                    "starting an external Slurm Worker allocation."
-                )
-            if dashboard_address not in (None, ""):
-                raise ValueError(
-                    "The cross-node Scheduler dashboard must remain disabled; "
-                    "use the WorkFlow execution UI instead."
-                )
-            security, _security_paths = _external_cluster_security_from_environment()
-            scheduler_spec = {
-                "cls": Scheduler,
-                "options": {
-                    "host": host.strip(),
-                    "port": port,
-                    # The Scheduler protocol listens on the configured
-                    # compute-facing host.  Do not expose the unauthenticated
-                    # Bokeh dashboard on that interface; the application UI
-                    # already relays execution state over its loopback HTTP
-                    # service.
-                    "dashboard": False,
-                    "dashboard_address": None,
-                    "security": security,
-                },
-            }
-            cluster: SpecCluster | None = None
-            client: WorkflowClient | None = None
-            try:
-                cluster = SpecCluster(
-                    scheduler=scheduler_spec,
-                    workers={},
-                    security=security,
-                    asynchronous=False,
-                    name="WorkFlow-Slurm-Driver",
-                )
-                client = WorkflowClient(
-                    cluster.scheduler_address,
-                    security=cluster.security,
-                    timeout=min(60.0, _cluster_start_timeout()),
-                    set_as_default=True,
-                )
-            except BaseException:
-                if client is not None:
-                    try:
-                        client.close(timeout=5.0)
-                    except Exception:
-                        logger.exception(
-                            "[Dask] Failed to close external Driver Client after startup failure."
-                        )
-                if cluster is not None:
-                    try:
-                        cluster.close(timeout=10.0)
-                    except Exception:
-                        logger.exception(
-                            "[Dask] Failed to close external Scheduler after startup failure."
-                        )
-                raise
-
-            self.cluster = cluster
-            self.client = client
-            self.active_cpu_workers = 0
-            self.active_gpu_workers = 0
-            self.active_gpu_ids = ()
-            self._external_workers = True
-            self._cluster_poisoned = False
-            logger.info(
-                "[Dask] Service-node Driver Scheduler ready for Slurm Workers: %s",
-                cluster.scheduler_address,
-            )
-            return client
+                raise RuntimeError("The Dask runtime has no live Driver Client.")
+            return self.client
 
     def start_slurm_jobqueue_scheduler(
         self,
@@ -1653,8 +1303,8 @@ class DaskService:
     ) -> Client:
         """Start one service-node Scheduler owned by ``SLURMCluster``.
 
-        Worker specs are added separately after their immutable launcher
-        requests contain this Scheduler's address.
+        Worker specs are added separately after Resource Planner validation.
+        Each spec remains a standard dask-jobqueue ``SLURMJob``.
         """
 
         from services.slurm_jobqueue_cluster import PlannedSLURMCluster
@@ -1679,7 +1329,7 @@ class DaskService:
                     cores=template_job.cpu,
                     memory=f"{template_job.memory_gib}GiB",
                     processes=template_job.processes,
-                    nanny=False,
+                    nanny=True,
                     walltime=time_limit,
                     job_cpu=template_job.cpu,
                     job_mem=f"{template_job.memory_gib}G",
@@ -1722,11 +1372,7 @@ class DaskService:
 
             self.cluster = cluster
             self.client = client
-            self.active_cpu_workers = 0
-            self.active_gpu_workers = 0
-            self.active_gpu_ids = ()
             self._external_workers = True
-            self._cluster_poisoned = False
             logger.info(
                 "[Dask] Planner-aware SLURMCluster Scheduler ready: %s",
                 cluster.scheduler_address,
@@ -1772,88 +1418,6 @@ class DaskService:
             return ()
         return tuple(records())
 
-    def activate_external_workers(
-        self,
-        *,
-        cpu_workers: int,
-        gpu_workers: int,
-        timeout: float,
-        execution_id: str | None = None,
-        submission_token: str | None = None,
-        submission_tokens: Sequence[str] | None = None,
-    ) -> ClusterResourceSummary:
-        """Validate and publish an exact externally launched Worker topology."""
-        expected_cpu = _normalize_worker_count(cpu_workers, name="cpu_workers")
-        expected_gpu = _normalize_worker_count(gpu_workers, name="gpu_workers")
-        if expected_cpu + expected_gpu <= 0:
-            raise ValueError("At least one external Worker must be requested.")
-        if timeout <= 0:
-            raise ValueError("External Worker startup timeout must be positive.")
-        # Do not hold the service-wide lifecycle lock while waiting for a
-        # queued multi-node allocation to register.  Cancellation cannot stop
-        # a synchronous distributed RPC running in ``to_thread``; holding the
-        # lock here would therefore prevent ``stop_cluster`` from closing the
-        # Client/Scheduler and issuing the authoritative Slurm cleanup.
-        with self._cluster_lock:
-            if not self._external_workers or self.client is None:
-                raise RuntimeError("No external Slurm Dask runtime is active.")
-            active_client = self.client
-
-        summary = self._wait_for_stable_topology(
-            expected_cpu_workers=expected_cpu,
-            expected_gpu_workers=expected_gpu,
-            expected_gpu_ids=None,
-            expected_total_workers=expected_cpu + expected_gpu,
-            deadline=time.monotonic() + timeout,
-            client=active_client,
-        )
-        diagnostics = self.get_worker_diagnostics(active_client)
-        if execution_id is not None:
-            token_hash = (
-                hashlib.sha256(submission_token.encode("utf-8")).hexdigest()
-                if submission_token is not None
-                else None
-            )
-            ownership_errors = []
-            for address, item in diagnostics.items():
-                if item.get("executionId") != execution_id:
-                    ownership_errors.append(
-                        f"{address} executionId={item.get('executionId')!r}"
-                    )
-                if token_hash is not None and item.get("submissionTokenHash") != token_hash:
-                    ownership_errors.append(
-                        f"{address} submission token does not match"
-                    )
-            if ownership_errors:
-                raise RuntimeError(
-                    "External Dask Workers failed execution ownership "
-                    "validation: " + "; ".join(ownership_errors)
-                )
-        gpu_ids = tuple(sorted(
-            str(item.get("physicalGpuId"))
-            for item in diagnostics.values()
-            if item.get("workerRole") == "gpu"
-        ))
-
-        with self._cluster_lock:
-            if not self._external_workers or self.client is not active_client:
-                raise RuntimeError(
-                    "The external Dask runtime was stopped while Workers were "
-                    "registering."
-                )
-            self.active_cpu_workers = expected_cpu
-            self.active_gpu_workers = expected_gpu
-            self.active_gpu_ids = gpu_ids
-            logger.info(
-                "[Dask] External Slurm Worker topology validated: CPU=%s GPU=%s "
-                "devices=%s Scheduler=%s",
-                expected_cpu,
-                expected_gpu,
-                gpu_ids,
-                summary.scheduler_address,
-            )
-            return summary
-
     def activate_external_worker_profiles(
         self,
         *,
@@ -1869,7 +1433,7 @@ class DaskService:
         for name, count in expected_profiles.items():
             if not isinstance(name, str) or not name:
                 raise ValueError("Worker Profile names must be non-empty strings.")
-            normalized[name] = _normalize_worker_count(
+            normalized[name] = _nonnegative_worker_count(
                 count, name=f"expected_profiles[{name!r}]"
             )
         expected_total = sum(normalized.values())
@@ -1990,6 +1554,7 @@ class DaskService:
             name: selected_pools[name].worker_count for name in selected_profiles
         }
 
+        _cleanup_failed_workflow_clients()
         with self._cluster_lock:
             if self._external_workers:
                 if self.client is None:
@@ -2017,7 +1582,7 @@ class DaskService:
                 gpu_ids = resolve_gpu_worker_ids(
                     detected_gpu_count=detected_gpu_count,
                     configured_gpu_ids=config.GPU_IDS,
-                    configured_gpu_workers=gpu_count,
+                    requested_gpu_workers=gpu_count,
                     parent_cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
                 )
             else:
@@ -2090,441 +1655,7 @@ class DaskService:
             self.cluster = cluster
             self.client = client
             self.active_worker_profile_topology = topology
-            self.active_cpu_workers = sum(
-                count for name, count in expected_counts.items()
-                if selected_profiles[name].physical_resources.gpu == 0
-            )
-            self.active_gpu_workers = gpu_count
-            self.active_gpu_ids = gpu_ids
-            self._cluster_poisoned = False
             return client
-
-    def start_cluster(
-        self,
-        *,
-        cpu_workers: int | None = None,
-        gpu_workers: int | None = None,
-    ) -> Client:
-        """Start or reuse one mixed cluster with the requested Worker counts.
-
-        Explicit counts come from the execution resource plan and take
-        precedence over the process-wide ``WorkFlow_*_WORKERS`` settings.
-        Omitting both arguments preserves the former configuration-driven API.
-        """
-        with self._cluster_lock:
-            _cleanup_failed_workflow_clients()
-            if self._cluster_poisoned:
-                logger.warning(
-                    "[Dask] Retrying cleanup of a previously poisoned local cluster."
-                )
-                self.stop_cluster()
-            startup_started = time.monotonic()
-            startup_timeout = _cluster_start_timeout()
-            startup_deadline = startup_started + startup_timeout
-            requested_cpu_workers = _normalize_worker_count(
-                config.CPU_WORKERS if cpu_workers is None else cpu_workers,
-                name=(
-                    "WorkFlow_CPU_WORKERS"
-                    if cpu_workers is None
-                    else "cpu_workers"
-                ),
-            )
-            requested_gpu_workers = (
-                config.GPU_WORKERS if gpu_workers is None else gpu_workers
-            )
-            if requested_gpu_workers is not None:
-                requested_gpu_workers = _normalize_worker_count(
-                    requested_gpu_workers,
-                    name=(
-                        "WorkFlow_GPU_WORKERS"
-                        if gpu_workers is None
-                        else "gpu_workers"
-                    ),
-                )
-
-            if requested_gpu_workers == 0:
-                gpu_ids: tuple[str, ...] = ()
-            else:
-                has_gpu, detected_gpu_count = _detect_cuda_for_cluster()
-                if not has_gpu:
-                    detected_gpu_count = 0
-                try:
-                    gpu_ids = resolve_gpu_worker_ids(
-                        detected_gpu_count=detected_gpu_count,
-                        configured_gpu_ids=config.GPU_IDS,
-                        configured_gpu_workers=requested_gpu_workers,
-                        parent_cuda_visible_devices=os.environ.get(
-                            "CUDA_VISIBLE_DEVICES"
-                        ),
-                    )
-                except ValueError as exc:
-                    if requested_gpu_workers:
-                        raise RuntimeError(
-                            "The workflow requires "
-                            f"{requested_gpu_workers} GPU Worker(s), but they "
-                            f"cannot be provisioned: {exc} "
-                            "CPU fallback is not supported."
-                        ) from exc
-                    raise
-
-            total_workers = requested_cpu_workers + len(gpu_ids)
-            if total_workers <= 0:
-                raise ValueError("At least one CPU or GPU Worker must be configured.")
-            # Parse startup policy before creating any Scheduler or Client so a
-            # bad deployment value has no process or socket side effects.
-            batch_size = _worker_start_batch_size(total_workers)
-            worker_batch_timeout = _worker_batch_start_timeout()
-            worker_registration_timeout = _worker_registration_timeout()
-
-            desired_topology = (
-                requested_cpu_workers,
-                len(gpu_ids),
-                gpu_ids,
-            )
-            if self.client is not None:
-                try:
-                    scheduler_summary = cluster_resource_summary_from_scheduler_info(
-                        get_fresh_scheduler_info(
-                            self.client,
-                            timeout=_remaining_startup_time(
-                                startup_deadline,
-                                stage="querying the existing Scheduler",
-                            ),
-                        )
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "[Dask] Existing client is unavailable; restarting: %s",
-                        exc,
-                    )
-                    self.stop_cluster()
-                else:
-                    active_topology = (
-                        self.active_cpu_workers,
-                        self.active_gpu_workers,
-                        self.active_gpu_ids,
-                    )
-                    scheduler_topology_matches = (
-                        len(scheduler_summary.cpu_workers)
-                        == requested_cpu_workers
-                        and len(scheduler_summary.gpu_workers) == len(gpu_ids)
-                        and scheduler_summary.total_cpu_slots
-                        == float(requested_cpu_workers)
-                        and scheduler_summary.total_gpu_slots
-                        == float(len(gpu_ids))
-                    )
-                    if (
-                        active_topology == desired_topology
-                        and scheduler_topology_matches
-                    ):
-                        try:
-                            self._wait_for_stable_topology(
-                                expected_cpu_workers=requested_cpu_workers,
-                                expected_gpu_workers=len(gpu_ids),
-                                expected_gpu_ids=gpu_ids,
-                                expected_total_workers=total_workers,
-                                deadline=startup_deadline,
-                                client=self.client,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "[Dask] Existing topology validation failed; "
-                                "restarting: %s",
-                                exc,
-                            )
-                            self.stop_cluster()
-                        else:
-                            return self.client
-                    else:
-                        logger.info(
-                            "[Dask] Rebuilding cluster for topology change: "
-                            "cpu=%s gpu=%s ids=%s -> cpu=%s gpu=%s ids=%s",
-                            self.active_cpu_workers,
-                            self.active_gpu_workers,
-                            self.active_gpu_ids,
-                            requested_cpu_workers,
-                            len(gpu_ids),
-                            gpu_ids,
-                        )
-                        self.stop_cluster()
-
-            local_directory = _get_dask_local_dir()
-            total_memory_weight = (
-                requested_cpu_workers * CPU_WORKER_HOST_MEMORY_WEIGHT
-                + len(gpu_ids) * GPU_WORKER_HOST_MEMORY_WEIGHT
-            )
-            if total_memory_weight <= 0:
-                # The topology validation above already rejects zero Workers;
-                # retain a defensive denominator for direct/unit-test callers.
-                total_memory_weight = 1.0
-            cpu_memory_limit = _compute_worker_memory_limit(
-                total_workers,
-                configured_limit_gb=config.CPU_WORKER_MEMORY_LIMIT_GB,
-                allocation_weight=CPU_WORKER_HOST_MEMORY_WEIGHT,
-                total_allocation_weight=total_memory_weight,
-            )
-            gpu_memory_limit = _compute_worker_memory_limit(
-                total_workers,
-                configured_limit_gb=config.GPU_WORKER_MEMORY_LIMIT_GB,
-                allocation_weight=GPU_WORKER_HOST_MEMORY_WEIGHT,
-                total_allocation_weight=total_memory_weight,
-            )
-            scheduler_spec, worker_specs = build_local_cluster_specs(
-                cpu_workers=requested_cpu_workers,
-                gpu_ids=gpu_ids,
-                cpu_memory_limit=cpu_memory_limit,
-                gpu_memory_limit=gpu_memory_limit,
-                local_directory=local_directory,
-                dashboard_address=config.DASHBOARD_ADDRESS,
-                worker_start_timeout=worker_batch_timeout,
-            )
-
-            logger.info(
-                "[Dask] Startup plan: platform=%s host=%s scheduler=1 cpu_workers=%s "
-                "gpu_workers=%s selected_gpu_ids=%s threads_per_worker=1 "
-                "cpu_memory_limit=%s gpu_memory_limit=%s local_directory=%s "
-                "worker_batch_size=%s worker_batch_timeout=%.1fs "
-                "worker_registration_timeout=%.1fs "
-                "total_startup_timeout=%.1fs",
-                current_platform(),
-                LOCAL_CLUSTER_HOST,
-                requested_cpu_workers,
-                len(gpu_ids),
-                gpu_ids,
-                cpu_memory_limit,
-                gpu_memory_limit,
-                local_directory,
-                batch_size,
-                worker_batch_timeout,
-                worker_registration_timeout,
-                startup_timeout,
-            )
-
-            cluster: SpecCluster | None = None
-            client: Client | None = None
-            startup_stage = "creating the Dask Scheduler"
-            try:
-                # Start the Scheduler with no Workers, then connect an
-                # independently looped Driver Client before any Nanny spawn.
-                # Client(cluster) reuses SpecCluster's control IOLoop; on the
-                # remote Windows host, creating 14 Nannies first left that loop
-                # unable to complete the subsequent Client handshake even
-                # though all Workers had already registered.  A separate Client
-                # loop prevents Worker startup from blocking the only Driver
-                # connection.  Once the Client is healthy, Workers start
-                # concurrently by default; an explicit batch-size override can
-                # still cap process-spawn concurrency for a specific site.
-                cluster = SpecCluster(
-                    workers={},
-                    scheduler=scheduler_spec,
-                    asynchronous=False,
-                    silence_logs=logging.WARNING,
-                    name="WorkFlow local mixed cluster",
-                )
-                logger.info(
-                    "[Dask] Scheduler constructed before Workers: address=%s "
-                    "elapsed=%.1fs",
-                    cluster.scheduler.address,
-                    time.monotonic() - startup_started,
-                )
-                startup_stage = "connecting the Dask Client"
-                client_deadline = _bounded_phase_deadline(startup_deadline, 60.0)
-                client = WorkflowClient(
-                    cluster.scheduler.address,
-                    security=cluster.security,
-                    timeout=_remaining_startup_time(
-                        client_deadline,
-                        stage="connecting the Dask Client",
-                    ),
-                )
-                initial_scheduler_info = get_fresh_scheduler_info(
-                    client,
-                    timeout=_remaining_startup_time(
-                        client_deadline,
-                        stage="checking the Scheduler before Worker startup",
-                    ),
-                )
-                if initial_scheduler_info.get("workers"):
-                    raise RuntimeError(
-                        "A newly created Dask Scheduler unexpectedly reported "
-                        "Workers before local provisioning began."
-                    )
-                logger.info(
-                    "[Dask] Driver Client connected before Worker startup: "
-                    "scheduler=%s elapsed=%.1fs",
-                    initial_scheduler_info.get("address", cluster.scheduler.address),
-                    time.monotonic() - startup_started,
-                )
-
-                startup_stage = "starting Worker processes in bounded batches"
-                _provision_worker_specs_in_batches(
-                    cluster,
-                    client,
-                    worker_specs,
-                    deadline=startup_deadline,
-                    batch_size=batch_size,
-                    batch_timeout=worker_batch_timeout,
-                    registration_timeout=worker_registration_timeout,
-                )
-                workers_ready_at = time.monotonic()
-                logger.info(
-                    "[Dask] Worker processes and role metadata registered: "
-                    "total=%s batch_size=%s elapsed=%.1fs",
-                    total_workers,
-                    batch_size,
-                    workers_ready_at - startup_started,
-                )
-
-                startup_stage = "waiting for a stable validated topology"
-                validation_deadline = _bounded_phase_deadline(
-                    startup_deadline,
-                    30.0,
-                )
-                summary = self._wait_for_stable_topology(
-                    expected_cpu_workers=requested_cpu_workers,
-                    expected_gpu_workers=len(gpu_ids),
-                    expected_gpu_ids=gpu_ids,
-                    expected_total_workers=total_workers,
-                    deadline=validation_deadline,
-                    client=client,
-                )
-                # Publish the client only after every Worker has passed role,
-                # resource, and CUDA-visibility validation.
-                self.cluster = cluster
-                self.client = client
-                self.active_cpu_workers = requested_cpu_workers
-                self.active_gpu_workers = len(gpu_ids)
-                self.active_gpu_ids = gpu_ids
-
-                if should_schedule_malloc_trim():
-                    client.run_on_scheduler(_schedule_malloc_trim_on_scheduler)
-
-                logger.info("[Dask] Scheduler started: %s", summary.scheduler_address)
-                logger.info("[Dask] Dashboard: %s", client.dashboard_link)
-                logger.info(
-                    "[Dask] CPU Workers: %s | GPU Workers: %s | CPU slots: %s | GPU slots: %s",
-                    len(summary.cpu_workers),
-                    len(summary.gpu_workers),
-                    summary.total_cpu_slots,
-                    summary.total_gpu_slots,
-                )
-                if summary.gpu_workers:
-                    logger.info(
-                        "[Dask] All GPU Workers have distinct one-device CUDA visibility masks"
-                    )
-                logger.info(
-                    "[Dask] Worker memory: CPU=%s GPU=%s | spill=%s",
-                    cpu_memory_limit,
-                    gpu_memory_limit,
-                    local_directory,
-                )
-                logger.info(
-                    "[Dask] Startup validation complete: elapsed=%.1fs",
-                    time.monotonic() - startup_started,
-                )
-                return client
-            except Exception as exc:
-                startup_diagnostics: dict[str, object] = {}
-                if cluster is not None:
-                    startup_diagnostics = _cluster_startup_diagnostics(cluster)
-                logger.error(
-                    "[Dask] Start failed after %.1fs during %s: %s | "
-                    "startup_diagnostics=%s",
-                    time.monotonic() - startup_started,
-                    startup_stage,
-                    exc,
-                    startup_diagnostics,
-                )
-                cleanup_errors: list[BaseException] = []
-                cleanup_deadline = time.monotonic() + _cluster_close_timeout()
-                if client is not None:
-                    client_loop_thread = _capture_control_loop_thread(client)
-                    try:
-                        client.close(timeout=_client_close_timeout(cleanup_deadline))
-                    except Exception as close_exc:
-                        cleanup_errors.append(close_exc)
-                        logger.warning(
-                            "[Dask] Client cleanup after startup failure failed: %s",
-                            close_exc,
-                        )
-                    finally:
-                        _record_lingering_control_thread(
-                            client,
-                            client_loop_thread,
-                        )
-                if cluster is not None:
-                    cluster_loop_thread = _capture_control_loop_thread(cluster)
-                    try:
-                        cluster.close(timeout=_remaining_shutdown_time(cleanup_deadline))
-                    except Exception as close_exc:
-                        cleanup_errors.append(close_exc)
-                        logger.warning(
-                            "[Dask] Cluster cleanup after startup failure failed: %s",
-                            close_exc,
-                        )
-                    finally:
-                        _record_lingering_control_thread(
-                            cluster,
-                            cluster_loop_thread,
-                        )
-                cleanup_unconfirmed = False
-                if (
-                    cluster is not None
-                    and not _cluster_nanny_shutdown_confirmed(cluster)
-                ):
-                    try:
-                        _force_kill_cluster_workers_sync(cluster, timeout=5.0)
-                    except Exception as kill_exc:
-                        logger.error(
-                            "[Dask] Emergency Worker cleanup after startup failure "
-                            "failed: %s",
-                            kill_exc,
-                            exc_info=True,
-                        )
-                if cluster is not None:
-                    cleanup_unconfirmed = not _cluster_nanny_shutdown_confirmed(
-                        cluster
-                    )
-                if not cleanup_unconfirmed:
-                    for owner, label in (
-                        (client, "Dask Client"),
-                        (cluster, "SpecCluster"),
-                    ):
-                        if not _control_loop_shutdown_confirmed(owner):
-                            try:
-                                _force_stop_control_loop(
-                                    owner,
-                                    timeout=5.0,
-                                    label=label,
-                                )
-                            except Exception as loop_exc:
-                                cleanup_errors.append(loop_exc)
-                                logger.error(
-                                    "[Dask] %s loop cleanup after startup failure "
-                                    "failed: %s",
-                                    label,
-                                    loop_exc,
-                                    exc_info=True,
-                                )
-                    cleanup_unconfirmed = not all(
-                        _control_loop_shutdown_confirmed(owner)
-                        for owner in (client, cluster)
-                    )
-                if cleanup_unconfirmed:
-                    # Fail closed: retain the only handles capable of retrying
-                    # cleanup and forbid a second cluster beside possible
-                    # orphan GPU processes.
-                    self.client = client
-                    self.cluster = cluster
-                    self._cluster_poisoned = True
-                else:
-                    self.client = None
-                    self.cluster = None
-                    self._cluster_poisoned = False
-                self.active_cpu_workers = 0
-                self.active_gpu_workers = 0
-                self.active_gpu_ids = ()
-                raise RuntimeError(f"Dask mixed cluster startup failed: {exc}") from exc
 
     def get_cluster_resource_summary(
         self,
@@ -2536,12 +1667,6 @@ class DaskService:
         return cluster_resource_summary_from_scheduler_info(
             get_fresh_scheduler_info(active_client)
         )
-
-    def count_cpu_workers(self, client: Client | None = None) -> int:
-        return len(self.get_cluster_resource_summary(client).cpu_workers)
-
-    def count_gpu_workers(self, client: Client | None = None) -> int:
-        return len(self.get_cluster_resource_summary(client).gpu_workers)
 
     def get_worker_diagnostics(
         self,
@@ -2557,231 +1682,6 @@ class DaskService:
                 scheduler_info.get("workers", {})
             ).items()
         }
-
-    def _wait_for_stable_topology(
-        self,
-        *,
-        expected_cpu_workers: int,
-        expected_gpu_workers: int,
-        expected_gpu_ids: tuple[str, ...] | None,
-        expected_total_workers: int,
-        deadline: float,
-        client: Client,
-    ) -> ClusterResourceSummary:
-        """Wait through transient Nanny restarts for two matching topologies.
-
-        ``wait_for_workers`` guarantees only that the requested total was seen
-        at one instant.  A Worker can restart immediately afterwards.  The old
-        startup path then combined a stale scheduler snapshot with a later
-        diagnostics snapshot and rejected a topology that had already
-        recovered.  Device metadata is now part of each atomic scheduler
-        snapshot, and two consecutive snapshots must describe the same Worker
-        addresses before the cluster is published.
-        """
-        last_error: Exception | None = None
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                client.wait_for_workers(
-                    expected_total_workers,
-                    timeout=remaining,
-                )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        "Worker registration completed after the startup deadline."
-                    )
-                first = self.validate_cluster_topology(
-                    expected_cpu_workers=expected_cpu_workers,
-                    expected_gpu_workers=expected_gpu_workers,
-                    expected_gpu_ids=expected_gpu_ids,
-                    verify_device_isolation=True,
-                    client=client,
-                    rpc_timeout=remaining,
-                )
-
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    last_error = TransientClusterTopologyError(
-                        "Topology validated once but did not remain observable "
-                        "for the stability interval."
-                    )
-                    break
-                time.sleep(min(0.2, remaining))
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    last_error = TransientClusterTopologyError(
-                        "Topology validated once but did not remain observable "
-                        "for the stability interval."
-                    )
-                    break
-                second = self.validate_cluster_topology(
-                    expected_cpu_workers=expected_cpu_workers,
-                    expected_gpu_workers=expected_gpu_workers,
-                    expected_gpu_ids=expected_gpu_ids,
-                    verify_device_isolation=True,
-                    client=client,
-                    rpc_timeout=remaining,
-                )
-                if time.monotonic() > deadline:
-                    last_error = TransientClusterTopologyError(
-                        "Topology validation completed after the startup deadline."
-                    )
-                    break
-                if (
-                    first.cpu_workers == second.cpu_workers
-                    and first.gpu_workers == second.gpu_workers
-                    and first.total_cpu_slots == second.total_cpu_slots
-                    and first.total_gpu_slots == second.total_gpu_slots
-                ):
-                    return second
-                last_error = TransientClusterTopologyError(
-                    "Worker addresses changed between consecutive topology snapshots."
-                )
-            except (TransientClusterTopologyError, OSError, TimeoutError) as exc:
-                last_error = exc
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.2, remaining))
-
-        detail = f" Last validation error: {last_error}" if last_error else ""
-        raise TimeoutError(
-            "Dask Worker topology did not stabilize before the startup "
-            f"deadline.{detail}"
-        ) from last_error
-
-    def validate_cluster_topology(
-        self,
-        *,
-        expected_cpu_workers: int | None = None,
-        expected_gpu_workers: int | None = None,
-        expected_gpu_ids: tuple[str, ...] | None = None,
-        verify_device_isolation: bool = True,
-        client: Client | None = None,
-        rpc_timeout: float | None = None,
-    ) -> ClusterResourceSummary:
-        active_client = client or self.get_client()
-        if active_client is None:
-            raise RuntimeError("No live Dask client is available for topology validation.")
-        scheduler_info = get_fresh_scheduler_info(
-            active_client,
-            timeout=rpc_timeout,
-        )
-        summary = cluster_resource_summary_from_scheduler_info(scheduler_info)
-        membership_errors: list[str] = []
-        contract_errors: list[str] = []
-
-        workers = dict(scheduler_info.get("workers", {}))
-        for worker_address, worker_info in workers.items():
-            resources = dict(worker_info.get("resources", {}) or {})
-            cpu_slots = float(resources.get(CPU_RESOURCE_NAME, 0) or 0)
-            gpu_slots = float(resources.get(GPU_RESOURCE_NAME, 0) or 0)
-            if (cpu_slots, gpu_slots) not in {(1.0, 0.0), (0.0, 1.0)}:
-                contract_errors.append(
-                    f"Worker {worker_address!r} must register exactly CPU=1 or GPU=1, "
-                    f"got {resources!r}."
-                )
-
-        if expected_cpu_workers is not None and len(summary.cpu_workers) != expected_cpu_workers:
-            membership_errors.append(
-                f"Expected {expected_cpu_workers} CPU Workers, found {len(summary.cpu_workers)}."
-            )
-        if expected_gpu_workers is not None and len(summary.gpu_workers) != expected_gpu_workers:
-            membership_errors.append(
-                f"Expected {expected_gpu_workers} GPU Workers, found {len(summary.gpu_workers)}."
-            )
-
-        observed_gpu_ids: list[str] = []
-        if verify_device_isolation and workers:
-            for worker_address, worker_info in workers.items():
-                diagnostic = worker_info.get("workflowDevice")
-                if not isinstance(diagnostic, Mapping):
-                    contract_errors.append(
-                        f"Worker {worker_address!r} did not publish workflowDevice "
-                        "startup metadata."
-                    )
-                    continue
-                role = diagnostic.get("workerRole")
-                assigned = diagnostic.get("assignedDevice")
-                visible = diagnostic.get("cudaVisibleDevices")
-                resources = diagnostic.get("resources", {})
-                if role == "cpu":
-                    if assigned != "cpu" or visible != "" or resources != {CPU_RESOURCE_NAME: 1.0}:
-                        contract_errors.append(
-                            f"CPU Worker {worker_address!r} failed device isolation: {diagnostic!r}."
-                        )
-                elif role == "gpu":
-                    visible_ids = tuple(part for part in str(visible).split(",") if part)
-                    physical_gpu_id = str(diagnostic.get("physicalGpuId") or "")
-                    local_gpu_id = str(
-                        diagnostic.get("localGpuId") or physical_gpu_id
-                    )
-                    if (
-                        assigned != "cuda:0"
-                        or len(visible_ids) != 1
-                        or not physical_gpu_id
-                        or visible_ids[0] != local_gpu_id
-                        or resources != {GPU_RESOURCE_NAME: 1.0}
-                    ):
-                        contract_errors.append(
-                            f"GPU Worker {worker_address!r} failed device isolation: {diagnostic!r}."
-                        )
-                    else:
-                        observed_gpu_ids.append(physical_gpu_id)
-                else:
-                    contract_errors.append(
-                        f"Worker {worker_address!r} has unknown role {role!r}."
-                    )
-
-            if len(observed_gpu_ids) != len(set(observed_gpu_ids)):
-                contract_errors.append(
-                    "GPU Workers must use distinct physical GPUs, got "
-                    f"{tuple(observed_gpu_ids)!r}."
-                )
-            if (
-                expected_gpu_ids is not None
-                and set(observed_gpu_ids) != set(expected_gpu_ids)
-            ):
-                target = membership_errors if membership_errors else contract_errors
-                target.append(
-                    "GPU Worker physical IDs do not match the requested topology: "
-                    f"expected {expected_gpu_ids!r}, got {tuple(observed_gpu_ids)!r}."
-                )
-
-        if contract_errors:
-            raise RuntimeError(
-                "Invalid Dask cluster topology: "
-                + " ".join(contract_errors + membership_errors)
-            )
-        if membership_errors:
-            raise TransientClusterTopologyError(
-                "Invalid Dask cluster topology: " + " ".join(membership_errors)
-            )
-        return summary
-
-    def validate_resource_availability(
-        self,
-        *,
-        requires_cpu: bool,
-        requires_gpu: bool,
-        client: Client | None = None,
-    ) -> ClusterResourceSummary:
-        """Fail synchronously before submission when a resource class is absent."""
-        summary = self.get_cluster_resource_summary(client)
-        if requires_cpu and summary.total_cpu_slots < 1:
-            raise RuntimeError(
-                "The workflow requires CPU Workers, but no Worker with resource CPU=1 is available."
-            )
-        if requires_gpu and summary.total_gpu_slots < 1:
-            raise RuntimeError(
-                "The workflow requires GPU execution, but no Worker with resource GPU=1 is "
-                "available. CPU fallback is not supported."
-            )
-        return summary
 
     def stop_cluster(self) -> bool:
         """Stop the runtime and report whether shutdown was fully graceful.
@@ -2863,19 +1763,14 @@ class DaskService:
                 )
 
             if cleanup_unconfirmed:
-                # Preserve poisoned handles and fail closed.  start_cluster()
-                # retries this cleanup before it may provision any new Worker.
+                # Preserve handles and fail closed. The next Profile-cluster
+                # request retries cleanup before provisioning any new Worker.
                 self.client = client
                 self.cluster = cluster
-                self._cluster_poisoned = True
             else:
                 # Only discard handles after every child is confirmed stopped.
                 self.client = None
                 self.cluster = None
-                self._cluster_poisoned = False
-            self.active_cpu_workers = 0
-            self.active_gpu_workers = 0
-            self.active_gpu_ids = ()
             self.active_worker_profile_topology = ()
             if not cleanup_unconfirmed:
                 self._external_workers = False

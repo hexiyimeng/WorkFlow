@@ -441,7 +441,7 @@ def _compute_with_resource_boundaries(
     # ``Client.compute`` adds finalization tasks for Dask collections.  Those
     # tasks are framework work rather than node work, so they may run on any
     # available Worker. The annotation applies only to layers created by
-    # ``compute``; existing node layers keep their CPU/GPU resource annotations.
+    # ``compute``; existing node layers keep their Worker Profile annotations.
     with dask.annotate(
         brainflow_node_id="__framework_finalize__",
         worker_profile="framework",
@@ -1494,19 +1494,22 @@ async def execute_graph(
             ),
         )
         # Profile requirements are not Worker counts. Slurm execution has
-        # already provisioned the browser-configured Pools; the local backend
-        # validates its independently managed compatibility cluster here.
+        # already provisioned the browser-configured Pools; a local backend
+        # builds the same Pool topology directly from the supplied Profiles.
         if dask_service.uses_external_workers():
-            client = await asyncio.to_thread(dask_service.ensure_client)
-        elif worker_profiles is not None and worker_pools is not None:
+            client = dask_service.require_active_client()
+        else:
+            if worker_profiles is None or worker_pools is None:
+                raise ValueError(
+                    "Workflow execution requires Worker Profiles and Worker Pools. "
+                    "Configure Worker Resources in the frontend and retry."
+                )
             client = await asyncio.to_thread(
                 dask_service.ensure_profile_client,
                 profiles=parse_worker_profiles(worker_profiles),
                 pools=parse_worker_pools(worker_pools),
                 required_profiles=resource_plan.required_worker_profiles,
             )
-        else:
-            client = await asyncio.to_thread(dask_service.ensure_client)
         cluster_summary = await asyncio.to_thread(
             dask_service.get_cluster_resource_summary,
             client,
@@ -2209,7 +2212,7 @@ async def execute_graph(
             )
         elif client and should_cancel_dask_objects:
             # A failed/cancelled task may have died while owning a no-expiry
-            # Zarr storage-chunk lease.  Rebuild the fixed local cluster before
+            # Zarr storage-chunk lease. Rebuild the local Profile cluster before
             # another execution instead of either deadlocking on that stale
             # lease or weakening it into an unsafe expiring lock.
             try:
