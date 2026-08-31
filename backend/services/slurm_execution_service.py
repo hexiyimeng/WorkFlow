@@ -1004,7 +1004,13 @@ class SlurmExecutionService:
             logger.warning("squeue unavailable for job %s: %s", job_id, exc)
             return False, None
         if result.returncode != 0:
-            logger.warning("squeue failed for job %s: %s", job_id, result.stderr.strip())
+            detail = (result.stderr or result.stdout or "").strip()
+            # Legacy Slurm controllers return rc=1 instead of an empty result
+            # when an exact job id has already left the active queue. This is
+            # an authoritative absence, not a scheduler outage.
+            if "invalid job id specified" in detail.lower():
+                return True, None
+            logger.warning("squeue failed for job %s: %s", job_id, detail)
             return False, None
         lines = [item.strip() for item in result.stdout.splitlines() if item.strip()]
         if not lines:
@@ -2012,6 +2018,8 @@ class SlurmExecutionService:
         """Cancel the complete Worker allocation and retain ownership until terminal."""
         cancel_sent = cancellation_already_sent
         last_error: str | None = None
+        absent_since: float | None = None
+        absent_confirmations = 0
         while True:
             try:
                 if not cancel_sent:
@@ -2040,12 +2048,27 @@ class SlurmExecutionService:
                     submission_token,
                 )
                 if queue_ok and queue_row is not None:
+                    absent_since = None
+                    absent_confirmations = 0
                     state, node, reason = queue_row
                     if state in _SLURM_TERMINAL_STATES:
                         return state, reason, node
-                elif not found:
-                    # A purged or unavailable record is not proof that remote
-                    # Writers stopped. Keep the active lease and retry.
+                elif queue_ok and not found:
+                    absent_confirmations += 1
+                    if absent_since is None:
+                        absent_since = time.monotonic()
+                    if (
+                        absent_confirmations >= 2
+                        and time.monotonic() - absent_since
+                        >= config.result_grace_seconds
+                    ):
+                        # Exact local squeue absence for a bounded grace period,
+                        # combined with no controller/accounting record, proves
+                        # that this allocation can no longer run Worker code.
+                        return "PURGED", "", ""
+                elif not queue_ok:
+                    absent_since = None
+                    absent_confirmations = 0
                     cancel_sent = False
                 await asyncio.sleep(config.poll_interval_seconds)
             except asyncio.CancelledError:

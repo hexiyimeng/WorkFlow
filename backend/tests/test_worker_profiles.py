@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import distributed
 import pytest
 from dask_jobqueue import SLURMCluster
+from distributed.security import Security
 
 from core.cluster_inventory import (
     ClusterInventory,
@@ -332,7 +333,7 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
         scancel_executable="/usr/bin/scancel",
         interface=None,
         protocol="tcp://",
-        security=None,
+        security=Security(),
         worker_port_range="20000:20100",
         nanny_port_range="20101:20200",
     )
@@ -354,6 +355,8 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
     assert "services.slurm_worker_preload" in script
     assert "slurm_worker_launcher" not in script
     assert "workflow_workers.sbatch" not in script
+    assert "--tls-" not in script
+    assert "--tls-ca-file None" not in script
 
 
 def test_slurmcluster_derives_worker_threads_from_cores_and_processes(
@@ -511,6 +514,59 @@ def test_worker_registration_detects_an_exited_slurm_job_immediately(
             submitted_jobs=(("57093", None, "wf:test:1", request),),
             run_directory=tmp_path,
         ))
+
+
+def test_legacy_squeue_invalid_job_id_is_an_authoritative_absence(
+    monkeypatch,
+) -> None:
+    service = SlurmExecutionService()
+    monkeypatch.setattr(service, "_run_command", lambda *_args, **_kwargs: (
+        subprocess.CompletedProcess(
+            args=("squeue",),
+            returncode=1,
+            stdout="",
+            stderr="slurm_load_jobs error: Invalid job id specified\n",
+        )
+    ))
+
+    result = asyncio.run(service._query_queue_state(
+        SimpleNamespace(squeue_executable="squeue"),
+        "57093",
+    ))
+
+    assert result == (True, None)
+
+
+def test_worker_cleanup_accepts_confirmed_purged_legacy_job(
+    monkeypatch,
+) -> None:
+    service = SlurmExecutionService()
+
+    async def no_terminal_record(*_args, **_kwargs):
+        return False, None
+
+    async def absent_from_queue(*_args, **_kwargs):
+        return True, None
+
+    async def cancel_already_absent(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_query_terminal_state", no_terminal_record)
+    monkeypatch.setattr(service, "_query_queue_state", absent_from_queue)
+    monkeypatch.setattr(service, "_send_cancel", cancel_already_absent)
+
+    terminal = asyncio.run(service._wait_for_worker_allocation_terminal(
+        config=SimpleNamespace(
+            poll_interval_seconds=0.001,
+            result_grace_seconds=0.002,
+        ),
+        execution_id="12345678-1234-1234-1234-123456789abc",
+        job_id="57093",
+        cluster=None,
+        submission_token="wf:test:1",
+    ))
+
+    assert terminal == ("PURGED", "", "")
 
 
 def test_planned_slurmcluster_owns_submit_and_scale_down_lifecycle(

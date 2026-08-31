@@ -57,6 +57,35 @@ def _absolute_directory(value: Path | str, *, name: str) -> Path:
     return path
 
 
+def _worker_command_security(security: object) -> object | None:
+    """Return only a complete encrypted Security object for Worker CLI use.
+
+    ``Client.security`` is a truthy ``Security`` instance even for plain TCP.
+    dask-jobqueue interprets every truthy object as TLS-enabled and serializes
+    its worker fields verbatim, turning absent values into command arguments
+    such as ``--tls-ca-file None``. Plain TCP must therefore pass ``None`` to
+    ``SLURMJob``; encrypted mode must fail before submission if incomplete.
+    """
+
+    if security is None or not bool(getattr(security, "require_encryption", False)):
+        return None
+    tls_config = getattr(security, "get_tls_config_for_role", None)
+    if not callable(tls_config):
+        raise ValueError("Encrypted Dask security does not expose Worker TLS config.")
+    values = dict(tls_config("worker"))
+    missing = sorted(
+        name for name, value in values.items()
+        if name != "ciphers" and not value
+    )
+    if missing:
+        raise ValueError(
+            "Encrypted Dask Worker TLS config is incomplete: "
+            + ", ".join(missing)
+            + "."
+        )
+    return security
+
+
 @dataclass(frozen=True, slots=True)
 class PlannedSlurmWorkerSpec:
     allocation_id: str
@@ -299,7 +328,7 @@ def build_planned_slurm_worker_spec(
         "job_script_prologue": prologue,
         "interface": interface,
         "protocol": protocol,
-        "security": security,
+        "security": _worker_command_security(security),
         "config_name": "slurm",
     }
     return PlannedSlurmWorkerSpec(
