@@ -16,8 +16,11 @@ SESSION_NAME="${WORKFLOW_CONTROL_PLANE_SESSION:-workflow-control-plane}"
 START_SCRIPT="$WORKFLOW_ROOT/deploy/hpc/start_control_plane.sh"
 LOG_PATH="$WORKFLOW_RUNTIME_DIR/logs/control-plane.log"
 ACTION="${1:-status}"
-WEB_PORT="${WORKFLOW_WEB_PORT:-8000}"
-READY_URL="http://127.0.0.1:$WEB_PORT/plugin_status"
+CONFIG_PATH="${WORKFLOW_CONTROL_PLANE_CONFIG_FILE:-$WORKFLOW_RUNTIME_DIR/config/control-plane.env}"
+case "$CONFIG_PATH" in
+  /*) ;;
+  *) echo "WORKFLOW_CONTROL_PLANE_CONFIG_FILE must be an absolute path." >&2; exit 2 ;;
+esac
 CONTROL_PLANE_ENVIRONMENT=(
   WorkFlow_ALLOWED_ORIGINS
   WorkFlow_DASK_ALLOW_INSECURE_CLUSTER
@@ -60,6 +63,138 @@ CONTROL_PLANE_ENVIRONMENT=(
   WORKFLOW_WEB_PORT
 )
 
+is_managed_environment_name() {
+  local requested="$1"
+  local managed
+  for managed in "${CONTROL_PLANE_ENVIRONMENT[@]}"; do
+    if [[ "$requested" == "$managed" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+load_control_plane_config() {
+  if [[ -L "$CONFIG_PATH" || ! -f "$CONFIG_PATH" || ! -r "$CONFIG_PATH" ]]; then
+    echo "Control-plane config must be a readable regular non-symlink file: $CONFIG_PATH" >&2
+    exit 2
+  fi
+  local line
+  local line_number=0
+  local name
+  local value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    line="${line%$'\r'}"
+    if [[ -z "$line" || "$line" == \#* ]]; then
+      continue
+    fi
+    if [[ "$line" != *=* ]]; then
+      echo "$CONFIG_PATH:$line_number must use NAME=VALUE syntax." >&2
+      exit 2
+    fi
+    name="${line%%=*}"
+    value="${line#*=}"
+    if ! is_managed_environment_name "$name"; then
+      echo "$CONFIG_PATH:$line_number contains unsupported setting $name." >&2
+      exit 2
+    fi
+    printf -v "$name" '%s' "$value"
+  done < "$CONFIG_PATH"
+}
+
+write_control_plane_config() {
+  if [[ -e "$CONFIG_PATH" || -L "$CONFIG_PATH" ]]; then
+    echo "Refusing to overwrite existing control-plane config: $CONFIG_PATH" >&2
+    echo "Edit that file directly, or remove it intentionally and run configure again." >&2
+    exit 1
+  fi
+  local scheduler_host="${WorkFlow_DASK_SCHEDULER_HOST:-$(hostname -f)}"
+  local interface="${WorkFlow_DASK_INTERFACE:-}"
+  local allow_insecure="${WorkFlow_DASK_ALLOW_INSECURE_CLUSTER:-0}"
+  local tls_ca="${WorkFlow_DASK_TLS_CA:-}"
+  local tls_cert="${WorkFlow_DASK_TLS_CERT:-}"
+  local tls_key="${WorkFlow_DASK_TLS_KEY:-}"
+  if [[ -z "$scheduler_host" ]]; then
+    echo "Cannot discover a Scheduler host; set WorkFlow_DASK_SCHEDULER_HOST." >&2
+    exit 2
+  fi
+  if [[ -z "$interface" ]]; then
+    echo "Set WorkFlow_DASK_INTERFACE to the compute-node data interface." >&2
+    exit 2
+  fi
+  if [[ "$allow_insecure" != 0 && "$allow_insecure" != 1 ]]; then
+    echo "WorkFlow_DASK_ALLOW_INSECURE_CLUSTER must be 0 or 1." >&2
+    exit 2
+  fi
+  if [[ -z "$tls_ca$tls_cert$tls_key" && "$allow_insecure" != 1 ]]; then
+    echo "Explicitly set WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1 for a trusted test network," >&2
+    echo "or provide all three WorkFlow_DASK_TLS_* paths before configuring." >&2
+    exit 2
+  fi
+  if [[ -n "$tls_ca$tls_cert$tls_key" ]] \
+    && [[ -z "$tls_ca" || -z "$tls_cert" || -z "$tls_key" ]]; then
+    echo "WorkFlow_DASK_TLS_CA, WorkFlow_DASK_TLS_CERT and WorkFlow_DASK_TLS_KEY must be set together." >&2
+    exit 2
+  fi
+  for value in \
+    "$scheduler_host" "$interface" "$allow_insecure" \
+    "$tls_ca" "$tls_cert" "$tls_key" \
+    "${WorkFlow_DASK_SCHEDULER_PORT:-8786}" \
+    "${WorkFlow_DASK_DASHBOARD_ADDRESS:-127.0.0.1:8787}" \
+    "${WorkFlow_DASHBOARD_HOST:-127.0.0.1:18787}" \
+    "${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn,control}" \
+    "${WorkFlow_SLURM_MAX_CPUS:-256}"; do
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+      echo "Control-plane configuration values must not contain newlines." >&2
+      exit 2
+    fi
+  done
+
+  mkdir -p "${CONFIG_PATH%/*}"
+  umask 077
+  {
+    printf '%s\n' \
+      '# WorkFlow control-plane site configuration. Values are literal; do not add export or shell quotes.' \
+      "WorkFlow_DASK_SCHEDULER_HOST=$scheduler_host" \
+      "WorkFlow_DASK_SCHEDULER_PORT=${WorkFlow_DASK_SCHEDULER_PORT:-8786}" \
+      "WorkFlow_DASK_INTERFACE=$interface" \
+      "WorkFlow_DASK_DASHBOARD_ADDRESS=${WorkFlow_DASK_DASHBOARD_ADDRESS:-127.0.0.1:8787}" \
+      "WorkFlow_DASHBOARD_HOST=${WorkFlow_DASHBOARD_HOST:-127.0.0.1:18787}" \
+      "WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=$allow_insecure" \
+      "WorkFlow_SLURM_EXCLUDED_PARTITIONS=${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn,control}" \
+      "WorkFlow_SLURM_MAX_CPUS=${WorkFlow_SLURM_MAX_CPUS:-256}"
+    if [[ -v WorkFlow_SLURM_SACCT ]]; then
+      printf 'WorkFlow_SLURM_SACCT=%s\n' "$WorkFlow_SLURM_SACCT"
+    fi
+    if [[ -n "$tls_ca$tls_cert$tls_key" ]]; then
+      printf '%s\n' \
+        "WorkFlow_DASK_TLS_CA=$tls_ca" \
+        "WorkFlow_DASK_TLS_CERT=$tls_cert" \
+        "WorkFlow_DASK_TLS_KEY=$tls_key"
+    fi
+  } > "$CONFIG_PATH"
+  chmod 600 "$CONFIG_PATH"
+  echo "WorkFlow control-plane config created."
+  echo "config=$CONFIG_PATH"
+  echo "scheduler=$scheduler_host"
+  echo "worker_interface=$interface"
+  echo "max_cpus=${WorkFlow_SLURM_MAX_CPUS:-256}"
+}
+
+# Once configured, the file is authoritative. Clear every managed value from
+# the caller/tmux environment before loading it, so stale partition overrides
+# cannot silently return and operators do not need repeated `unset` commands.
+if [[ "$ACTION" != configure && ( -e "$CONFIG_PATH" || -L "$CONFIG_PATH" ) ]]; then
+  for variable_name in "${CONTROL_PLANE_ENVIRONMENT[@]}"; do
+    unset "$variable_name"
+  done
+  load_control_plane_config
+fi
+
+WEB_PORT="${WORKFLOW_WEB_PORT:-8000}"
+READY_URL="http://127.0.0.1:$WEB_PORT/plugin_status"
+
 if [[ ! "$SESSION_NAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "WORKFLOW_CONTROL_PLANE_SESSION contains unsupported characters." >&2
   exit 2
@@ -68,7 +203,7 @@ if [[ ! -x "$START_SCRIPT" ]]; then
   echo "Missing executable control-plane entrypoint: $START_SCRIPT" >&2
   exit 1
 fi
-if ! command -v tmux >/dev/null 2>&1; then
+if [[ "$ACTION" != configure ]] && ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for the user-managed control plane." >&2
   echo "Ask the administrator for a system service if login-node daemons are not allowed." >&2
   exit 1
@@ -128,6 +263,9 @@ start_control_plane() {
     exit 1
   fi
   echo "WorkFlow control plane started (tmux=$SESSION_NAME)."
+  if [[ -f "$CONFIG_PATH" ]]; then
+    echo "config=$CONFIG_PATH"
+  fi
   echo "log=$LOG_PATH"
   echo "remote=http://127.0.0.1:$WEB_PORT"
 }
@@ -150,6 +288,9 @@ stop_control_plane() {
 }
 
 case "$ACTION" in
+  configure)
+    write_control_plane_config
+    ;;
   start)
     start_control_plane
     ;;
@@ -176,7 +317,7 @@ case "$ACTION" in
     exec tail -n 200 -f "$LOG_PATH"
     ;;
   *)
-    echo "Usage: control_plane.sh {start|stop|restart|status|logs}" >&2
+    echo "Usage: control_plane.sh {configure|start|stop|restart|status|logs}" >&2
     exit 2
     ;;
 esac

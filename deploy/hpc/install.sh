@@ -29,6 +29,7 @@ mkdir -p \
   "$UV_CACHE_DIR" \
   "$(dirname "$MODEL_PATH")" \
   "$WORKFLOW_RUNTIME_DIR/logs" \
+  "$WORKFLOW_RUNTIME_DIR/config" \
   "$WORKFLOW_RUNTIME_DIR/state" \
   "$WORKFLOW_RUNTIME_DIR/data" \
   "$WORKFLOW_RUNTIME_DIR/output" \

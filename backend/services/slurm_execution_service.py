@@ -367,7 +367,7 @@ def slurm_policy_from_environment(
     return SlurmPolicy(
         partition=partition,
         time_limit=str(env.get("WorkFlow_SLURM_TIME_LIMIT", "1-00:00:00")).strip(),
-        max_cpus=_env_positive_int(env, "WorkFlow_SLURM_MAX_CPUS", 128),
+        max_cpus=_env_positive_int(env, "WorkFlow_SLURM_MAX_CPUS", 256),
         max_gpus=_env_positive_int(
             env, "WorkFlow_SLURM_MAX_GPUS", 8, allow_zero=True
         ),
