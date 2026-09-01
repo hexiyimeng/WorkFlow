@@ -110,17 +110,12 @@ write_control_plane_config() {
     exit 1
   fi
   local scheduler_host="${WorkFlow_DASK_SCHEDULER_HOST:-$(hostname -f)}"
-  local interface="${WorkFlow_DASK_INTERFACE:-}"
   local allow_insecure="${WorkFlow_DASK_ALLOW_INSECURE_CLUSTER:-0}"
   local tls_ca="${WorkFlow_DASK_TLS_CA:-}"
   local tls_cert="${WorkFlow_DASK_TLS_CERT:-}"
   local tls_key="${WorkFlow_DASK_TLS_KEY:-}"
   if [[ -z "$scheduler_host" ]]; then
     echo "Cannot discover a Scheduler host; set WorkFlow_DASK_SCHEDULER_HOST." >&2
-    exit 2
-  fi
-  if [[ -z "$interface" ]]; then
-    echo "Set WorkFlow_DASK_INTERFACE to the compute-node data interface." >&2
     exit 2
   fi
   if [[ "$allow_insecure" != 0 && "$allow_insecure" != 1 ]]; then
@@ -138,7 +133,7 @@ write_control_plane_config() {
     exit 2
   fi
   for value in \
-    "$scheduler_host" "$interface" "$allow_insecure" \
+    "$scheduler_host" "$allow_insecure" \
     "$tls_ca" "$tls_cert" "$tls_key" \
     "${WorkFlow_DASK_SCHEDULER_PORT:-8786}" \
     "${WorkFlow_DASK_DASHBOARD_ADDRESS:-127.0.0.1:8787}" \
@@ -158,7 +153,6 @@ write_control_plane_config() {
       '# WorkFlow control-plane site configuration. Values are literal; do not add export or shell quotes.' \
       "WorkFlow_DASK_SCHEDULER_HOST=$scheduler_host" \
       "WorkFlow_DASK_SCHEDULER_PORT=${WorkFlow_DASK_SCHEDULER_PORT:-8786}" \
-      "WorkFlow_DASK_INTERFACE=$interface" \
       "WorkFlow_DASK_DASHBOARD_ADDRESS=${WorkFlow_DASK_DASHBOARD_ADDRESS:-127.0.0.1:8787}" \
       "WorkFlow_DASHBOARD_HOST=${WorkFlow_DASHBOARD_HOST:-127.0.0.1:18787}" \
       "WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=$allow_insecure" \
@@ -178,7 +172,7 @@ write_control_plane_config() {
   echo "WorkFlow control-plane config created."
   echo "config=$CONFIG_PATH"
   echo "scheduler=$scheduler_host"
-  echo "worker_interface=$interface"
+  echo "worker_network=route-selected-ipv4"
   echo "max_cpus=${WorkFlow_SLURM_MAX_CPUS:-256}"
 }
 
@@ -190,6 +184,14 @@ if [[ "$ACTION" != configure && ( -e "$CONFIG_PATH" || -L "$CONFIG_PATH" ) ]]; t
     unset "$variable_name"
   done
   load_control_plane_config
+fi
+
+# Older configs required one interface name for every compute node.  Keep the
+# name in the parser allowlist so existing files migrate without an edit, but
+# never export it: Worker jobs now bind to the per-node route-selected IPv4.
+if [[ -n "${WorkFlow_DASK_INTERFACE:-}" ]]; then
+  echo "Ignoring deprecated WorkFlow_DASK_INTERFACE; Workers use route-selected IPv4 addresses." >&2
+  unset WorkFlow_DASK_INTERFACE
 fi
 
 WEB_PORT="${WORKFLOW_WEB_PORT:-8000}"

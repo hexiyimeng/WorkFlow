@@ -337,7 +337,8 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
         python_executable=Path(sys.executable),
         sbatch_executable="/usr/bin/sbatch",
         scancel_executable="/usr/bin/scancel",
-        interface=None,
+        scheduler_host="mn02",
+        scheduler_port=8786,
         protocol="tcp://",
         security=Security(),
         worker_port_range="20000:20100",
@@ -359,6 +360,10 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
     assert "--nthreads 4" in script
     assert "--nanny" in script
     assert "services.slurm_worker_preload" in script
+    assert "services.dask_worker_network" in script
+    assert "--scheduler-host mn02 --scheduler-port 8786" in script
+    assert '--host "$WORKFLOW_DASK_WORKER_HOST"' in script
+    assert "--interface" not in script
     assert "slurm_worker_launcher" not in script
     assert "workflow_workers.sbatch" not in script
     assert "--tls-" not in script
@@ -406,7 +411,8 @@ def test_slurmcluster_derives_worker_threads_from_cores_and_processes(
         python_executable=Path(sys.executable),
         sbatch_executable="/usr/bin/sbatch",
         scancel_executable="/usr/bin/scancel",
-        interface=None,
+        scheduler_host="mn02",
+        scheduler_port=8786,
         protocol="tcp://",
         security=None,
         worker_port_range="20000:20100",

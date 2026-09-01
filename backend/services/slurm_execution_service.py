@@ -2484,7 +2484,6 @@ class SlurmExecutionService:
             planned_jobs_by_allocation = {
                 job.allocation_id: job for job in allocation_plan.jobs
             }
-            interface = os.getenv("WorkFlow_DASK_INTERFACE", "").strip() or None
             protocol = "tls://" if scheduler_address.startswith("tls://") else "tcp://"
             for job_index, planned_job in enumerate(allocation_plan.jobs, start=1):
                 job_request = _worker_job_request(allocation_plan, planned_job)
@@ -2504,7 +2503,8 @@ class SlurmExecutionService:
                     ),
                     sbatch_executable=config.sbatch_executable,
                     scancel_executable=config.scancel_executable,
-                    interface=interface,
+                    scheduler_host=config.scheduler_host,
+                    scheduler_port=config.scheduler_port,
                     protocol=protocol,
                     security=client.security,
                     worker_port_range=config.worker_port_range,

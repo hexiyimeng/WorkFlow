@@ -29,6 +29,7 @@ from core.worker_ownership import (
 _JOB_ID_RE = re.compile(r"[1-9][0-9]*\Z")
 _SAFE_JOB_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}\Z")
+_SAFE_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 
 
 def _absolute_executable(value: Path | str, *, name: str) -> Path:
@@ -223,7 +224,8 @@ def build_planned_slurm_worker_spec(
     python_executable: Path,
     sbatch_executable: str,
     scancel_executable: str,
-    interface: str | None,
+    scheduler_host: str,
+    scheduler_port: int,
     protocol: str | None,
     security: object,
     worker_port_range: str,
@@ -235,6 +237,10 @@ def build_planned_slurm_worker_spec(
     runtime = _absolute_directory(runtime_directory, name="runtime_directory")
     logs = _absolute_directory(run_directory, name="run_directory")
     python = _absolute_executable(python_executable, name="python_executable")
+    if _SAFE_HOST_RE.fullmatch(scheduler_host) is None:
+        raise ValueError("scheduler_host must be a safe IPv4 address or host name.")
+    if type(scheduler_port) is not int or not 1 <= scheduler_port <= 65535:
+        raise ValueError("scheduler_port must be 1..65535.")
     allocation_tag = hashlib.sha256(
         job.allocation_id.encode("utf-8")
     ).hexdigest()[:10]
@@ -289,6 +295,17 @@ def build_planned_slurm_worker_spec(
         f"WORKFLOW_FALLBACK_SCRATCH={shlex.quote(str(fallback_scratch))}",
         'export WORKFLOW_DASK_LOCAL_DIRECTORY="${SLURM_TMPDIR:-$WORKFLOW_FALLBACK_SCRATCH}"',
         "mkdir -p \"$WORKFLOW_DASK_LOCAL_DIRECTORY\"",
+        (
+            f'export WORKFLOW_DASK_WORKER_HOST="$({shlex.quote(str(python))} '
+            '-m services.dask_worker_network '
+            f'--scheduler-host {shlex.quote(scheduler_host)} '
+            f'--scheduler-port {scheduler_port})"'
+        ),
+        (
+            'echo "WorkFlow Dask Worker route: '
+            'node=${SLURMD_NODENAME:-${HOSTNAME}} '
+            'host=${WORKFLOW_DASK_WORKER_HOST}" >&2'
+        ),
     ]
     if job.gpu:
         prologue.extend((
@@ -326,6 +343,7 @@ def build_planned_slurm_worker_spec(
         "worker_extra_args": [
             "--resources", resources,
             "--preload", "services.slurm_worker_preload",
+            "--host", '"$WORKFLOW_DASK_WORKER_HOST"',
             "--worker-port", worker_port_range,
             "--nanny-port", nanny_port_range,
             "--no-dashboard",
@@ -333,7 +351,10 @@ def build_planned_slurm_worker_spec(
         "death_timeout": 120,
         "local_directory": '"$WORKFLOW_DASK_LOCAL_DIRECTORY"',
         "job_script_prologue": prologue,
-        "interface": interface,
+        # An empty value prevents dask-jobqueue from restoring a global
+        # jobqueue.slurm.interface setting.  Each job binds to the route-selected
+        # concrete host above, so heterogeneous interface names are supported.
+        "interface": "",
         "protocol": protocol,
         "security": _worker_command_security(security),
         "config_name": "slurm",

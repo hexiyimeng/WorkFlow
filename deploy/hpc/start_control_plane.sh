@@ -256,6 +256,7 @@ printf '%s\n' \
   "dashboard=on-demand-loopback:http://$DASHBOARD_ADDRESS/status" \
   "cluster_manager=dask_jobqueue.SLURMCluster" \
   "workers=slurm-nodes-discovered-by-sinfo-and-scontrol" \
+  "worker_network=per-node-route-selected-ipv4" \
   "worker_ports=$WORKER_PORT_RANGE" \
   "nanny_ports=$NANNY_PORT_RANGE" \
   "slurm_node_envelope=max_nodes:$SLURM_MAX_NODES,cpus:$SLURM_CPUS_PER_NODE,gpus:$SLURM_GPUS_PER_NODE,memory_gib:$SLURM_MEMORY_GIB_PER_NODE" \
