@@ -86,6 +86,7 @@ async def preflight_graph(
         return result
 
     try:
+        required_names = set(required.get("requiredWorkerProfiles", {}))
         profiles, pools = parse_required_worker_resources(
             worker_profiles,
             worker_pools,
@@ -93,7 +94,6 @@ async def preflight_graph(
         )
         profile_by_name = {profile.name: profile for profile in profiles}
         pool_by_name = {pool.profile: pool for pool in pools}
-        required_names = set(required.get("requiredWorkerProfiles", {}))
         missing_profiles = sorted(required_names - set(profile_by_name))
         missing_pools = sorted(required_names - set(pool_by_name))
         if missing_profiles:
