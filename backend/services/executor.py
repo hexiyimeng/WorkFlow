@@ -11,6 +11,7 @@ import dask
 import dask.array as da
 import numpy as np
 from dask.base import is_dask_collection
+from dask.highlevelgraph import HighLevelGraph
 from distributed import wait as dist_wait
 
 from core.invocation_builder import (
@@ -346,7 +347,10 @@ async def _cancel_sink_futures_with_timeout(
 
 def _normalize_futures(futures) -> list:
     if isinstance(futures, (list, tuple)):
-        return list(futures)
+        normalized = []
+        for item in futures:
+            normalized.extend(_normalize_futures(item))
+        return normalized
     return [futures]
 
 
@@ -448,27 +452,66 @@ def _compute_with_resource_boundaries(
     the Driver by gigabytes before any Worker received useful work and could
     make the Scheduler miss its communication timeout.
 
-    Dask already treats layers with different annotations as separate when
-    annotation fusion is disabled.  Keep normal collection optimization (and
-    therefore culling), while disabling only the fusion passes that could move
-    work across a Worker Profile boundary.
+    Dask 2026 serializes an expression and normally materializes/optimizes it
+    later on the Scheduler.  A temporary client-side config context therefore
+    cannot safely control fusion: by the time the Scheduler materializes the
+    graph, that context may have ended.  Optimize each collection eagerly,
+    verify that the annotated HighLevelGraph survived, merge the already
+    culled graphs, and submit their concrete block keys through ``Client.get``.
+    ``Client.get`` wraps this graph without another collection optimizer, so
+    the Scheduler cannot fuse a GPU model task into a CPU-reader task.
     """
-    # ``Client.compute`` adds finalization tasks for Dask collections.  Those
-    # tasks are framework work rather than node work, so they may run on any
-    # available Worker. The annotation applies only to layers created by
-    # ``compute``; existing node layers keep their Worker Profile annotations.
+    if preserve_resource_boundaries:
+        optimized_graphs = []
+        collection_keys = []
+        with dask.config.set(
+            {
+                "optimization.annotations.fuse": False,
+                "optimization.fuse.active": False,
+            }
+        ):
+            for collection in collections:
+                graph = collection.__dask_graph__()
+                keys = collection.__dask_keys__()
+                optimized = collection.__dask_optimize__(graph, keys)
+                if not isinstance(optimized, HighLevelGraph):
+                    raise RuntimeError(
+                        "Worker Profile graph optimization materialized a "
+                        "low-level graph and lost resource annotations."
+                    )
+                for layer_name, layer in optimized.layers.items():
+                    annotations = dict(layer.annotations or {})
+                    required_profile = annotations.get(
+                        "required_worker_profile"
+                    )
+                    if required_profile is None:
+                        continue
+                    resources = dict(annotations.get("resources") or {})
+                    if float(resources.get(required_profile, 0)) < 1.0:
+                        raise RuntimeError(
+                            "Optimized Dask layer "
+                            f"{layer_name!r} requires Worker Profile "
+                            f"{required_profile!r}, but advertises task "
+                            f"resources {resources!r}."
+                        )
+                optimized_graphs.append(optimized)
+                collection_keys.append(keys)
+
+        if not optimized_graphs:
+            return []
+        submission_graph = HighLevelGraph.merge(*optimized_graphs)
+        return client.get(
+            submission_graph,
+            collection_keys,
+            sync=False,
+        )
+
+    # ``Client.compute`` adds finalization tasks for ordinary single-profile
+    # collections.  They are framework work and may run on any Worker.
     with dask.annotate(
         brainflow_node_id="__framework_finalize__",
         worker_profile="framework",
     ):
-        if preserve_resource_boundaries:
-            with dask.config.set(
-                {
-                    "optimization.annotations.fuse": False,
-                    "optimization.fuse.active": False,
-                }
-            ):
-                return client.compute(collections)
         return client.compute(collections)
 
 
@@ -1888,17 +1931,17 @@ async def execute_graph(
                     await progress_callback(node_id, None, "Running", "running")
 
                 await loop.run_in_executor(None, lambda: dist_wait(futures))
-                for sink, future in zip(output_sinks, futures):
-                    if sink["is_delayed"]:
-                        await loop.run_in_executor(None, future.result)
-                    else:
-                        # Never pull a complete large collection to the driver.
-                        exception = await loop.run_in_executor(
-                            None,
-                            future.exception,
-                        )
-                        if exception is not None:
-                            raise exception
+                # A boundary-preserving submission returns one Future per
+                # terminal block rather than one collection-finalization
+                # Future.  Inspect every block without gathering output arrays
+                # back to the Driver. Delayed sinks naturally have one key.
+                for future in futures:
+                    exception = await loop.run_in_executor(
+                        None,
+                        future.exception,
+                    )
+                    if exception is not None:
+                        raise exception
         else:
             root_arrays, actual_output_shape, window_reason = _inspect_window_roots(
                 results,

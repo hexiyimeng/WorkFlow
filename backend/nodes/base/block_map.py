@@ -1516,6 +1516,10 @@ class BaseMapOverlapNode(BaseDaskArrayMapNode):
         with dask.annotate(
             brainflow_node_id="__map_overlap__",
             worker_profile=CPU_GENERAL_PROFILE,
+            # Override the enclosing node annotation as well as its concrete
+            # resource requirement.  These overlap/rechunk/trim layers are
+            # framework data preparation, not model execution.
+            required_worker_profile=None,
             resources={},
         ):
             result = da.map_overlap(
