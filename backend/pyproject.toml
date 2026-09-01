@@ -9,6 +9,7 @@ dependencies = [
     "dask-jobqueue==0.9.0",
     "distributed==2026.3.0",
     "fastapi>=0.100.0",
+    "h5py>=3.12,<4",
     "numcodecs>=0.12,<0.16",
     "numpy>=1.24.0",
     "ome-zarr>=0.9.0",
