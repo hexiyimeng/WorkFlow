@@ -18,6 +18,7 @@ import { isAbsoluteServerPath } from '../../utils/executionConfig';
 import {
   defaultWorkerPool,
   defaultWorkerProfile,
+  fixedGpuForWorkerProfile,
   loadWorkerPools,
   loadWorkerProfiles,
   saveRequiredWorkerResources,
@@ -233,7 +234,8 @@ const WorkerResourcesSection = ({
         const errors: WorkerDraftErrors = {};
         const cpu = positiveIntegerDraft(draft?.cpu ?? '');
         const memoryGB = positiveNumberDraft(draft?.memoryGB ?? '');
-        const gpu = nonnegativeIntegerDraft(draft?.gpu ?? '');
+        const fixedGpu = fixedGpuForWorkerProfile(profile.name);
+        const gpu = fixedGpu ?? nonnegativeIntegerDraft(draft?.gpu ?? '');
         if (cpu === null) errors.cpu = 'Enter a positive whole number.';
         if (memoryGB === null) errors.memoryGB = 'Enter a positive number.';
         if (gpu === null || gpu > 1) errors.gpu = 'Enter 0 or 1.';
@@ -311,7 +313,8 @@ const WorkerResourcesSection = ({
           cpu: '', memoryGB: '', gpu: '', processes: '', scale: '',
         };
         const errors = fieldErrors[profile.name] ?? {};
-        const gpuProfile = draft.gpu === '1';
+        const fixedGpu = fixedGpuForWorkerProfile(profile.name);
+        const gpuProfile = fixedGpu === 1 || (fixedGpu === undefined && draft.gpu === '1');
         const processes = positiveIntegerDraft(draft.processes);
         const scale = positiveIntegerDraft(draft.scale);
         const totalWorkers = processes !== null && scale !== null
@@ -343,9 +346,11 @@ const WorkerResourcesSection = ({
                 </span>
                 <FieldError message={errors.memoryGB} />
               </label>
-              <label>GPU / Worker
-                <input type="number" min="0" max="1" step="1" value={draft.gpu}
+              <label>GPU / Worker{fixedGpu === undefined ? '' : ' (fixed)'}
+                <input type="number" min="0" max="1" step="1"
+                  value={fixedGpu === undefined ? draft.gpu : String(fixedGpu)}
                   aria-invalid={Boolean(errors.gpu)}
+                  disabled={disabled || saving || fixedGpu !== undefined}
                   onChange={event => {
                     const gpu = event.target.value;
                     updateDraft(profile.name, 'gpu', gpu);

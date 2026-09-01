@@ -13,6 +13,12 @@ DEFAULT_WORKER_PROFILE = CPU_GENERAL_PROFILE
 _PROFILE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _MEMORY_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(gib|gb)\Z", re.IGNORECASE)
 _RESERVED_LOGICAL_RESOURCES = frozenset({"CPU", "GPU"})
+_BUILT_IN_PROFILE_GPUS = {
+    "cpu-general": 0,
+    "cpu-reader": 0,
+    "cpu-writer": 0,
+    "gpu-cellpose": 1,
+}
 
 
 def normalize_worker_profile(value: object, *, owner: str = "Node") -> str:
@@ -138,6 +144,12 @@ class WorkerProfile:
         name = normalize_worker_profile(self.name, owner="WorkerProfile")
         if not isinstance(self.physical_resources, PhysicalResources):
             raise ValueError("physical_resources must be PhysicalResources.")
+        fixed_gpu = _BUILT_IN_PROFILE_GPUS.get(name)
+        if fixed_gpu is not None and self.physical_resources.gpu != fixed_gpu:
+            raise ValueError(
+                f"Worker Profile {name!r} requires physical_resources.gpu="
+                f"{fixed_gpu}, got {self.physical_resources.gpu}."
+            )
         threads = _positive_integer(self.threads, name="threads")
         if threads != self.physical_resources.cpu:
             raise ValueError(

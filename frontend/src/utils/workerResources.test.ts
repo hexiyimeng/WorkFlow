@@ -77,3 +77,34 @@ assert(loadWorkerProfiles().some(profile => profile.name === 'cpu-reader'),
   'Saving required resources must add the current workflow Profile');
 assert(values.has(WORKER_PROFILES_STORAGE_KEY) && values.has(WORKER_POOLS_STORAGE_KEY),
   'Worker resources must use the dedicated localStorage keys');
+
+const staleCpuGeneral = {
+  ...defaultWorkerProfile('cpu-general'),
+  physical_resources: { cpu: 8, memory: '32GB', gpu: 1 },
+  logical_resources: { 'cpu-general': 1, CPU: 8, GPU: 1 },
+};
+values.set(WORKER_PROFILES_STORAGE_KEY, JSON.stringify([staleCpuGeneral]));
+values.set(WORKER_POOLS_STORAGE_KEY, JSON.stringify([
+  { profile: 'cpu-general', processes: 1, scale: 1 },
+]));
+const migratedCpuGeneral = loadWorkerProfiles()[0];
+assert(migratedCpuGeneral?.physical_resources.gpu === 0,
+  'stale cpu-general Profiles must migrate to zero physical GPUs');
+assert(migratedCpuGeneral?.logical_resources.GPU === undefined,
+  'stale cpu-general Profiles must drop logical GPU capability');
+saveWorkerResources([migratedCpuGeneral!], [
+  { profile: 'cpu-general', processes: 4, scale: 1 },
+]);
+assert(loadWorkerPools()[0]?.processes === 4,
+  'cpu-general must allow multiple Worker processes per Slurm Job');
+
+let builtInGpuMismatchRejected = false;
+try {
+  saveWorkerResources([staleCpuGeneral], [
+    { profile: 'cpu-general', processes: 1, scale: 1 },
+  ]);
+} catch {
+  builtInGpuMismatchRejected = true;
+}
+assert(builtInGpuMismatchRejected,
+  'built-in cpu-general must reject GPU allocation');

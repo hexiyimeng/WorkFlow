@@ -819,6 +819,20 @@ def test_gpu_pool_rejects_multiple_processes_per_job() -> None:
         raise AssertionError("GPU Worker Pools must reject processes > 1")
 
 
+def test_built_in_cpu_profile_rejects_gpu_allocation() -> None:
+    try:
+        WorkerProfile(
+            name="cpu-general",
+            physical_resources=PhysicalResources(cpu=4, memory_gib=16, gpu=1),
+            logical_resources={"cpu-general": 1, "CPU": 4, "GPU": 1},
+            threads=4,
+        )
+    except ValueError as error:
+        assert "requires physical_resources.gpu=0" in str(error)
+    else:
+        raise AssertionError("cpu-general must never request a GPU")
+
+
 def test_local_worker_specs_use_profile_pool_counts_and_capabilities(tmp_path) -> None:
     reader = WorkerProfile(
         name="cpu-reader",

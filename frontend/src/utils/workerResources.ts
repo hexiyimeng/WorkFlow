@@ -5,6 +5,16 @@ export const WORKER_POOLS_STORAGE_KEY = 'worker_pools';
 
 const PROFILE_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const MEMORY = /^([0-9]+(?:\.[0-9]+)?)\s*(GB|GiB)$/i;
+const BUILT_IN_PROFILE_GPUS: Readonly<Record<string, 0 | 1>> = {
+  'cpu-general': 0,
+  'cpu-reader': 0,
+  'cpu-writer': 0,
+  'gpu-cellpose': 1,
+};
+
+export const fixedGpuForWorkerProfile = (name: string): 0 | 1 | undefined => (
+  BUILT_IN_PROFILE_GPUS[name]
+);
 
 const positiveMemory = (value: unknown): value is string => {
   if (typeof value !== 'string') return false;
@@ -122,7 +132,18 @@ export const loadWorkerProfiles = (): WorkerProfile[] => {
     if (!Array.isArray(parsed)) return [];
     return parsed.map(value => {
       if (!isRecord(value) || !isRecord(value.physical_resources)) return value;
-      return { ...value, threads: Number(value.physical_resources.cpu) };
+      const name = typeof value.name === 'string' ? value.name : '';
+      const fixedGpu = fixedGpuForWorkerProfile(name);
+      const physicalResources = {
+        ...value.physical_resources,
+        ...(fixedGpu === undefined ? {} : { gpu: fixedGpu }),
+      };
+      return synchronizeLogicalResources({
+        ...value,
+        name,
+        physical_resources: physicalResources,
+        threads: Number(value.physical_resources.cpu),
+      } as WorkerProfile);
     }).filter(isWorkerProfile);
   } catch {
     return [];
@@ -140,6 +161,12 @@ export const saveWorkerResources = (
   for (const [index, profile] of profiles.entries()) {
     const error = workerProfileError(profile, index);
     if (error) throw new Error(error);
+    const fixedGpu = fixedGpuForWorkerProfile(profile.name);
+    if (fixedGpu !== undefined && profile.physical_resources.gpu !== fixedGpu) {
+      throw new Error(
+        `Worker Profile "${profile.name}": GPU / Worker is fixed at ${fixedGpu}.`,
+      );
+    }
   }
   for (const [index, pool] of pools.entries()) {
     const error = workerPoolError(pool, index);
@@ -188,7 +215,7 @@ export const workerResourcePayload = (): {
 });
 
 export const defaultWorkerProfile = (name: string): WorkerProfile => {
-  const gpu = name.startsWith('gpu-') ? 1 : 0;
+  const gpu = fixedGpuForWorkerProfile(name) ?? (name.startsWith('gpu-') ? 1 : 0);
   const cpu = gpu > 0 ? 4 : 8;
   return {
     name,
