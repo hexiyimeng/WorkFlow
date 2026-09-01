@@ -58,8 +58,11 @@ from services.recovery_service import (
 )
 
 logger = logging.getLogger("BrainFlow.Executor")
-logging.getLogger("distributed.core").setLevel(logging.CRITICAL)
-logging.getLogger("distributed.utils").setLevel(logging.CRITICAL)
+# Keep connection failures visible.  Suppressing ``distributed.core`` at
+# CRITICAL hid the reason why a Scheduler disappeared while large graphs were
+# being submitted, leaving only the downstream FuturesCancelledError.
+logging.getLogger("distributed.core").setLevel(logging.WARNING)
+logging.getLogger("distributed.utils").setLevel(logging.WARNING)
 
 
 # =============================================================================
@@ -434,9 +437,22 @@ def _compute_with_resource_boundaries(
     client,
     collections,
     *,
-    disable_graph_optimization: bool,
+    preserve_resource_boundaries: bool,
 ):
-    """Submit collections without constraining framework finalization tasks."""
+    """Submit collections while retaining both culling and resource routing.
+
+    Window execution slices a collection whose HighLevelGraph describes the
+    complete dataset.  Disabling optimization to preserve Worker Profile
+    annotations also disabled Dask's culling pass, so every Window submitted
+    that complete graph to the Scheduler.  Large datasets consequently grew
+    the Driver by gigabytes before any Worker received useful work and could
+    make the Scheduler miss its communication timeout.
+
+    Dask already treats layers with different annotations as separate when
+    annotation fusion is disabled.  Keep normal collection optimization (and
+    therefore culling), while disabling only the fusion passes that could move
+    work across a Worker Profile boundary.
+    """
     # ``Client.compute`` adds finalization tasks for Dask collections.  Those
     # tasks are framework work rather than node work, so they may run on any
     # available Worker. The annotation applies only to layers created by
@@ -445,8 +461,14 @@ def _compute_with_resource_boundaries(
         brainflow_node_id="__framework_finalize__",
         worker_profile="framework",
     ):
-        if disable_graph_optimization:
-            return client.compute(collections, optimize_graph=False)
+        if preserve_resource_boundaries:
+            with dask.config.set(
+                {
+                    "optimization.annotations.fuse": False,
+                    "optimization.fuse.active": False,
+                }
+            ):
+                return client.compute(collections)
         return client.compute(collections)
 
 
@@ -623,7 +645,7 @@ async def _execute_pending_windows(
     tracked_futures: list,
     progress_callback,
     window_progress_callback,
-    disable_graph_optimization: bool,
+    preserve_resource_boundaries: bool,
 ) -> int:
     """Execute zero-valued Window positions with bounded, out-of-order completion."""
     total_windows = window_generator.total_windows
@@ -680,7 +702,7 @@ async def _execute_pending_windows(
             _compute_with_resource_boundaries(
                 client,
                 window_collections,
-                disable_graph_optimization=disable_graph_optimization,
+                preserve_resource_boundaries=preserve_resource_boundaries,
             )
         )
         tracked_futures.extend(futures)
@@ -1842,7 +1864,7 @@ async def execute_graph(
                     _compute_with_resource_boundaries(
                         client,
                         collections,
-                        disable_graph_optimization=(
+                        preserve_resource_boundaries=(
                             _requires_resource_boundary_preservation(resource_plan)
                         ),
                     )
@@ -1979,7 +2001,7 @@ async def execute_graph(
                     tracked_futures=sink_futures,
                     progress_callback=progress_callback,
                     window_progress_callback=window_progress_callback,
-                    disable_graph_optimization=(
+                    preserve_resource_boundaries=(
                         _requires_resource_boundary_preservation(resource_plan)
                     ),
                 )

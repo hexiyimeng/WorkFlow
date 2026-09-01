@@ -1025,6 +1025,12 @@ def get_fresh_scheduler_info(
 
 _memory_thresholds = _get_dask_memory_thresholds()
 _worker_ttl = os.getenv("WorkFlow_DASK_WORKER_TTL", "2h")
+_dashboard_token_expiration_seconds = int(
+    _positive_timeout_from_env(
+        "WorkFlow_DASK_DASHBOARD_TOKEN_EXPIRATION_SECONDS",
+        86_400.0,
+    )
+)
 dask.config.set(
     {
         "optimization.fuse.active": True,
@@ -1042,6 +1048,12 @@ dask.config.set(
             "distributed.worker.memory.terminate"
         ],
         "distributed.scheduler.worker-ttl": _worker_ttl,
+        # The on-demand Scheduler is replaced between workflow executions.
+        # A browser tab can otherwise retain Bokeh's five-minute token and
+        # repeatedly fail its WebSocket connection during a long run.
+        "distributed.scheduler.dashboard.bokeh-application.session_token_expiration": (
+            _dashboard_token_expiration_seconds
+        ),
     }
 )
 
