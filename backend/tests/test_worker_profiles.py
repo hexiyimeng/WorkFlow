@@ -19,7 +19,11 @@ from core.cluster_inventory import (
     parse_sinfo_partitions,
     parse_sinfo_nodes,
 )
-from core.resource_planner import ResourcePlanningError, plan_workflow_resources
+from core.resource_planner import (
+    ResourcePlanningError,
+    parse_required_worker_resources,
+    plan_workflow_resources,
+)
 from core.platform import rewrite_dashboard_url
 from core.worker_pool import WorkerPool
 from core.worker_profiles import (
@@ -831,6 +835,43 @@ def test_built_in_cpu_profile_rejects_gpu_allocation() -> None:
         assert "requires physical_resources.gpu=0" in str(error)
     else:
         raise AssertionError("cpu-general must never request a GPU")
+
+
+def test_unrequired_stale_profile_is_not_parsed_or_planned() -> None:
+    profiles, pools = parse_required_worker_resources(
+        [
+            {
+                "name": "cpu-general",
+                "physical_resources": {"cpu": 8, "memory": "32GB", "gpu": 1},
+                "logical_resources": {
+                    "cpu-general": 1,
+                    "CPU": 8,
+                    "GPU": 1,
+                },
+                "capabilities": ["cpu-general"],
+                "threads": 8,
+            },
+            {
+                "name": "gpu-cellpose",
+                "physical_resources": {"cpu": 4, "memory": "32GB", "gpu": 1},
+                "logical_resources": {
+                    "gpu-cellpose": 1,
+                    "CPU": 4,
+                    "GPU": 1,
+                },
+                "capabilities": ["gpu-cellpose"],
+                "threads": 4,
+            },
+        ],
+        [
+            {"profile": "cpu-general", "processes": 1, "scale": 1},
+            {"profile": "gpu-cellpose", "processes": 1, "scale": 2},
+        ],
+        ("gpu-cellpose",),
+    )
+
+    assert [profile.name for profile in profiles] == ["gpu-cellpose"]
+    assert [pool.profile for pool in pools] == ["gpu-cellpose"]
 
 
 def test_local_worker_specs_use_profile_pool_counts_and_capabilities(tmp_path) -> None:

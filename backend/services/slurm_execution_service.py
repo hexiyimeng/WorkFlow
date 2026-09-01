@@ -37,10 +37,9 @@ from core.platform import rewrite_dashboard_url
 from core.resource_planner import (
     SlurmAllocationPlan,
     SlurmJobRequirement,
+    parse_required_worker_resources,
     plan_workflow_resources,
 )
-from core.worker_pool import parse_worker_pools
-from core.worker_profiles import parse_worker_profiles
 from core.state_manager import ExecutionStatus, state_manager
 from core.window_execution import (
     ExecutionConfig,
@@ -719,10 +718,15 @@ def _plan_slurm_allocation(
         scontrol_executable=config.scontrol_executable
     ).load()
     partitions = config.policy.resolve_partitions(inventory.partition_names)
+    profiles, pools = parse_required_worker_resources(
+        worker_profiles,
+        worker_pools,
+        tuple(workflow_plan.required_worker_profiles),
+    )
     return plan_workflow_resources(
         workflow_plan,
-        parse_worker_profiles(worker_profiles),
-        parse_worker_pools(worker_pools),
+        profiles,
+        pools,
         inventory,
         time_limit=config.policy.time_limit,
         partitions=partitions,

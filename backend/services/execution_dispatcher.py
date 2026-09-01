@@ -6,9 +6,10 @@ import os
 from typing import Any
 
 from core.cluster_inventory import ClusterInventoryService
-from core.resource_planner import plan_workflow_resources
-from core.worker_pool import parse_worker_pools
-from core.worker_profiles import parse_worker_profiles
+from core.resource_planner import (
+    parse_required_worker_resources,
+    plan_workflow_resources,
+)
 from core.window_execution import ExecutionConfig
 from core.workflow_resources import build_workflow_resource_plan
 from services.executor import (
@@ -85,8 +86,11 @@ async def preflight_graph(
         return result
 
     try:
-        profiles = parse_worker_profiles(worker_profiles)
-        pools = parse_worker_pools(worker_pools)
+        profiles, pools = parse_required_worker_resources(
+            worker_profiles,
+            worker_pools,
+            tuple(required_names),
+        )
         profile_by_name = {profile.name: profile for profile in profiles}
         pool_by_name = {pool.profile: pool for pool in pools}
         required_names = set(required.get("requiredWorkerProfiles", {}))

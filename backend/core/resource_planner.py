@@ -4,13 +4,46 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from core.cluster_inventory import ClusterInventory, ClusterNode
-from core.worker_pool import WorkerPool
-from core.worker_profiles import WorkerProfile
+from core.worker_pool import WorkerPool, parse_worker_pools
+from core.worker_profiles import WorkerProfile, parse_worker_profiles
 from core.workflow_resources import WorkflowResourcePlan
 
 
 class ResourcePlanningError(ValueError):
     """A valid profile/pool request cannot be placed on the inventory."""
+
+
+def parse_required_worker_resources(
+    worker_profiles: object,
+    worker_pools: object,
+    required_names: Sequence[str],
+) -> tuple[tuple[WorkerProfile, ...], tuple[WorkerPool, ...]]:
+    """Parse only resources used by the current immutable workflow graph.
+
+    Browser storage intentionally retains Profiles for other workflows.  An
+    unrelated stale entry must not participate in validation or allocation for
+    this graph merely because it shares the same localStorage collection.
+    """
+
+    required = set(required_names)
+    if not isinstance(worker_profiles, list):
+        return parse_worker_profiles(worker_profiles), parse_worker_pools(worker_pools)
+    if not isinstance(worker_pools, list):
+        return parse_worker_profiles(worker_profiles), parse_worker_pools(worker_pools)
+    selected_profiles = [
+        value
+        for value in worker_profiles
+        if isinstance(value, Mapping) and value.get("name") in required
+    ]
+    selected_pools = [
+        value
+        for value in worker_pools
+        if isinstance(value, Mapping) and value.get("profile") in required
+    ]
+    return (
+        parse_worker_profiles(selected_profiles),
+        parse_worker_pools(selected_pools),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,5 +342,6 @@ __all__ = [
     "ResourcePlanningError",
     "SlurmAllocationPlan",
     "SlurmJobRequirement",
+    "parse_required_worker_resources",
     "plan_workflow_resources",
 ]

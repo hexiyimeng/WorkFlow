@@ -20,8 +20,7 @@ from core.invocation_builder import (
 )
 from core.config import config
 from core.worker_profiles import dask_annotation_kwargs
-from core.worker_profiles import parse_worker_profiles
-from core.worker_pool import parse_worker_pools
+from core.resource_planner import parse_required_worker_resources
 from core.platform import rewrite_dashboard_url
 from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
@@ -1504,10 +1503,15 @@ async def execute_graph(
                     "Workflow execution requires Worker Profiles and Worker Pools. "
                     "Configure Worker Resources in the frontend and retry."
                 )
+            profiles, pools = parse_required_worker_resources(
+                worker_profiles,
+                worker_pools,
+                tuple(resource_plan.required_worker_profiles),
+            )
             client = await asyncio.to_thread(
                 dask_service.ensure_profile_client,
-                profiles=parse_worker_profiles(worker_profiles),
-                pools=parse_worker_pools(worker_pools),
+                profiles=profiles,
+                pools=pools,
                 required_profiles=resource_plan.required_worker_profiles,
             )
         cluster_summary = await asyncio.to_thread(
