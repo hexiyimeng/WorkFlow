@@ -530,9 +530,19 @@ class WorkerMemoryTrimPlugin(WorkerPlugin):
         finish: Any,
         **kwargs: Any,
     ) -> None:
-        if not self._enabled or str(start) != "executing":
+        if not self._enabled:
             return
-        if str(finish) not in {"memory", "error", "released"}:
+        start_state = str(getattr(start, "value", start))
+        finish_state = str(getattr(finish, "value", finish))
+        task_finished = (
+            start_state == "executing"
+            and finish_state in {"memory", "error", "released"}
+        )
+        dependency_released = (
+            start_state == "memory"
+            and finish_state == "released"
+        )
+        if not task_finished and not dependency_released:
             return
         with self._lock:
             if self._timer is not None:

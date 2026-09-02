@@ -134,6 +134,30 @@ def test_writer_worker_trims_after_task_transition(monkeypatch) -> None:
     plugin.teardown(SimpleNamespace())
 
 
+def test_writer_worker_trims_when_dask_releases_input_dependency(monkeypatch) -> None:
+    trimmed = threading.Event()
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-writer")
+    monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_DELAY_SECONDS", "0.01")
+    monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_INTERVAL_SECONDS", "0.01")
+    monkeypatch.setattr(
+        dask_service_module,
+        "should_schedule_malloc_trim",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        dask_service_module,
+        "trim_process_allocator",
+        trimmed.set,
+    )
+
+    plugin = WorkerMemoryTrimPlugin()
+    plugin.setup(SimpleNamespace())
+    plugin.transition("mask-dependency", "memory", "released")
+
+    assert trimmed.wait(timeout=1)
+    plugin.teardown(SimpleNamespace())
+
+
 def test_non_writer_worker_does_not_schedule_post_task_trim(monkeypatch) -> None:
     trimmed = threading.Event()
     monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-reader")
