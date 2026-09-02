@@ -23,6 +23,7 @@ from core.platform import (
     dask_spill_dir,
     reclaim_process_memory,
     should_schedule_malloc_trim,
+    trim_process_allocator,
 )
 from core.worker_pool import WorkerPool
 from core.worker_profiles import WorkerProfile, worker_logical_resources
@@ -482,6 +483,96 @@ class WorkerDevicePlugin(WorkerPlugin):
         worker.assigned_gpu = "cuda:0"
 
 
+class WorkerMemoryTrimPlugin(WorkerPlugin):
+    """Trim Linux Writer arenas after Dask releases completed task arguments.
+
+    A task-level ``finally`` block runs while Dask still owns the task's input
+    arrays.  Trimming there cannot return those pages.  This plugin waits for
+    the executing-to-terminal Worker transition, then performs a short,
+    throttled allocator trim from a daemon thread so the Worker event loop can
+    continue sending heartbeats.
+    """
+
+    name = "workflow-worker-memory-trim"
+
+    def setup(self, worker: Any) -> None:
+        self._enabled = (
+            should_schedule_malloc_trim()
+            and os.environ.get("WORKFLOW_WORKER_PROFILE", "").strip()
+            == "cpu-writer"
+        )
+        self._delay = max(
+            0.05,
+            float(
+                os.getenv(
+                    "WorkFlow_DASK_WORKER_MEMORY_TRIM_DELAY_SECONDS",
+                    "0.5",
+                )
+            ),
+        )
+        self._interval = max(
+            self._delay,
+            float(
+                os.getenv(
+                    "WorkFlow_DASK_WORKER_MEMORY_TRIM_INTERVAL_SECONDS",
+                    "5",
+                )
+            ),
+        )
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._last_trim = 0.0
+
+    def transition(
+        self,
+        key: Any,
+        start: Any,
+        finish: Any,
+        **kwargs: Any,
+    ) -> None:
+        if not self._enabled or str(start) != "executing":
+            return
+        if str(finish) not in {"memory", "error", "released"}:
+            return
+        with self._lock:
+            if self._timer is not None:
+                return
+            now = time.monotonic()
+            delay = max(
+                self._delay,
+                self._interval - (now - self._last_trim),
+            )
+            timer = threading.Timer(delay, self._run_trim)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def _run_trim(self) -> None:
+        try:
+            trim_process_allocator()
+        finally:
+            with self._lock:
+                self._last_trim = time.monotonic()
+                self._timer = None
+
+    def teardown(self, worker: Any) -> None:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            timer = self._timer
+            self._timer = None
+        if timer is not None:
+            timer.cancel()
+
+
+def _worker_plugins() -> tuple[WorkerPlugin, ...]:
+    plugins: list[WorkerPlugin] = [WorkerDevicePlugin()]
+    if should_schedule_malloc_trim():
+        plugins.append(WorkerMemoryTrimPlugin())
+    return tuple(plugins)
+
+
 def worker_device_diagnostics(dask_worker: Any | None = None) -> dict[str, Any]:
     """Return lightweight role/device information from one Worker process.
 
@@ -614,7 +705,7 @@ def build_local_profile_cluster_specs(
                     "memory_limit": f"{profile.physical_resources.memory_gib}GB",
                     "local_directory": local_directory,
                     "silence_logs": logging.WARNING,
-                    "plugins": (WorkerDevicePlugin(),),
+                    "plugins": _worker_plugins(),
                     "startup_information": {
                         "workflowDevice": worker_device_startup_information,
                     },

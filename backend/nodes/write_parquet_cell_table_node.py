@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from core.execution_paths import normalize_execution_path
-from core.platform import reclaim_process_memory
+from core.platform import trim_process_allocator
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
@@ -465,7 +465,10 @@ def write_cell_table_block(mask: np.ndarray, ctx=None) -> np.ndarray:
                 release_unused()
         except Exception:
             pass
-        reclaim_process_memory()
+        # Do not force gc.collect() while Dask still owns the task arguments.
+        # A Worker lifecycle plugin performs another delayed trim after those
+        # input arrays have actually been released.
+        trim_process_allocator()
 
 
 @register_node("WriteParquetCellTable")

@@ -89,10 +89,9 @@ def should_schedule_malloc_trim() -> bool:
     return is_linux()
 
 
-def reclaim_process_memory() -> None:
-    """Collect Python cycles and return free glibc arenas when available."""
+def trim_process_allocator() -> None:
+    """Return already-freed glibc pages without forcing a Python GC pass."""
 
-    gc.collect()
     if not is_linux():
         return
     try:
@@ -101,8 +100,15 @@ def reclaim_process_memory() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         # Allocator reclamation is a best-effort Linux optimization.  A libc
-        # without malloc_trim must not make execution cleanup fail.
+        # without malloc_trim must not make task execution fail.
         return
+
+
+def reclaim_process_memory() -> None:
+    """Collect Python cycles and return free glibc arenas when available."""
+
+    gc.collect()
+    trim_process_allocator()
 
 
 def rewrite_dashboard_url(dashboard_link: str | None, custom_host: str | None) -> str | None:

@@ -56,12 +56,12 @@ def test_writer_entry_points_reclaim_memory_even_after_failure(monkeypatch) -> N
     zarr_reclaims: list[bool] = []
     monkeypatch.setattr(
         parquet_writer,
-        "reclaim_process_memory",
+        "trim_process_allocator",
         lambda: parquet_reclaims.append(True),
     )
     monkeypatch.setattr(
         zarr_writer,
-        "reclaim_process_memory",
+        "trim_process_allocator",
         lambda: zarr_reclaims.append(True),
     )
 

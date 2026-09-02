@@ -13,7 +13,7 @@ import dask.config
 import numpy as np
 
 from core.execution_paths import execution_path_suffix, normalize_execution_path
-from core.platform import reclaim_process_memory
+from core.platform import trim_process_allocator
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
@@ -536,7 +536,10 @@ def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
     try:
         return _write_zarr_block_impl(array, ctx)
     finally:
-        reclaim_process_memory()
+        # The task argument is still owned by Dask at this point.  Trim codec
+        # temporaries now; the Worker lifecycle plugin trims again after Dask
+        # releases the input array.
+        trim_process_allocator()
 
 
 @register_node("ZarrWriter")

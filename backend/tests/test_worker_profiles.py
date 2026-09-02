@@ -5,10 +5,13 @@ import inspect
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import distributed
 import pytest
+import services.dask_service as dask_service_module
+import services.slurm_worker_preload as slurm_worker_preload
 from dask_jobqueue import SLURMCluster
 from distributed.security import Security
 
@@ -40,6 +43,7 @@ from core.worker_ownership import (
 from nodes.base.block_map import BlockContextFactory
 from services.dask_service import (
     DaskService,
+    WorkerMemoryTrimPlugin,
     build_local_profile_cluster_specs,
     cluster_resource_summary_from_scheduler_info,
     validate_external_worker_ownership,
@@ -104,6 +108,73 @@ def test_dashboard_browser_host_override_preserves_dask_status_path() -> None:
         "http://127.0.0.1:8787/status",
         "127.0.0.1:18787",
     ) == "http://127.0.0.1:18787/status"
+
+
+def test_writer_worker_trims_after_task_transition(monkeypatch) -> None:
+    trimmed = threading.Event()
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-writer")
+    monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_DELAY_SECONDS", "0.01")
+    monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_INTERVAL_SECONDS", "0.01")
+    monkeypatch.setattr(
+        dask_service_module,
+        "should_schedule_malloc_trim",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        dask_service_module,
+        "trim_process_allocator",
+        trimmed.set,
+    )
+
+    plugin = WorkerMemoryTrimPlugin()
+    plugin.setup(SimpleNamespace())
+    plugin.transition("writer-task", "executing", "memory")
+
+    assert trimmed.wait(timeout=1)
+    plugin.teardown(SimpleNamespace())
+
+
+def test_non_writer_worker_does_not_schedule_post_task_trim(monkeypatch) -> None:
+    trimmed = threading.Event()
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-reader")
+    monkeypatch.setattr(
+        dask_service_module,
+        "should_schedule_malloc_trim",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        dask_service_module,
+        "trim_process_allocator",
+        trimmed.set,
+    )
+
+    plugin = WorkerMemoryTrimPlugin()
+    plugin.setup(SimpleNamespace())
+    plugin.transition("reader-task", "executing", "memory")
+
+    assert not trimmed.wait(timeout=0.1)
+    plugin.teardown(SimpleNamespace())
+
+
+def test_slurm_preload_registers_worker_memory_lifecycle_plugin(monkeypatch) -> None:
+    worker = SimpleNamespace(plugins={})
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-writer")
+    monkeypatch.setattr(
+        slurm_worker_preload,
+        "should_schedule_malloc_trim",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        slurm_worker_preload.WorkerDevicePlugin,
+        "setup",
+        lambda self, configured_worker: None,
+    )
+
+    slurm_worker_preload.dask_setup(worker)
+
+    plugin = worker.plugins[WorkerMemoryTrimPlugin.name]
+    assert isinstance(plugin, WorkerMemoryTrimPlugin)
+    plugin.teardown(worker)
 
 
 def test_node_without_profile_uses_cpu_general_default() -> None:
