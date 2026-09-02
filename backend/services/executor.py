@@ -611,24 +611,36 @@ async def _log_memory_snapshot_with_timeout(
     return True
 
 
+def _wait_for_futures_fail_fast(futures: list) -> None:
+    """Stop waiting as soon as any terminal Future fails.
+
+    A Window can have multiple terminal outputs.  Waiting for all of them
+    before inspecting exceptions deadlocks failure propagation when one
+    output exhausts its Worker pool while another remains permanently
+    pending.  Polling completed Futures lets the Driver enter its bounded
+    cancellation path immediately after the first observable failure.
+    """
+    pending = list(futures)
+    while pending:
+        completed = dist_wait(
+            pending,
+            return_when="FIRST_COMPLETED",
+        )
+        for future in completed.done:
+            exception = future.exception()
+            if exception is not None:
+                raise exception
+        pending = list(completed.not_done)
+
+
 async def _wait_for_window_futures(futures: list) -> None:
-    """Wait for, then inspect, every terminal Future for one Window."""
+    """Wait for one Window's terminal Futures with fail-fast propagation."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None,
-        lambda: dist_wait(futures),
+        _wait_for_futures_fail_fast,
+        futures,
     )
-    future_exceptions: list[BaseException] = []
-    for future in futures:
-        try:
-            exception = await loop.run_in_executor(None, future.exception)
-        except BaseException as exc:
-            future_exceptions.append(exc)
-        else:
-            if exception is not None:
-                future_exceptions.append(exception)
-    if future_exceptions:
-        raise future_exceptions[0]
 
 
 async def _cancel_in_flight_windows(
@@ -772,7 +784,7 @@ async def _execute_pending_windows(
             )
             first_error: BaseException | None = None
             for waiter in done:
-                entry = in_flight.pop(waiter)
+                entry = in_flight[waiter]
                 try:
                     waiter.result()
                     # The Driver commits only after all terminal Futures for
@@ -798,7 +810,12 @@ async def _execute_pending_windows(
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc
-                finally:
+                else:
+                    # Failed entries remain tracked until the outer cleanup
+                    # cancels every Future belonging to that Window.  This is
+                    # required now that the waiter deliberately returns before
+                    # its sibling terminal Futures have completed.
+                    in_flight.pop(waiter)
                     _release_futures(entry.futures)
                     _remove_futures(tracked_futures, entry.futures)
 

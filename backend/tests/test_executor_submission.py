@@ -12,6 +12,7 @@ from core.worker_profiles import (
 from services.executor import (
     _compute_with_resource_boundaries,
     _normalize_futures,
+    _wait_for_futures_fail_fast,
 )
 
 
@@ -124,6 +125,48 @@ def test_nested_block_futures_are_flattened_for_wait_and_cleanup() -> None:
         second,
         third,
     ]
+
+
+class _CompletedFutures:
+    def __init__(self, done, not_done) -> None:
+        self.done = done
+        self.not_done = not_done
+
+
+class _FakeFuture:
+    def __init__(self, exception: BaseException | None = None) -> None:
+        self._exception = exception
+        self.inspected = False
+
+    def exception(self):
+        self.inspected = True
+        return self._exception
+
+
+def test_window_future_wait_fails_before_pending_sibling_finishes(
+    monkeypatch,
+) -> None:
+    failure = RuntimeError("writer worker exhausted its memory budget")
+    failed = _FakeFuture(failure)
+    still_pending = _FakeFuture()
+    wait_calls = []
+
+    def fake_wait(futures, *, return_when):
+        wait_calls.append((list(futures), return_when))
+        return _CompletedFutures({failed}, {still_pending})
+
+    monkeypatch.setattr("services.executor.dist_wait", fake_wait)
+
+    try:
+        _wait_for_futures_fail_fast([failed, still_pending])
+    except RuntimeError as exc:
+        assert exc is failure
+    else:
+        raise AssertionError("the first failed Future was not propagated")
+
+    assert wait_calls == [([failed, still_pending], "FIRST_COMPLETED")]
+    assert failed.inspected is True
+    assert still_pending.inspected is False
 
 
 def test_live_scheduler_routes_frozen_layers_to_matching_profiles() -> None:
