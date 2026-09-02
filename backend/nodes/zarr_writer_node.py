@@ -13,6 +13,7 @@ import dask.config
 import numpy as np
 
 from core.execution_paths import execution_path_suffix, normalize_execution_path
+from core.platform import reclaim_process_memory
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
@@ -469,7 +470,7 @@ def _prepare_store(
         }
 
 
-def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
+def _write_zarr_block_impl(array: np.ndarray, ctx=None) -> np.ndarray:
     if ctx is None:
         raise RuntimeError("ZarrWriter block requires a BlockContext.")
     resources = ctx.resources or {}
@@ -527,6 +528,15 @@ def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
         )
     token_shape = ctx.output_chunk_shape or ((1,) * int(array.ndim))
     return np.ones(tuple(int(x) for x in token_shape), dtype=TOKEN_DTYPE)
+
+
+def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
+    """Write one Zarr block without retaining codec/native allocator arenas."""
+
+    try:
+        return _write_zarr_block_impl(array, ctx)
+    finally:
+        reclaim_process_memory()
 
 
 @register_node("ZarrWriter")

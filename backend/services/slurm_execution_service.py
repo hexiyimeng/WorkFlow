@@ -2515,6 +2515,11 @@ class SlurmExecutionService:
                     nanny_port_range=config.nanny_port_range,
                 ))
 
+            # DaskService is the sole runtime owner from this point onward.
+            # Avoid retaining a second Driver Client reference in the Slurm
+            # controller for the entire (potentially multi-hour) execution.
+            client = None
+
             _atomic_write_json(job_path, {
                 "schemaVersion": JOB_SCHEMA_VERSION,
                 "executionId": execution_id,

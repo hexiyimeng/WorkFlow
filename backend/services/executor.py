@@ -22,7 +22,7 @@ from core.invocation_builder import (
 from core.config import config
 from core.worker_profiles import dask_annotation_kwargs
 from core.resource_planner import parse_required_worker_resources
-from core.platform import rewrite_dashboard_url
+from core.platform import reclaim_process_memory, rewrite_dashboard_url
 from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
 from core.type_system import can_connect_types, is_dask_array_type
@@ -1401,6 +1401,7 @@ async def execute_graph(
     sink_futures: list = []
     results: dict = {}
     node_instances: dict = {}
+    root_arrays: list[da.Array] = []
     client = None
     should_cancel_dask_objects = False
 
@@ -2296,6 +2297,10 @@ async def execute_graph(
                 "[Cleanup] External Slurm Worker allocation cleanup is "
                 "delegated to the service-node execution controller."
             )
+            # The barrier has stopped the on-demand Scheduler.  Keeping its
+            # closed Client in this coroutine frame also keeps graph/future
+            # registries reachable until the whole execution function returns.
+            client = None
         elif client and should_cancel_dask_objects:
             # A failed/cancelled task may have died while owning a no-expiry
             # Zarr storage-chunk lease. Rebuild the local Profile cluster before
@@ -2358,6 +2363,9 @@ async def execute_graph(
         sink_futures.clear()
         tasks.clear()
         results.clear()
+        root_arrays.clear()
+        node_instances.clear()
+        await asyncio.to_thread(reclaim_process_memory)
         # Keep the single-active-execution lease until all Driver/Worker
         # cleanup has completed. A following DAG may require a different
         # Worker topology and must not replace this execution's cluster early.

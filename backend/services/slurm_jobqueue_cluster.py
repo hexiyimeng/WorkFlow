@@ -281,6 +281,12 @@ def build_planned_slurm_worker_spec(
         f"export PATH={shlex.quote(str(python.parent))}:/usr/local/bin:/usr/bin:/bin",
         f"export PYTHONPATH={shlex.quote(str(backend))}",
         "export PYTHONUNBUFFERED=1",
+        # ``--export=NONE`` intentionally isolates compute jobs from the login
+        # environment, so allocator settings must be carried explicitly.  CPU
+        # Writer processes are reused for many blocks and otherwise retain
+        # large NumPy/Arrow/codec arenas until Slurm or the Nanny kills them.
+        "export MALLOC_ARENA_MAX=2",
+        "export MALLOC_TRIM_THRESHOLD_=0",
         "export WORKFLOW_DASK_WORKER_PROCESS=1",
         f"export WORKFLOW_EXECUTION_ID={shlex.quote(execution_id)}",
         f"export WORKFLOW_SUBMISSION_TOKEN_HASH={shlex.quote(token_hash)}",

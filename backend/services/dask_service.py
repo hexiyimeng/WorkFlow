@@ -15,10 +15,15 @@ import dask.config
 from dask.distributed import Client, Nanny, Scheduler, Security, SpecCluster
 from distributed import WorkerPlugin, get_worker
 from distributed.core import Status
+from distributed.diagnostics.plugin import SchedulerPlugin
 
 from core.config import _is_main_process, config
 from core.logger import logger
-from core.platform import dask_spill_dir, should_schedule_malloc_trim
+from core.platform import (
+    dask_spill_dir,
+    reclaim_process_memory,
+    should_schedule_malloc_trim,
+)
 from core.worker_pool import WorkerPool
 from core.worker_profiles import WorkerProfile, worker_logical_resources
 from core.worker_ownership import (
@@ -510,18 +515,44 @@ def worker_device_startup_information(worker: Any) -> dict[str, Any]:
 
 
 def _malloc_trim_once() -> None:
-    import ctypes
-    import gc
-
-    gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception as exc:
-        logger.debug("Memory trim failed: %s", exc)
+    reclaim_process_memory()
 
 
 def _schedule_malloc_trim_on_scheduler(dask_scheduler: Any) -> None:
-    dask_scheduler.loop.call_later(60, _malloc_trim_once)
+    """Periodically return released graph pages from the Scheduler process."""
+
+    interval = float(
+        os.getenv(
+            "WorkFlow_DASK_SCHEDULER_MEMORY_TRIM_INTERVAL_SECONDS",
+            "60",
+        )
+    )
+    if interval <= 0:
+        return
+
+    def trim_and_reschedule() -> None:
+        status = getattr(dask_scheduler, "status", None)
+        if status in {Status.closing, Status.closed, "closing", "closed"}:
+            return
+        _malloc_trim_once()
+        dask_scheduler.loop.call_later(interval, trim_and_reschedule)
+
+    dask_scheduler.loop.call_later(interval, trim_and_reschedule)
+
+
+class _SchedulerMemoryTrimPlugin(SchedulerPlugin):
+    """Install Linux allocator maintenance on an in-process Scheduler."""
+
+    name = "workflow-scheduler-memory-trim"
+
+    async def start(self, scheduler: Any) -> None:
+        _schedule_malloc_trim_on_scheduler(scheduler)
+
+
+def _scheduler_plugins() -> tuple[Any, ...]:
+    if not should_schedule_malloc_trim():
+        return ()
+    return (_SchedulerMemoryTrimPlugin(),)
 
 
 def build_local_profile_cluster_specs(
@@ -540,6 +571,7 @@ def build_local_profile_cluster_specs(
         "options": {
             "host": LOCAL_CLUSTER_HOST,
             "dashboard_address": dashboard_address,
+            "plugins": _scheduler_plugins(),
         },
     }
     worker_specs: dict[str, dict[str, Any]] = {}
@@ -1404,6 +1436,7 @@ class DaskService:
                         # only need the separate Scheduler protocol address.
                         "dashboard": True,
                         "dashboard_address": dashboard_address,
+                        "plugins": _scheduler_plugins(),
                     },
                     security=security,
                     asynchronous=False,

@@ -243,6 +243,11 @@ export WorkFlow_MODELS_DIR="$WORKFLOW_RUNTIME_DIR/models"
 export CELLPOSE_LOCAL_MODELS_PATH="$WORKFLOW_RUNTIME_DIR/models/cellpose"
 export WorkFlow_CUDA_MODE="disabled"
 export CUDA_VISIBLE_DEVICES=""
+# The on-demand SLURMCluster Scheduler lives inside this long-running process.
+# Bound glibc arena proliferation and aggressively return pages released after
+# Window graph materialization.  Operators can still override either value.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-0}"
 
 printf '%s\n' \
   "Starting the WorkFlow control plane" \

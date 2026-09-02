@@ -9,6 +9,12 @@ from core.worker_profiles import (
     dask_annotation_kwargs,
     worker_logical_resources,
 )
+from core.node_invocation import NodeRuntime
+from nodes.base.block_map import (
+    BlockContextFactory,
+    BlockwiseInputPlan,
+    ProcessBlockBinder,
+)
 from services.executor import (
     _compute_with_resource_boundaries,
     _normalize_futures,
@@ -22,6 +28,44 @@ class _ReaderNode:
 
 class _GpuNode:
     required_worker_profile = "gpu-cellpose"
+
+
+class _BlockNode:
+    DASK_API = "map_blocks"
+
+
+def test_block_callable_does_not_capture_complete_upstream_plan() -> None:
+    upstream_graph_owner = object()
+    plan = BlockwiseInputPlan(
+        ordered_names=["dask_arr"],
+        primary_name="dask_arr",
+        array_inputs={"dask_arr": upstream_graph_owner},
+        params={},
+        ordered_arrays=[upstream_graph_owner],
+        axes_by_name={"dask_arr": ("z", "y", "x")},
+    )
+
+    wrapped = ProcessBlockBinder().build_wrapped_function(
+        _BlockNode(),
+        input_plan=plan,
+        params={},
+        runtime=NodeRuntime(
+            node_id="test",
+            execution_id="execution",
+            worker_profile="cpu-general",
+        ),
+        preprocess_state={},
+        context_factory=BlockContextFactory(),
+    )
+
+    # The old closure captured ``input_plan`` and therefore every upstream
+    # Dask Array/graph reachable through it.  Each map task then recursively
+    # serialized the complete workflow graph.
+    assert "input_plan" not in wrapped.__code__.co_freevars
+    assert all(
+        cell.cell_contents is not upstream_graph_owner
+        for cell in (wrapped.__closure__ or ())
+    )
 
 
 def _assert_profile_and_add(block, *, profile: str, amount: int):

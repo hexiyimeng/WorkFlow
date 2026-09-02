@@ -364,6 +364,8 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
     assert "--nthreads 4" in script
     assert "--nanny" in script
     assert "services.slurm_worker_preload" in script
+    assert "export MALLOC_ARENA_MAX=2" in script
+    assert "export MALLOC_TRIM_THRESHOLD_=0" in script
     assert "services.dask_worker_network" in script
     assert "--scheduler-host mn02 --scheduler-port 8786" in script
     assert '--host "$WORKFLOW_DASK_WORKER_HOST"' in script

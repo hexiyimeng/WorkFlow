@@ -1132,9 +1132,16 @@ class ProcessBlockBinder:
         preprocess_state: dict,
         context_factory: BlockContextFactory,
     ):
+        # Capture only the scalar routing metadata needed by a block task.
+        # Capturing ``input_plan`` also captures ``array_inputs`` and
+        # ``ordered_arrays``. Those Dask Arrays own the complete upstream graph,
+        # so every map callable recursively carried the whole workflow graph.
+        ordered_names = tuple(input_plan.ordered_names)
+        primary_name = input_plan.primary_name
+
         def wrapped(*blocks, block_info=None):
             block_info = block_info or {}
-            named_blocks = dict(zip(input_plan.ordered_names, blocks))
+            named_blocks = dict(zip(ordered_names, blocks))
             expected_profile = runtime.worker_profile
             device_hint = context_factory.resolve_device_hint(
                 expected_profile
@@ -1155,12 +1162,18 @@ class ProcessBlockBinder:
             }
             ctx = context_factory.build(
                 named_blocks=named_blocks,
-                ordered_names=input_plan.ordered_names,
-                primary_name=input_plan.primary_name,
+                ordered_names=ordered_names,
+                primary_name=primary_name,
                 block_info=block_info,
                 runtime=runtime_dict,
             )
-            return self.call_process_block(node, named_blocks, input_plan.primary_name, params, ctx)
+            return self.call_process_block(
+                node,
+                named_blocks,
+                primary_name,
+                params,
+                ctx,
+            )
 
         wrapped._is_dask_array_map_wrapped = True
         wrapped.__name__ = (
