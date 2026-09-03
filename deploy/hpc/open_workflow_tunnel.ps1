@@ -10,19 +10,34 @@ param(
     [int]$LocalPort = 18000,
 
     [ValidateRange(1, 65535)]
-    [int]$RemotePort = 8000
+    [int]$RemotePort = 8000,
+
+    [ValidateRange(1, 65535)]
+    [int]$DashboardLocalPort = 18787,
+
+    [ValidateRange(1, 65535)]
+    [int]$DashboardRemotePort = 8787
 )
 
 $ssh = (Get-Command ssh.exe -ErrorAction Stop).Source
 $forward = "127.0.0.1:${LocalPort}:127.0.0.1:${RemotePort}"
+$dashboardForward = "127.0.0.1:${DashboardLocalPort}:127.0.0.1:${DashboardRemotePort}"
 $target = "${User}@${ClusterHost}"
+$logDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'WorkFlow'
+$logPath = Join-Path $logDirectory 'ssh-tunnel.log'
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 $arguments = @(
     '-N',
     '-T',
+    '-v',
+    '-E', $logPath,
     '-o', 'ExitOnForwardFailure=yes',
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
+    '-o', 'TCPKeepAlive=yes',
+    '-o', 'ConnectTimeout=20',
     '-L', $forward,
+    '-L', $dashboardForward,
     $target
 )
 
@@ -62,6 +77,8 @@ if (-not $connected) {
 
 $url = "http://127.0.0.1:${LocalPort}/"
 Write-Host "WorkFlow tunnel is ready: $url"
+Write-Host "Dask dashboard tunnel: http://127.0.0.1:${DashboardLocalPort}/status"
+Write-Host "SSH diagnostics: $logPath"
 Write-Host 'Keep the SSH window open while using WorkFlow.'
 Start-Process $url
 
@@ -70,6 +87,8 @@ Start-Process $url
 # pressing Ctrl+C ends the exact child tunnel instead of leaving it detached.
 try {
     Wait-Process -Id $process.Id
+    $process.Refresh()
+    Write-Warning "SSH tunnel exited with code $($process.ExitCode). Diagnostics: $logPath"
 }
 finally {
     if (-not $process.HasExited) {

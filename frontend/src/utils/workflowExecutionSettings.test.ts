@@ -224,6 +224,26 @@ assert(
   'new-run recovery location should be copied explicitly',
 );
 
+const defaultConcurrencyConfig = buildNewRunExecutionConfig({
+  ...windowSettings,
+  maxInFlightWindows: undefined,
+}, {
+  outputShape: [293, 1077, 1050],
+  availableAnchorNodeIds: ['writer-123'],
+});
+assert(
+  defaultConcurrencyConfig.mode === 'window'
+    && defaultConcurrencyConfig.maxInFlightWindows === 1,
+  'Window execution must default Maximum In-Flight Windows to 1',
+);
+assert(
+  formatWorkflowExecutionSettingsSummary({
+    ...windowSettings,
+    maxInFlightWindows: undefined,
+  }).includes('In-flight 1'),
+  'the header summary must show the effective default concurrency',
+);
+
 const fullGraphConfig = buildNewRunExecutionConfig({
   ...createDefaultWorkflowExecutionSettings(),
   resumeAction: 'resume',
@@ -238,18 +258,21 @@ const preflight: ExecutionPreflightResponse = {
   outputShape: [293, 1077, 1050],
   totalWindows: 125,
   requiredResources: {
-    requiresCpu: true,
-    requiresGpu: true,
-    cpuWorkers: 1,
-    gpuWorkers: 8,
-    cpuNodes: [],
-    gpuNodes: [],
+    requiredWorkerProfiles: {
+      'cpu-general': 1,
+      'gpu-inference': 8,
+    },
+    profileRequirements: [],
   },
 };
 const summary = lastPreflightSummaryFromResponse(preflight, 1234);
 assert(summary.outputShape?.join(',') === '293,1077,1050', 'preflight summary should retain output shape');
 assert(summary.totalWindows === 125, 'preflight summary should retain total Windows');
-assert(summary.cpuWorkers === 1 && summary.gpuWorkers === 8, 'preflight summary should retain resource counts');
+assert(
+  summary.requiredWorkerProfiles?.['cpu-general'] === 1
+    && summary.requiredWorkerProfiles['gpu-inference'] === 8,
+  'preflight summary should retain Worker Profile requirements',
+);
 assert(summary.validatedAt === 1234, 'preflight summary should retain validation time');
 
 const settingsWithSummary = withLastPreflightSummary(windowSettings, preflight, 1234);

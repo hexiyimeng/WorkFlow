@@ -4,10 +4,13 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import dask
 import dask.array as da
 import numpy as np
+from dask.base import tokenize
 
 from core.registry import register_node
+from core.worker_profiles import dask_annotation_kwargs
 from nodes.base import ChunkPlanner
 
 
@@ -20,6 +23,17 @@ DEFAULT_AXES = {
     4: ("C", "Z", "Y", "X"),
     5: ("T", "C", "Z", "Y", "X"),
 }
+
+
+def _materialize_zarr_block(block: np.ndarray) -> np.ndarray:
+    """Expose one decoded Zarr chunk as a managed cpu-reader dependency.
+
+    ``np.asarray`` is intentionally zero-copy for the normal NumPy result from
+    Zarr.  The separate Dask layer is a scheduling/lifetime boundary, not a
+    request to copy or persist the complete dataset.
+    """
+
+    return np.asarray(block)
 
 
 def _normalize_zarr_path(value: str) -> Path:
@@ -88,9 +102,12 @@ def _resolve_group_array(group, requested_path: str | None, multiscale_index: in
             array_path = array_paths[0] if len(array_paths) == 1 else None
 
     if array_path is None:
+        available = ", ".join(repr(path) for path in array_paths) or "none"
         raise ValueError(
-            "Could not infer an array dataset from the zarr group. "
-            "Provide array_path explicitly, for example '0' or 'labels/cells/0'."
+            "Could not infer one array dataset from the zarr group because it "
+            f"contains multiple candidate arrays: {available}. Set the Reader "
+            "array_path explicitly, for example 's0', 's1', '0', or "
+            "'labels/cells/0'."
         )
     return group[array_path], array_path
 
@@ -138,8 +155,7 @@ class OMEZarrReader:
     PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr / OME-Zarr Reader"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 6
+    required_worker_profile = "cpu-reader"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -176,6 +192,7 @@ class OMEZarrReader:
         chunk_y=64,
         chunk_x=64,
         keep_first_dim=False,
+        _runtime=None,
     ):
         root_path = _normalize_zarr_path(file_path)
         requested_path = str(array_path or "").strip().strip("/").strip()
@@ -230,5 +247,43 @@ class OMEZarrReader:
             target_chunks,
         )
 
-        dask_arr = da.from_zarr(str(array_store_path), chunks=target_chunks)
-        return (dask_arr,)
+        runtime = _runtime if isinstance(_runtime, dict) else {}
+        node_id = str(runtime.get("node_id") or "reader")
+        execution_id = str(runtime.get("execution_id") or "unbound")
+        read_layer_name = "OMEZarrReader-read-" + tokenize(
+            str(array_store_path),
+            shape,
+            str(z_arr.dtype),
+            target_chunks,
+            node_id,
+            execution_id,
+        )
+
+        # Both the storage task and the explicit hand-off task belong to the
+        # cpu-reader profile.  The hand-off makes the decoded NumPy chunk a
+        # concrete Dask dependency before Cellpose is eligible to run.  Dask
+        # retains only the chunks needed by submitted Windows and releases
+        # them after their downstream consumers finish; this is deliberately
+        # not ``persist()``, which would materialize the whole array.
+        with dask.annotate(
+            **dask_annotation_kwargs(type(self), node_id)
+        ):
+            source = da.from_zarr(
+                str(array_store_path),
+                chunks=target_chunks,
+            )
+            materialized = da.map_blocks(
+                _materialize_zarr_block,
+                source,
+                dtype=source.dtype,
+                chunks=source.chunks,
+                meta=np.empty((0,) * source.ndim, dtype=source.dtype),
+                name=read_layer_name,
+            )
+        logger.info(
+            "[ZarrReader] streaming read layer=%s profile=%s; chunks are "
+            "materialized per submitted Window, not persisted as a full array",
+            read_layer_name,
+            self.required_worker_profile,
+        )
+        return (materialized,)

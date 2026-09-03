@@ -11,6 +11,7 @@ import dask
 import dask.array as da
 import numpy as np
 from dask.base import is_dask_collection
+from dask.highlevelgraph import HighLevelGraph
 from distributed import wait as dist_wait
 
 from core.invocation_builder import (
@@ -19,8 +20,9 @@ from core.invocation_builder import (
     prepare_node_inputs,
 )
 from core.config import config
-from core.execution_resources import dask_annotation_kwargs
-from core.platform import rewrite_dashboard_url
+from core.worker_profiles import dask_annotation_kwargs
+from core.resource_planner import parse_required_worker_resources
+from core.platform import reclaim_process_memory, rewrite_dashboard_url
 from core.registry import NODE_CLASS_MAPPINGS, validate_node_port_types
 from core.state_manager import state_manager, ExecutionStatus
 from core.type_system import can_connect_types, is_dask_array_type
@@ -57,8 +59,11 @@ from services.recovery_service import (
 )
 
 logger = logging.getLogger("BrainFlow.Executor")
-logging.getLogger("distributed.core").setLevel(logging.CRITICAL)
-logging.getLogger("distributed.utils").setLevel(logging.CRITICAL)
+# Keep connection failures visible.  Suppressing ``distributed.core`` at
+# CRITICAL hid the reason why a Scheduler disappeared while large graphs were
+# being submitted, leaving only the downstream FuturesCancelledError.
+logging.getLogger("distributed.core").setLevel(logging.WARNING)
+logging.getLogger("distributed.utils").setLevel(logging.WARNING)
 
 
 # =============================================================================
@@ -342,7 +347,10 @@ async def _cancel_sink_futures_with_timeout(
 
 def _normalize_futures(futures) -> list:
     if isinstance(futures, (list, tuple)):
-        return list(futures)
+        normalized = []
+        for item in futures:
+            normalized.extend(_normalize_futures(item))
+        return normalized
     return [futures]
 
 
@@ -433,19 +441,77 @@ def _compute_with_resource_boundaries(
     client,
     collections,
     *,
-    disable_graph_optimization: bool,
+    preserve_resource_boundaries: bool,
 ):
-    """Submit collections without constraining framework finalization tasks."""
-    # ``Client.compute`` adds finalization tasks for Dask collections.  Those
-    # tasks are framework work rather than node work, so they may run on any
-    # available Worker. The annotation applies only to layers created by
-    # ``compute``; existing node layers keep their CPU/GPU resource annotations.
+    """Submit collections while retaining both culling and resource routing.
+
+    Window execution slices a collection whose HighLevelGraph describes the
+    complete dataset.  Disabling optimization to preserve Worker Profile
+    annotations also disabled Dask's culling pass, so every Window submitted
+    that complete graph to the Scheduler.  Large datasets consequently grew
+    the Driver by gigabytes before any Worker received useful work and could
+    make the Scheduler miss its communication timeout.
+
+    Dask 2026 serializes an expression and normally materializes/optimizes it
+    later on the Scheduler.  A temporary client-side config context therefore
+    cannot safely control fusion: by the time the Scheduler materializes the
+    graph, that context may have ended.  Optimize each collection eagerly,
+    verify that the annotated HighLevelGraph survived, merge the already
+    culled graphs, and submit their concrete block keys through ``Client.get``.
+    ``Client.get`` wraps this graph without another collection optimizer, so
+    the Scheduler cannot fuse a GPU model task into a CPU-reader task.
+    """
+    if preserve_resource_boundaries:
+        optimized_graphs = []
+        collection_keys = []
+        with dask.config.set(
+            {
+                "optimization.annotations.fuse": False,
+                "optimization.fuse.active": False,
+            }
+        ):
+            for collection in collections:
+                graph = collection.__dask_graph__()
+                keys = collection.__dask_keys__()
+                optimized = collection.__dask_optimize__(graph, keys)
+                if not isinstance(optimized, HighLevelGraph):
+                    raise RuntimeError(
+                        "Worker Profile graph optimization materialized a "
+                        "low-level graph and lost resource annotations."
+                    )
+                for layer_name, layer in optimized.layers.items():
+                    annotations = dict(layer.annotations or {})
+                    required_profile = annotations.get(
+                        "required_worker_profile"
+                    )
+                    if required_profile is None:
+                        continue
+                    resources = dict(annotations.get("resources") or {})
+                    if float(resources.get(required_profile, 0)) < 1.0:
+                        raise RuntimeError(
+                            "Optimized Dask layer "
+                            f"{layer_name!r} requires Worker Profile "
+                            f"{required_profile!r}, but advertises task "
+                            f"resources {resources!r}."
+                        )
+                optimized_graphs.append(optimized)
+                collection_keys.append(keys)
+
+        if not optimized_graphs:
+            return []
+        submission_graph = HighLevelGraph.merge(*optimized_graphs)
+        return client.get(
+            submission_graph,
+            collection_keys,
+            sync=False,
+        )
+
+    # ``Client.compute`` adds finalization tasks for ordinary single-profile
+    # collections.  They are framework work and may run on any Worker.
     with dask.annotate(
         brainflow_node_id="__framework_finalize__",
-        execution_resource="any",
+        worker_profile="framework",
     ):
-        if disable_graph_optimization:
-            return client.compute(collections, optimize_graph=False)
         return client.compute(collections)
 
 
@@ -471,10 +537,9 @@ def _resolve_max_in_flight_windows(
     resource_plan: WorkflowResourcePlan,
     cluster_summary,
 ) -> int:
+    del resource_plan, cluster_summary
     if requested is not None:
         resolved = requested
-    elif resource_plan.requires_gpu:
-        resolved = max(1, 2 * len(cluster_summary.gpu_workers))
     else:
         resolved = 1
 
@@ -498,7 +563,7 @@ def _requires_resource_boundary_preservation(
 ) -> bool:
     """Return whether optimization could fuse differently constrained layers."""
 
-    return len({node.resource for node in plan.nodes}) > 1
+    return len({node.worker_profile for node in plan.nodes}) > 1
 
 
 @dataclass
@@ -546,24 +611,36 @@ async def _log_memory_snapshot_with_timeout(
     return True
 
 
+def _wait_for_futures_fail_fast(futures: list) -> None:
+    """Stop waiting as soon as any terminal Future fails.
+
+    A Window can have multiple terminal outputs.  Waiting for all of them
+    before inspecting exceptions deadlocks failure propagation when one
+    output exhausts its Worker pool while another remains permanently
+    pending.  Polling completed Futures lets the Driver enter its bounded
+    cancellation path immediately after the first observable failure.
+    """
+    pending = list(futures)
+    while pending:
+        completed = dist_wait(
+            pending,
+            return_when="FIRST_COMPLETED",
+        )
+        for future in completed.done:
+            exception = future.exception()
+            if exception is not None:
+                raise exception
+        pending = list(completed.not_done)
+
+
 async def _wait_for_window_futures(futures: list) -> None:
-    """Wait for, then inspect, every terminal Future for one Window."""
+    """Wait for one Window's terminal Futures with fail-fast propagation."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None,
-        lambda: dist_wait(futures),
+        _wait_for_futures_fail_fast,
+        futures,
     )
-    future_exceptions: list[BaseException] = []
-    for future in futures:
-        try:
-            exception = await loop.run_in_executor(None, future.exception)
-        except BaseException as exc:
-            future_exceptions.append(exc)
-        else:
-            if exception is not None:
-                future_exceptions.append(exception)
-    if future_exceptions:
-        raise future_exceptions[0]
 
 
 async def _cancel_in_flight_windows(
@@ -623,7 +700,7 @@ async def _execute_pending_windows(
     tracked_futures: list,
     progress_callback,
     window_progress_callback,
-    disable_graph_optimization: bool,
+    preserve_resource_boundaries: bool,
 ) -> int:
     """Execute zero-valued Window positions with bounded, out-of-order completion."""
     total_windows = window_generator.total_windows
@@ -670,7 +747,7 @@ async def _execute_pending_windows(
         # Existing node layers retain their own resource annotations.
         with dask.annotate(
             brainflow_node_id="__window__",
-            execution_resource="any",
+            worker_profile="framework",
         ):
             window_collections = [
                 root_array[window.slices]
@@ -680,7 +757,7 @@ async def _execute_pending_windows(
             _compute_with_resource_boundaries(
                 client,
                 window_collections,
-                disable_graph_optimization=disable_graph_optimization,
+                preserve_resource_boundaries=preserve_resource_boundaries,
             )
         )
         tracked_futures.extend(futures)
@@ -707,7 +784,7 @@ async def _execute_pending_windows(
             )
             first_error: BaseException | None = None
             for waiter in done:
-                entry = in_flight.pop(waiter)
+                entry = in_flight[waiter]
                 try:
                     waiter.result()
                     # The Driver commits only after all terminal Futures for
@@ -733,7 +810,12 @@ async def _execute_pending_windows(
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc
-                finally:
+                else:
+                    # Failed entries remain tracked until the outer cleanup
+                    # cancels every Future belonging to that Window.  This is
+                    # required now that the waiter deliberately returns before
+                    # its sibling terminal Futures have completed.
+                    in_flight.pop(waiter)
                     _release_futures(entry.futures)
                     _remove_futures(tracked_futures, entry.futures)
 
@@ -1311,12 +1393,15 @@ async def execute_graph(
     checkpoint_store: WindowCheckpointStore | None = None,
     release_active_execution: bool = True,
     external_cleanup_barrier: Callable[[], Awaitable[None]] | None = None,
+    worker_profiles: object = None,
+    worker_pools: object = None,
 ):
     """Execute true terminal roots in Full Graph or bounded Window mode."""
     tasks: dict = {}
     sink_futures: list = []
     results: dict = {}
     node_instances: dict = {}
+    root_arrays: list[da.Array] = []
     client = None
     should_cancel_dask_objects = False
 
@@ -1483,26 +1568,35 @@ async def execute_graph(
             selected_config,
         )
         logger.info(
-            "[Dask] Graph resource plan: cpu_workers=%s gpu_workers=%s "
-            "contributors=%s",
-            resource_plan.cpu_workers,
-            resource_plan.gpu_workers,
+            "[Dask] Graph Worker Profile requirements: %s contributors=%s",
+            resource_plan.required_worker_profiles,
             tuple(
-                (
-                    node.node_id,
-                    node.node_type,
-                    node.resource,
-                    node.workers,
-                )
+                (node.node_id, node.node_type, node.worker_profile)
                 for node in resource_plan.nodes
-                if node.workers
             ),
         )
-        client = await asyncio.to_thread(
-            dask_service.ensure_client,
-            cpu_workers=resource_plan.cpu_workers,
-            gpu_workers=resource_plan.gpu_workers,
-        )
+        # Profile requirements are not Worker counts. Slurm execution has
+        # already provisioned the browser-configured Pools; a local backend
+        # builds the same Pool topology directly from the supplied Profiles.
+        if dask_service.uses_external_workers():
+            client = dask_service.require_active_client()
+        else:
+            if worker_profiles is None or worker_pools is None:
+                raise ValueError(
+                    "Workflow execution requires Worker Profiles and Worker Pools. "
+                    "Configure Worker Resources in the frontend and retry."
+                )
+            profiles, pools = parse_required_worker_resources(
+                worker_profiles,
+                worker_pools,
+                tuple(resource_plan.required_worker_profiles),
+            )
+            client = await asyncio.to_thread(
+                dask_service.ensure_profile_client,
+                profiles=profiles,
+                pools=pools,
+                required_profiles=resource_plan.required_worker_profiles,
+            )
         cluster_summary = await asyncio.to_thread(
             dask_service.get_cluster_resource_summary,
             client,
@@ -1831,7 +1925,7 @@ async def execute_graph(
                     _compute_with_resource_boundaries(
                         client,
                         collections,
-                        disable_graph_optimization=(
+                        preserve_resource_boundaries=(
                             _requires_resource_boundary_preservation(resource_plan)
                         ),
                     )
@@ -1855,17 +1949,17 @@ async def execute_graph(
                     await progress_callback(node_id, None, "Running", "running")
 
                 await loop.run_in_executor(None, lambda: dist_wait(futures))
-                for sink, future in zip(output_sinks, futures):
-                    if sink["is_delayed"]:
-                        await loop.run_in_executor(None, future.result)
-                    else:
-                        # Never pull a complete large collection to the driver.
-                        exception = await loop.run_in_executor(
-                            None,
-                            future.exception,
-                        )
-                        if exception is not None:
-                            raise exception
+                # A boundary-preserving submission returns one Future per
+                # terminal block rather than one collection-finalization
+                # Future.  Inspect every block without gathering output arrays
+                # back to the Driver. Delayed sinks naturally have one key.
+                for future in futures:
+                    exception = await loop.run_in_executor(
+                        None,
+                        future.exception,
+                    )
+                    if exception is not None:
+                        raise exception
         else:
             root_arrays, actual_output_shape, window_reason = _inspect_window_roots(
                 results,
@@ -1968,7 +2062,7 @@ async def execute_graph(
                     tracked_futures=sink_futures,
                     progress_callback=progress_callback,
                     window_progress_callback=window_progress_callback,
-                    disable_graph_optimization=(
+                    preserve_resource_boundaries=(
                         _requires_resource_boundary_preservation(resource_plan)
                     ),
                 )
@@ -2203,9 +2297,13 @@ async def execute_graph(
                 "[Cleanup] External Slurm Worker allocation cleanup is "
                 "delegated to the service-node execution controller."
             )
+            # The barrier has stopped the on-demand Scheduler.  Keeping its
+            # closed Client in this coroutine frame also keeps graph/future
+            # registries reachable until the whole execution function returns.
+            client = None
         elif client and should_cancel_dask_objects:
             # A failed/cancelled task may have died while owning a no-expiry
-            # Zarr storage-chunk lease.  Rebuild the fixed local cluster before
+            # Zarr storage-chunk lease. Rebuild the local Profile cluster before
             # another execution instead of either deadlocking on that stale
             # lease or weakening it into an unsafe expiring lock.
             try:
@@ -2265,6 +2363,9 @@ async def execute_graph(
         sink_futures.clear()
         tasks.clear()
         results.clear()
+        root_arrays.clear()
+        node_instances.clear()
+        await asyncio.to_thread(reclaim_process_memory)
         # Keep the single-active-execution lease until all Driver/Worker
         # cleanup has completed. A following DAG may require a different
         # Worker topology and must not replace this execution's cluster early.

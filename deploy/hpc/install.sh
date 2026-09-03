@@ -16,12 +16,20 @@ MODEL_URLS=(
   "https://hf-mirror.com/mouseland/cellpose-sam/resolve/main/cpsam"
 )
 
+if [[ ! "$WORKFLOW_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+  || [[ "$WORKFLOW_BRANCH" == *..* ]] \
+  || [[ "$WORKFLOW_BRANCH" == */ ]]; then
+  echo "WORKFLOW_BRANCH is not a valid deployable Git branch: $WORKFLOW_BRANCH" >&2
+  exit 2
+fi
+
 mkdir -p \
   "$(dirname "$UV_BIN")" \
   "$(dirname "$WORKFLOW_ROOT")" \
   "$UV_CACHE_DIR" \
   "$(dirname "$MODEL_PATH")" \
   "$WORKFLOW_RUNTIME_DIR/logs" \
+  "$WORKFLOW_RUNTIME_DIR/config" \
   "$WORKFLOW_RUNTIME_DIR/state" \
   "$WORKFLOW_RUNTIME_DIR/data" \
   "$WORKFLOW_RUNTIME_DIR/output" \
@@ -47,8 +55,27 @@ else
     echo "Refusing to update a dirty deployment: $WORKFLOW_ROOT" >&2
     exit 1
   fi
-  git -C "$WORKFLOW_ROOT" fetch origin "$WORKFLOW_BRANCH"
-  git -C "$WORKFLOW_ROOT" checkout "$WORKFLOW_BRANCH"
+  # An explicit refspec is required here. `git fetch origin branch` updates
+  # only FETCH_HEAD when an existing single-branch checkout has never seen the
+  # requested branch, so the following checkout cannot discover it.
+  # Also extend the remote's configured branch set. Without this, Git has the
+  # remote-tracking ref on disk but `checkout --track` still rejects it as
+  # "not a branch" because a prior --single-branch clone tracks only master.
+  branch_refspec="+refs/heads/$WORKFLOW_BRANCH:refs/remotes/origin/$WORKFLOW_BRANCH"
+  if ! git -C "$WORKFLOW_ROOT" config --get-all remote.origin.fetch \
+    | grep -Fqx "$branch_refspec"; then
+    git -C "$WORKFLOW_ROOT" remote set-branches --add origin "$WORKFLOW_BRANCH"
+  fi
+  git -C "$WORKFLOW_ROOT" fetch origin \
+    "$branch_refspec"
+  if git -C "$WORKFLOW_ROOT" show-ref \
+    --verify --quiet "refs/heads/$WORKFLOW_BRANCH"; then
+    git -C "$WORKFLOW_ROOT" checkout "$WORKFLOW_BRANCH"
+  else
+    git -C "$WORKFLOW_ROOT" checkout \
+      --branch "$WORKFLOW_BRANCH" \
+      --track "origin/$WORKFLOW_BRANCH"
+  fi
   git -C "$WORKFLOW_ROOT" merge --ff-only "origin/$WORKFLOW_BRANCH"
 fi
 
@@ -59,7 +86,7 @@ export UV_CACHE_DIR
   "$UV_BIN" sync --frozen --no-install-project --python 3.12
   .venv/bin/python -m compileall -q .
   .venv/bin/python -c \
-    "import dask, distributed, fastapi, zarr; print('backend imports: OK')"
+    "import dask, dask_jobqueue, distributed, fastapi, zarr; print('backend imports: OK')"
   .venv/bin/python \
     "$WORKFLOW_ROOT/deploy/hpc/validate_frontend_dist.py" \
     "$WORKFLOW_ROOT/backend/dist"

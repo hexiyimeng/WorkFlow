@@ -47,6 +47,26 @@ assert(
   'Full Graph execution must use the compatible wire payload',
 );
 
+const failedReaderPreflight = decideNormalRun(
+  resolved({ version: 1, mode: 'full_graph' }),
+  {
+    ...preflight,
+    windowable: false,
+    outputShape: null,
+    totalWindows: null,
+    resourcesSatisfied: true,
+    preflightError: {
+      type: 'ValueError',
+      message: "Set the Reader array_path explicitly, for example 's0'.",
+    },
+  },
+);
+assert(
+  failedReaderPreflight.kind === 'open_settings'
+    && failedReaderPreflight.validation.generalError?.includes("array_path explicitly") === true,
+  'a graph metadata preflight failure must block Run even if resources are available',
+);
+
 const windowSettings: WorkflowExecutionSettings = {
   version: 1,
   mode: 'window',

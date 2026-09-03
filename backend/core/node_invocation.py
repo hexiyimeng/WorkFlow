@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from core.execution_resources import ExecutionResource
+from core.worker_profiles import DEFAULT_WORKER_PROFILE
 
 
 @dataclass(frozen=True)
@@ -12,7 +12,7 @@ class NodeRuntime:
     execution_id: str | None
     is_preflight: bool = False
     is_resuming: bool = False
-    execution_resource: ExecutionResource = "any"
+    worker_profile: str = DEFAULT_WORKER_PROFILE
 
 
 @dataclass(frozen=True)

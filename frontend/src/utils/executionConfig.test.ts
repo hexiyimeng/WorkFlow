@@ -50,28 +50,19 @@ assert(
   'older preflight responses without resource metadata should remain compatible',
 );
 
-const countedResourcePreflight: ExecutionPreflightResponse = {
+const profilePreflight: ExecutionPreflightResponse = {
   windowable: true,
   requiredResources: {
-    requiresCpu: true,
-    requiresGpu: true,
-    cpuWorkers: 3,
-    gpuWorkers: 2,
-    cpuNodes: [{
-      nodeId: 'reader',
-      nodeType: 'OMEZarrReader',
-      displayName: 'OME-Zarr Reader',
-      workers: 3,
-      resource: 'cpu',
-    }],
-    gpuNodes: [{
+    requiredWorkerProfiles: {
+      'cpu-general': 3,
+      'gpu-inference': 2,
+    },
+    profileRequirements: [{
       nodeId: 'cellpose',
       nodeType: 'Cellpose',
       displayName: 'Cellpose',
-      workers: 2,
-      resource: 'gpu',
+      workerProfile: 'gpu-inference',
     }],
-    anyNodes: [],
   },
   availableResources: {
     cpuWorkers: 4,
@@ -82,90 +73,29 @@ const countedResourcePreflight: ExecutionPreflightResponse = {
   resourcesSatisfied: null,
 };
 assert(
-  countedResourcePreflight.requiredResources?.cpuWorkers === 3
-    && countedResourcePreflight.requiredResources.gpuWorkers === 2,
-  'preflight types should retain planned CPU and GPU Worker counts',
+  profilePreflight.requiredResources?.requiredWorkerProfiles['gpu-inference'] === 2,
+  'preflight types should retain Worker Profile requirement counts',
 );
 assert(
-  countedResourcePreflight.requiredResources?.gpuNodes[0]?.workers === 2,
-  'resource node requirements should retain their Worker count',
+  profilePreflight.requiredResources?.profileRequirements[0]?.workerProfile === 'gpu-inference',
+  'node requirements should expose their Worker Profile',
 );
 assert(
-  preflightResourcesAllowExecution(countedResourcePreflight),
-  'unknown live-cluster availability must remain submit-able with planned counts',
+  preflightResourcesAllowExecution(profilePreflight),
+  'unknown live-cluster availability must remain submit-able',
 );
 
-const gpuOnlyWithUnconstrainedIo: ExecutionPreflightResponse = {
-  windowable: true,
-  requiredResources: {
-    requiresCpu: false,
-    requiresGpu: true,
-    cpuWorkers: 0,
-    gpuWorkers: 1,
-    cpuNodes: [],
-    gpuNodes: [{
-      nodeId: 'cellpose',
-      nodeType: 'Cellpose',
-      displayName: 'Cellpose',
-      workers: 1,
-      resource: 'gpu',
-    }],
-    anyNodes: [{
-      nodeId: 'reader',
-      nodeType: 'OMEZarrReader',
-      displayName: 'OME-Zarr Reader',
-      workers: 0,
-      resource: 'any',
-    }, {
-      nodeId: 'writer',
-      nodeType: 'ZarrWriter',
-      displayName: 'Zarr Writer',
-      workers: 0,
-      resource: 'any',
-    }],
-  },
-  resourcesSatisfied: true,
-};
-assert(
-  gpuOnlyWithUnconstrainedIo.requiredResources?.cpuWorkers === 0
-    && gpuOnlyWithUnconstrainedIo.requiredResources.gpuWorkers === 1,
-  'preflight types must preserve an exact 0 CPU + 1 GPU Worker plan',
-);
-assert(
-  gpuOnlyWithUnconstrainedIo.requiredResources?.anyNodes?.length === 2
-    && gpuOnlyWithUnconstrainedIo.requiredResources.anyNodes.every(
-      node => node.resource === 'any' && node.workers === 0,
-    ),
-  'unconstrained Reader and Writer nodes should be represented without adding Workers',
-);
-
-const countedNodeSpec: NodeSpec = {
+const profileNodeSpec: NodeSpec = {
   type: 'Cellpose',
   display_name: 'Cellpose',
   category: 'Segmentation',
   input: { required: {} },
   output: ['MASK'],
-  execution_resource: 'gpu',
-  execution_workers: 2,
+  required_worker_profile: 'gpu-cellpose',
 };
 assert(
-  countedNodeSpec.execution_workers === 2,
-  'node specifications should expose their requested Worker count',
-);
-
-const unconstrainedNodeSpec: NodeSpec = {
-  type: 'OMEZarrReader',
-  display_name: 'OME-Zarr Reader',
-  category: 'Input',
-  input: { required: {} },
-  output: ['IMAGE'],
-  execution_resource: 'any',
-  execution_workers: 0,
-};
-assert(
-  unconstrainedNodeSpec.execution_resource === 'any'
-    && unconstrainedNodeSpec.execution_workers === 0,
-  'node specifications should expose unconstrained nodes that add no Workers',
+  profileNodeSpec.required_worker_profile === 'gpu-cellpose',
+  'node specifications should expose their Worker Profile',
 );
 
 const clusterReadyMessage: WSMessage = {

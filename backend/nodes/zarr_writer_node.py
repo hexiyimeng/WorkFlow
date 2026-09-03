@@ -12,6 +12,8 @@ from typing import Any
 import dask.config
 import numpy as np
 
+from core.execution_paths import execution_path_suffix, normalize_execution_path
+from core.platform import trim_process_allocator
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
@@ -40,22 +42,13 @@ def _lock_acquire_timeout_seconds() -> float:
 
 
 def _normalize_output_path(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("ZarrWriter output_path must be a literal string.")
-    raw = value.strip()
-    if not raw:
-        raise ValueError("ZarrWriter output_path cannot be empty.")
-    if "\x00" in raw:
-        raise ValueError("ZarrWriter output_path contains a null byte.")
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        raise ValueError("ZarrWriter output_path must be an absolute path.")
-    if path.suffix.lower() != ".zarr":
+    normalized = normalize_execution_path(value, name="ZarrWriter output_path")
+    if execution_path_suffix(normalized).lower() != ".zarr":
         raise ValueError(
             "ZarrWriter output_path must include the complete final '.zarr' suffix; "
             "the framework does not append file extensions."
         )
-    return str(path.resolve())
+    return normalized
 
 
 def _normalize_dataset_path(value: str | None) -> str:
@@ -477,7 +470,7 @@ def _prepare_store(
         }
 
 
-def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
+def _write_zarr_block_impl(array: np.ndarray, ctx=None) -> np.ndarray:
     if ctx is None:
         raise RuntimeError("ZarrWriter block requires a BlockContext.")
     resources = ctx.resources or {}
@@ -537,14 +530,25 @@ def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
     return np.ones(tuple(int(x) for x in token_shape), dtype=TOKEN_DTYPE)
 
 
+def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
+    """Write one Zarr block without retaining codec/native allocator arenas."""
+
+    try:
+        return _write_zarr_block_impl(array, ctx)
+    finally:
+        # The task argument is still owned by Dask at this point.  Trim codec
+        # temporaries now; the Worker lifecycle plugin trims again after Dask
+        # releases the input array.
+        trim_process_allocator()
+
+
 @register_node("ZarrWriter")
 class ZarrWriter(BaseMapBlocksNode):
     """Generic Zarr/OME-Zarr side-effect writer backed by map_blocks."""
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr Writer"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 6
+    required_worker_profile = "cpu-writer"
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_path"
 
