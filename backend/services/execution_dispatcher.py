@@ -171,6 +171,14 @@ async def reconcile_execution_backend() -> str | None:
     return await slurm_execution_service.reconcile_active_job()
 
 
+def get_durable_execution_snapshot(execution_id: str) -> dict[str, Any] | None:
+    """Return persisted Slurm status when process-local WebSocket state is gone."""
+
+    if not uses_slurm_execution_backend():
+        return None
+    return slurm_execution_service.get_durable_execution_snapshot(execution_id)
+
+
 def detach_execution_backend(execution_id: str) -> None:
     """Deprecated: a local Driver cannot detach while remote Workers continue."""
     del execution_id
@@ -179,6 +187,7 @@ def detach_execution_backend(execution_id: str) -> None:
 __all__ = [
     "execute_graph",
     "detach_execution_backend",
+    "get_durable_execution_snapshot",
     "preflight_graph",
     "reconcile_execution_backend",
     "uses_slurm_execution_backend",

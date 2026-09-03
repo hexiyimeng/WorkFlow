@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 from core.workflow_resources import (
     WorkerProfileRequirement,
     WorkflowResourcePlan,
 )
 from services import execution_dispatcher
+from services import slurm_execution_service as slurm_service_module
 
 
 def test_failed_metadata_preflight_still_returns_profile_requirements(
@@ -124,3 +127,41 @@ def test_preflight_filters_unrequired_profiles_before_validation(monkeypatch) ->
 
     assert result["resourcesSatisfied"] is True
     assert result["resourceError"] is None
+
+
+def test_durable_slurm_snapshot_survives_process_local_state_loss(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    execution_id = "12345678-1234-1234-1234-123456789abc"
+    execution_root = tmp_path / "jobs"
+    run_directory = execution_root / execution_id
+    run_directory.mkdir(parents=True)
+    (run_directory / "job.json").write_text(
+        json.dumps({
+            "schemaVersion": slurm_service_module.JOB_SCHEMA_VERSION,
+            "executionId": execution_id,
+            "state": "failed",
+            "submittedAt": "2026-09-02T18:19:13+00:00",
+            "finishedAt": "2026-09-03T10:29:45+00:00",
+            "message": "example terminal failure",
+            "recoveryDirectory": None,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        slurm_service_module.SlurmRuntimeConfig,
+        "from_environment",
+        lambda environment=None: SimpleNamespace(execution_root=execution_root),
+    )
+
+    snapshot = slurm_service_module.SlurmExecutionService().get_durable_execution_snapshot(
+        execution_id
+    )
+
+    assert snapshot is not None
+    assert snapshot["status"] == "failed"
+    assert snapshot["durable"] is True
+    assert snapshot["message"] == "example terminal failure"
+    assert snapshot["createdAt"] == 1_788_373_153_000
+    assert snapshot["finishedAt"] == 1_788_431_385_000

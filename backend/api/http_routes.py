@@ -10,7 +10,10 @@ from core.plugin_diagnostics import get_plugin_diagnostics
 from core.registry import get_node_info
 from core.state_manager import state_manager
 from services.dask_service import dask_service
-from services.execution_dispatcher import preflight_graph
+from services.execution_dispatcher import (
+    get_durable_execution_snapshot,
+    preflight_graph,
+)
 from services.plugin_loader import reload_all_plugins
 from services.recovery_service import (
     RecoveryRecordChangedError,
@@ -48,6 +51,33 @@ async def get_plugin_status():
 async def get_dashboard_url():
     client = dask_service.get_client()
     return {"dashboard_url": _dashboard_url_for_client(client)}
+
+
+@router.get("/execution/status/{execution_id}")
+async def execution_status(execution_id: str):
+    """Return live status, or the durable Slurm record after a reconnect."""
+
+    snapshot = state_manager.get_execution_snapshot(execution_id)
+    if snapshot is None:
+        try:
+            snapshot = await asyncio.to_thread(
+                get_durable_execution_snapshot,
+                execution_id,
+            )
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"found": False, "message": str(exc)},
+            )
+    if snapshot is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "found": False,
+                "message": f"Execution {execution_id} not found",
+            },
+        )
+    return {"found": True, **snapshot}
 
 
 @router.post("/execution/preflight")

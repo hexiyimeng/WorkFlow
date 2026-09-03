@@ -6,6 +6,8 @@ import {
   isLiveExecutionPhase,
   markExecutionConnectionLost,
   markExecutionInterrupted,
+  websocketDisconnectMessage,
+  websocketReconnectDelayMs,
 } from './executionRuntime.ts';
 
 function assert(condition: boolean, message: string) {
@@ -57,6 +59,18 @@ const idle: ExecutionRuntimeState = {
   windowProgress: null,
 };
 assert(markExecutionConnectionLost(idle) === idle, 'an idle disconnect should not invent an execution');
+
+assert(websocketReconnectDelayMs(1) === 1_000, 'first reconnect should be prompt');
+assert(websocketReconnectDelayMs(6) === 30_000, 'reconnect delay should be capped');
+assert(websocketReconnectDelayMs(50) === 30_000, 'large retries should remain capped');
+assert(
+  websocketDisconnectMessage(1006, true, 2_000).includes('SSH/VPN/network'),
+  'abnormal closure should explain the likely transport layer',
+);
+assert(
+  websocketDisconnectMessage(1006, true, 2_000).includes('may still be running'),
+  'disconnect should not claim that the backend execution failed',
+);
 
 const permittedNodeChanges = filterLockedNodeChanges([
   { type: 'position', id: 'node', position: { x: 10, y: 20 } },

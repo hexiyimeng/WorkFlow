@@ -459,6 +459,8 @@ export interface WSMessage {
   dashboardUrl?: string | null;
   cpuWorkers?: number;
   gpuWorkers?: number;
+  durable?: boolean;
+  recoveryDirectory?: string;
 }
 
 export interface Workflow {

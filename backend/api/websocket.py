@@ -15,6 +15,7 @@ from core.window_execution import (
 )
 from services.execution_dispatcher import (
     execute_graph,
+    get_durable_execution_snapshot,
     uses_slurm_execution_backend,
 )
 from services.dask_service import dask_service
@@ -135,13 +136,29 @@ async def websocket_endpoint(websocket: WebSocket):
     HEARTBEAT_INTERVAL = 30  # 秒
 
     # 心跳任务
+    last_client_activity = asyncio.get_running_loop().time()
+
     async def heartbeat():
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             try:
                 if websocket.client_state == WebSocketState.CONNECTED:
-                    await websocket.send_json({"type": "ping"})
-            except Exception:
+                    await asyncio.wait_for(
+                        websocket.send_json({"type": "ping"}),
+                        timeout=5,
+                    )
+            except Exception as exc:
+                idle_seconds = (
+                    asyncio.get_running_loop().time() - last_client_activity
+                )
+                logger.warning(
+                    "WebSocket heartbeat failed for %s after %.1fs without "
+                    "client traffic: %s: %s",
+                    client_ip,
+                    idle_seconds,
+                    type(exc).__name__,
+                    exc,
+                )
                 break
 
     heartbeat_task = asyncio.create_task(heartbeat())
@@ -176,6 +193,7 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 timeout = 30
                 data = await asyncio.wait_for(websocket.receive_json(), timeout=timeout)
+                last_client_activity = asyncio.get_running_loop().time()
                 command = data.get("command")
 
                 if command == "execute_graph":
@@ -346,12 +364,32 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "executionId": execution_id
                             })
                         else:
-                            await websocket.send_json({
-                                "type": "execution_not_found",
-                                "code": "EXECUTION_NOT_FOUND",
-                                "executionId": execution_id,
-                                "message": f"Execution {execution_id} not found",
-                            })
+                            try:
+                                durable_snapshot = await asyncio.to_thread(
+                                    get_durable_execution_snapshot,
+                                    execution_id,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Cannot load durable execution %s: %s",
+                                    execution_id,
+                                    exc,
+                                )
+                                durable_snapshot = None
+                            if durable_snapshot is not None:
+                                await websocket.send_json(durable_snapshot)
+                                await websocket.send_json({
+                                    "type": "subscribed",
+                                    "executionId": execution_id,
+                                    "durable": True,
+                                })
+                            else:
+                                await websocket.send_json({
+                                    "type": "execution_not_found",
+                                    "code": "EXECUTION_NOT_FOUND",
+                                    "executionId": execution_id,
+                                    "message": f"Execution {execution_id} not found",
+                                })
 
             except asyncio.TimeoutError:
                 # 网络假活或极慢网络：跳过继续等待，不主动断开

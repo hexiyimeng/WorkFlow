@@ -535,6 +535,16 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _timestamp_milliseconds(value: object) -> int | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(parsed.timestamp() * 1000)
+
+
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     if path.is_symlink():
         raise ValueError(f"Refusing to replace symbolic link: {path}")
@@ -856,6 +866,82 @@ class SlurmExecutionService:
         self._jobs: dict[str, str] = {}
         self._detach_requests: set[str] = set()
         self._lock = asyncio.Lock()
+
+    def get_durable_execution_snapshot(
+        self,
+        execution_id: str,
+    ) -> dict[str, Any] | None:
+        """Load execution status after its process-local session is unavailable."""
+
+        normalized_id = validate_execution_id(execution_id)
+        config = SlurmRuntimeConfig.from_environment()
+        run_directory = resolve_execution_directory(
+            config.execution_root,
+            normalized_id,
+        )
+        job_path = run_directory / "job.json"
+        if not job_path.is_file() or job_path.is_symlink():
+            return None
+        record = _read_json_file(job_path)
+        if (
+            record.get("schemaVersion") != JOB_SCHEMA_VERSION
+            or record.get("executionId") != normalized_id
+        ):
+            raise SlurmSubmissionError(
+                f"Invalid durable Slurm execution record: {job_path}"
+            )
+
+        raw_state = str(record.get("state", "")).strip().lower()
+        if raw_state in {"submitting", "workers_starting"}:
+            status = "submitted"
+        elif raw_state == "driver_running":
+            status = "running"
+        elif raw_state in _TERMINAL_STATUSES:
+            status = raw_state
+        else:
+            raise SlurmSubmissionError(
+                f"Unsupported durable Slurm execution state {raw_state!r}: {job_path}"
+            )
+
+        snapshot: dict[str, Any] = {
+            "type": "execution_snapshot",
+            "executionId": normalized_id,
+            "status": status,
+            "createdAt": _timestamp_milliseconds(record.get("submittedAt")),
+            "finishedAt": _timestamp_milliseconds(record.get("finishedAt")),
+            "nodeCount": 0,
+            "logCount": 0,
+            "durable": True,
+            "message": record.get("message"),
+        }
+        recovery_directory = record.get("recoveryDirectory")
+        if isinstance(recovery_directory, str) and recovery_directory:
+            snapshot["recoveryDirectory"] = recovery_directory
+            try:
+                inspection = inspect_recovery_directory(
+                    recovery_directory,
+                    require_unlocked=False,
+                )
+            except Exception:
+                logger.debug(
+                    "Cannot add recovery progress to durable snapshot %s.",
+                    normalized_id,
+                    exc_info=True,
+                )
+            else:
+                total = inspection.total_windows
+                completed = inspection.completed_windows
+                snapshot["windowProgress"] = {
+                    "currentWindow": min(completed + 1, total),
+                    "completedWindows": completed,
+                    "totalWindows": total,
+                    "progress": (
+                        100.0 if total == 0 else completed * 100.0 / total
+                    ),
+                    "windowStatus": status,
+                    "message": f"{completed} / {total} Window(s) completed",
+                }
+        return snapshot
 
     def request_monitor_detach(self, execution_id: str) -> None:
         """Mark process shutdown so cancellation detaches instead of scancel."""
@@ -2334,6 +2420,18 @@ class SlurmExecutionService:
         authoritative_graph, plan = _authoritative_graph_and_plan(
             graph, selected_config
         )
+        execution_roots = find_execution_roots(authoritative_graph)
+        recovery_directory: str | None = None
+        if selected_config.mode == "window":
+            recovery_directory = str(
+                ExecutionLayout.resolve(
+                    selected_config,
+                    discover_terminal_outputs(
+                        authoritative_graph,
+                        execution_roots,
+                    ),
+                ).control_directory
+            )
         config = SlurmRuntimeConfig.from_environment()
         allocation_plan = await asyncio.to_thread(
             _plan_slurm_allocation,
@@ -2481,6 +2579,7 @@ class SlurmExecutionService:
                 "resources": resource_request.to_dict(),
                 "allocationPlan": allocation_plan.to_dict(),
                 "schedulerAddress": scheduler_address,
+                "recoveryDirectory": recovery_directory,
                 "submittedAt": submitted_at,
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
@@ -2535,6 +2634,7 @@ class SlurmExecutionService:
                 "resources": resource_request.to_dict(),
                 "allocationPlan": allocation_plan.to_dict(),
                 "schedulerAddress": scheduler_address,
+                "recoveryDirectory": recovery_directory,
                 "submittedAt": submitted_at,
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
@@ -2583,6 +2683,7 @@ class SlurmExecutionService:
                 "resources": resource_request.to_dict(),
                 "allocationPlan": allocation_plan.to_dict(),
                 "schedulerAddress": scheduler_address,
+                "recoveryDirectory": recovery_directory,
                 "submittedAt": submitted_at,
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
@@ -2651,6 +2752,7 @@ class SlurmExecutionService:
                 "resources": resource_request.to_dict(),
                 "allocationPlan": allocation_plan.to_dict(),
                 "schedulerAddress": scheduler_address,
+                "recoveryDirectory": recovery_directory,
                 "submittedAt": submitted_at,
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
@@ -2702,8 +2804,14 @@ class SlurmExecutionService:
                 "pendingSubmissionTokens": [],
                 "resources": resource_request.to_dict(),
                 "allocationPlan": allocation_plan.to_dict(),
+                "recoveryDirectory": recovery_directory,
                 "submittedAt": submitted_at,
                 "finishedAt": _utc_timestamp(),
+                "message": (
+                    str(final_error) or application_status
+                    if final_error is not None
+                    else "Workflow Finished Successfully"
+                ),
                 "workerAllocationsTerminal": {
                     job_id: list(terminal)
                     for job_id, terminal in worker_terminals.items()

@@ -16,11 +16,17 @@ from nodes.base import BaseMapBlocksNode
 
 TOKEN_DTYPE = np.dtype("uint8")
 SPATIAL_AXES = ("Z", "Y", "X")
-LOCAL_ID_BITS = 24
 TILE_Z_BITS = 10
 TILE_Y_BITS = 15
 TILE_X_BITS = 15
 CELL_LOCAL_ID_WIDTH = 6
+GLOBAL_CELL_ID_ENCODING_VERSION = 2
+GLOBAL_CELL_ID_ENCODING_NAME = "source-block-uint32-local-ordinal-uint32"
+SOURCE_BLOCK_ID_BITS = 32
+LOCAL_ORDINAL_BITS = 32
+MAX_SOURCE_BLOCK_ID = (1 << SOURCE_BLOCK_ID_BITS) - 1
+MAX_LOCAL_ORDINAL = (1 << LOCAL_ORDINAL_BITS) - 1
+DATASET_METADATA_FILENAME = "_workflow_cell_table.json"
 
 
 def _normalize_path(value: str, *, name: str) -> str:
@@ -85,24 +91,28 @@ def _flatten_block_index(block_index: tuple[int, ...], numblocks: tuple[int, ...
     return int(flat)
 
 
-def _local_id_config(total_blocks: int) -> tuple[int, int]:
-    block_bits = max(0, int(total_blocks - 1).bit_length())
-    if block_bits >= LOCAL_ID_BITS:
+def _validate_source_block_capacity(total_blocks: int) -> None:
+    if total_blocks < 1 or total_blocks > MAX_SOURCE_BLOCK_ID + 1:
         raise ValueError(
-            f"WriteParquetCellTable cannot encode {total_blocks} blocks into the "
-            f"{LOCAL_ID_BITS}-bit local id budget."
+            "WriteParquetCellTable global_cell_id encoding supports between 1 "
+            f"and {MAX_SOURCE_BLOCK_ID + 1} source blocks, got {total_blocks}."
         )
-    return block_bits, LOCAL_ID_BITS - block_bits
 
 
-def _encode_local_id(block_flat_id: int, ordinal: int, *, ordinal_bits: int) -> int:
-    max_ordinal = (1 << ordinal_bits) - 1
-    if ordinal < 1 or ordinal > max_ordinal:
+def _encode_global_cell_id(source_block_id: int, ordinal: int) -> int:
+    """Return a collision-free uint64 id independent of the graph block count."""
+
+    if source_block_id < 0 or source_block_id > MAX_SOURCE_BLOCK_ID:
         raise ValueError(
-            f"Block has local cell ordinal {ordinal}, but only {max_ordinal} ordinals fit in "
-            f"{ordinal_bits} bits. Rechunk the mask or use smaller blocks."
+            f"Source block id {source_block_id} exceeds the "
+            f"{SOURCE_BLOCK_ID_BITS}-bit global_cell_id budget."
         )
-    return (int(block_flat_id) << ordinal_bits) | int(ordinal)
+    if ordinal < 1 or ordinal > MAX_LOCAL_ORDINAL:
+        raise ValueError(
+            f"Block has local cell ordinal {ordinal}, but the supported range "
+            f"is 1..{MAX_LOCAL_ORDINAL}."
+        )
+    return (int(source_block_id) << LOCAL_ORDINAL_BITS) | int(ordinal)
 
 
 def _encode_spatial_key(tile_z: int, tile_y: int, tile_x: int) -> int:
@@ -117,8 +127,26 @@ def _encode_spatial_key(tile_z: int, tile_y: int, tile_x: int) -> int:
     return (int(tile_z) << (TILE_Y_BITS + TILE_X_BITS)) | (int(tile_y) << TILE_X_BITS) | int(tile_x)
 
 
-def _encode_global_cell_id(spatial_key: int, local_id: int) -> int:
-    return (int(spatial_key) << LOCAL_ID_BITS) | int(local_id)
+def _id_encoding_metadata() -> dict[str, Any]:
+    return {
+        "version": GLOBAL_CELL_ID_ENCODING_VERSION,
+        "name": GLOBAL_CELL_ID_ENCODING_NAME,
+        "source_block_id_bits": SOURCE_BLOCK_ID_BITS,
+        "local_ordinal_bits": LOCAL_ORDINAL_BITS,
+        "global_cell_id": (
+            "source_block_id << local_ordinal_bits | local_ordinal"
+        ),
+    }
+
+
+def _has_current_id_encoding(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("version") == GLOBAL_CELL_ID_ENCODING_VERSION
+        and value.get("name") == GLOBAL_CELL_ID_ENCODING_NAME
+        and value.get("source_block_id_bits") == SOURCE_BLOCK_ID_BITS
+        and value.get("local_ordinal_bits") == LOCAL_ORDINAL_BITS
+    )
 
 
 def _parquet_schema(label_dtype: np.dtype):
@@ -163,7 +191,50 @@ def _metadata_is_complete(parquet_path: Path, metadata_path: Path, write_metadat
         data = json.loads(metadata_path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return bool(data.get("fragment_path") and data.get("schema") and data.get("block_index") is not None)
+    return bool(
+        data.get("fragment_path")
+        and data.get("schema")
+        and data.get("block_index") is not None
+        and _has_current_id_encoding(data.get("id_encoding"))
+    )
+
+
+def _write_dataset_metadata(output_path: Path) -> None:
+    _write_json_atomic(
+        output_path / DATASET_METADATA_FILENAME,
+        {
+            "format": "workflow-cell-table",
+            "schemaVersion": 1,
+            "id_encoding": _id_encoding_metadata(),
+        },
+    )
+
+
+def _validate_dataset_metadata(output_path: Path) -> None:
+    metadata_path = output_path / DATASET_METADATA_FILENAME
+    if not metadata_path.is_file():
+        raise ValueError(
+            "Cannot Resume WriteParquetCellTable because the existing output "
+            "uses the legacy global_cell_id encoding or has no dataset metadata. "
+            "Use Recovery Restart to reset the Window checkpoint and rebuild all "
+            "Parquet fragments with the current encoding."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot read WriteParquetCellTable dataset metadata {metadata_path}: {exc}"
+        ) from exc
+    if (
+        metadata.get("format") != "workflow-cell-table"
+        or metadata.get("schemaVersion") != 1
+        or not _has_current_id_encoding(metadata.get("id_encoding"))
+    ):
+        raise ValueError(
+            "Cannot Resume WriteParquetCellTable because its global_cell_id "
+            "encoding is incompatible with the current implementation. Use "
+            "Recovery Restart to rebuild every Parquet fragment consistently."
+        )
 
 
 def _block_output_paths(
@@ -196,7 +267,6 @@ def _extract_rows_from_mask(
     block_index: tuple[int, ...],
     numblocks: tuple[int, ...],
     tile_sizes: Mapping[str, int],
-    ordinal_bits: int,
 ) -> list[dict[str, Any]]:
     if mask_block.size == 0:
         return []
@@ -244,10 +314,9 @@ def _extract_rows_from_mask(
             if area == 0:
                 continue
             ordinal += 1
-            local_id = _encode_local_id(
+            global_cell_id = _encode_global_cell_id(
                 source_block_id,
                 ordinal,
-                ordinal_bits=ordinal_bits,
             )
 
             spatial_stats: dict[str, dict[str, int | float]] = {}
@@ -303,7 +372,7 @@ def _extract_rows_from_mask(
             spatial_key = _encode_spatial_key(tile_z, tile_y, tile_x)
 
             rows.append({
-                "global_cell_id": _encode_global_cell_id(spatial_key, local_id),
+                "global_cell_id": global_cell_id,
                 "cell_id_str": f"{cell_prefix}{label:0{CELL_LOCAL_ID_WIDTH}d}",
                 "spatial_key": spatial_key,
                 "source_block_id": source_block_id,
@@ -378,7 +447,6 @@ def _write_cell_table_block_impl(mask: np.ndarray, ctx=None) -> np.ndarray:
         block_index=tuple(int(x) for x in block_index),
         numblocks=tuple(int(x) for x in numblocks),
         tile_sizes=resources.get("tile_sizes"),
-        ordinal_bits=int(resources.get("ordinal_bits")),
     )
     if bool(resources.get("sort_by_spatial_key", True)):
         rows = sorted(rows, key=lambda row: (int(row["spatial_key"]), int(row["global_cell_id"])))
@@ -433,9 +501,8 @@ def _write_cell_table_block_impl(mask: np.ndarray, ctx=None) -> np.ndarray:
             "compression": resources.get("compression", "zstd"),
             "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "id_encoding": {
+                **_id_encoding_metadata(),
                 "spatial_key_bits": {"z": TILE_Z_BITS, "y": TILE_Y_BITS, "x": TILE_X_BITS},
-                "local_id_bits": LOCAL_ID_BITS,
-                "global_cell_id": "spatial_key << local_id_bits | local_id",
                 "cell_id_str": (
                     "zero-padded block indices in ZYX order followed by the "
                     f"{CELL_LOCAL_ID_WIDTH}-digit block-local mask label"
@@ -555,13 +622,20 @@ class WriteParquetCellTable(BaseMapBlocksNode):
                     "Cannot resume WriteParquetCellTable because the output target "
                     f"is not a directory: {output_path}"
                 )
+            _validate_dataset_metadata(output_path)
         else:
-            if output_path.exists() and bool(params.get("overwrite", True)):
+            if output_path.exists():
+                if not bool(params.get("overwrite", True)):
+                    raise FileExistsError(
+                        "WriteParquetCellTable output directory already exists and "
+                        f"overwrite is disabled: {output_path}"
+                    )
                 shutil.rmtree(output_path)
             output_path.mkdir(parents=True, exist_ok=True)
+            _write_dataset_metadata(output_path)
 
         total_blocks = int(np.prod(tuple(int(x) for x in mask.numblocks), dtype=np.int64)) if mask.numblocks else 1
-        _, ordinal_bits = _local_id_config(total_blocks)
+        _validate_source_block_capacity(total_blocks)
         compression = str(params.get("compression") or "zstd").strip().lower()
         if compression not in {"zstd", "snappy"}:
             raise ValueError(f"compression must be 'zstd' or 'snappy', got {compression!r}.")
@@ -590,5 +664,4 @@ class WriteParquetCellTable(BaseMapBlocksNode):
             "write_block_metadata": bool(params.get("write_block_metadata", True)),
             "sort_by_spatial_key": bool(params.get("sort_by_spatial_key", True)),
             "numblocks": tuple(int(x) for x in mask.numblocks),
-            "ordinal_bits": ordinal_bits,
         }

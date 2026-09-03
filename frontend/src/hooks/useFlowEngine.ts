@@ -51,6 +51,8 @@ import {
   blocksExecutionChanges,
   markExecutionConnectionLost,
   markExecutionInterrupted,
+  websocketDisconnectMessage,
+  websocketReconnectDelayMs,
 } from '../utils/executionRuntime';
 import { workerResourcePayload } from '../utils/workerResources';
 
@@ -230,6 +232,8 @@ export const useFlowEngine = (
   const wsRef = useRef<WebSocket | null>(null);
   const mountedRef = useRef(true);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const lastReconnectWarningAtRef = useRef(0);
   const finishedRef = useRef(false);
   const restoredExecutionRef = useRef(false); // tracks if current session was restored via subscribe
   const reconciliationSnapshotReceivedRef = useRef(false);
@@ -430,6 +434,8 @@ export const useFlowEngine = (
           ws.send(JSON.stringify({ command: 'subscribe', executionId: storedExecutionId }));
           addLog(`Connection restored. Checking execution ${storedExecutionId}...`, 'info');
         } else {
+          reconnectAttemptRef.current = 0;
+          lastReconnectWarningAtRef.current = 0;
           setWebsocketStatus('connected');
           addLog('System Connected', 'success');
         }
@@ -460,15 +466,28 @@ export const useFlowEngine = (
           resetRuntimeNodeState(setNodes);
         }
 
-        // Always reconnect unless component is unmounting
-        addLog(
-          storedExecutionId && !finishedRef.current
-            ? 'Backend connection lost during execution. Status is unknown; reconnecting...'
-            : 'Connection lost. Reconnecting...',
-          'warning',
-        );
+        // Retry with bounded exponential backoff. Long VPN outages previously
+        // appended the same warning every few seconds for hours, hiding the
+        // useful execution logs without improving recovery.
+        reconnectAttemptRef.current += 1;
+        const retryDelay = websocketReconnectDelayMs(reconnectAttemptRef.current);
+        const now = Date.now();
+        if (
+          lastReconnectWarningAtRef.current === 0
+          || now - lastReconnectWarningAtRef.current >= 60_000
+        ) {
+          addLog(
+            websocketDisconnectMessage(
+              event.code,
+              Boolean(storedExecutionId && !finishedRef.current),
+              retryDelay,
+            ),
+            'warning',
+          );
+          lastReconnectWarningAtRef.current = now;
+        }
         clearReconnectTimer();
-        reconnectTimerRef.current = setTimeout(connectWs, 1000);
+        reconnectTimerRef.current = setTimeout(connectWs, retryDelay);
       };
 
       ws.onerror = (event) => {
@@ -664,7 +683,10 @@ export const useFlowEngine = (
               finishedAt: msg.finishedAt ?? null,
               totalNodes: msg.nodeCount ?? 0,
               windowProgress: snapshotWindowProgress.progress,
-              lastError: null,
+              lastError:
+                snapshotPhase !== 'succeeded' && isTerminalStatus(msg.status)
+                  ? msg.message ?? null
+                  : null,
             }
           });
 
@@ -676,6 +698,14 @@ export const useFlowEngine = (
             windowProgressProtocolRef.current = createWindowProgressProtocolState();
             sessionStorage.removeItem('WorkFlow_execution_id');
             setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
+            if (msg.durable && msg.message) {
+              addLog(
+                msg.recoveryDirectory
+                  ? `${msg.message} Recovery directory: ${msg.recoveryDirectory}`
+                  : msg.message,
+                snapshotPhase === 'succeeded' ? 'success' : 'error',
+              );
+            }
           } else if (['running', 'submitted', 'graph_building', 'cancelling'].includes(msg.status ?? '')) {
             // Active state: restore edge animation
             setEdges(eds => eds.map(e => ({ ...e, animated: true })));
@@ -830,6 +860,8 @@ export const useFlowEngine = (
             }
             restoredExecutionRef.current = false;
             reconciliationSnapshotReceivedRef.current = false;
+            reconnectAttemptRef.current = 0;
+            lastReconnectWarningAtRef.current = 0;
             setWebsocketStatus('connected');
             addLog(`Restored execution ${msg.executionId}`, 'success');
           }
