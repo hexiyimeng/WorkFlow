@@ -54,6 +54,7 @@ from services.slurm_execution_service import (
     _loopback_dashboard_address,
     _worker_job_request,
     slurm_policy_from_environment,
+    validate_allocation_plan_policy,
 )
 from services.slurm_jobqueue_cluster import (
     PlannedSLURMCluster,
@@ -392,6 +393,11 @@ def test_planner_places_eight_gpu_jobs_on_two_real_nodes() -> None:
     requests = [_worker_job_request(allocation, job) for job in allocation.jobs]
     assert all(request.nodes == 1 and request.gpus == 1 for request in requests)
     assert all(request.node_names == () for request in requests)
+    policy = slurm_policy_from_environment({
+        "WorkFlow_SLURM_MAX_NODES": "2",
+        "WorkFlow_SLURM_MAX_GPUS": "8",
+    })
+    validate_allocation_plan_policy(allocation, policy)
 
 
 def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(

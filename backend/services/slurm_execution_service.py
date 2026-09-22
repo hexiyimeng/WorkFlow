@@ -782,7 +782,6 @@ def validate_allocation_plan_policy(
         ):
             raise ValueError(f"Planned partition {partition!r} is not allowed.")
     checks = (
-        (len(plan.nodes), policy.max_nodes, "nodes"),
         (plan.total_cpu, policy.max_cpus, "total cpus"),
         (plan.total_gpu, policy.max_gpus, "total gpus"),
         (plan.total_memory_gib, policy.max_memory_gib, "total memory GiB"),
@@ -804,8 +803,10 @@ def validate_allocation_plan_policy(
                 )
     if plan.pools:
         templates = {job.profile: job for job in plan.jobs}
+        # Every SLURMJob requests resources from one node, but Slurm may place
+        # several jobs on the same physical node. Job count is therefore not a
+        # physical-node count and must not be compared with max_nodes.
         maximums = (
-            (sum(pool.maximum_jobs for pool in plan.pools), policy.max_nodes, "Job nodes"),
             (sum(pool.maximum_jobs * templates[pool.profile].cpu for pool in plan.pools),
              policy.max_cpus, "cpus"),
             (sum(pool.maximum_jobs * templates[pool.profile].gpu for pool in plan.pools),
