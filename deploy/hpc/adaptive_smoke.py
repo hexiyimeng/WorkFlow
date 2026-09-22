@@ -11,6 +11,7 @@ import argparse
 from dataclasses import asdict, replace
 import json
 import getpass
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -75,6 +76,18 @@ def main():
     args = parser.parse_args()
     if not 60 <= args.timeout <= 3600:
         parser.error("--timeout must be between 60 and 3600 seconds")
+
+    # start_control_plane.sh normally injects these derived runtime paths.
+    # The smoke test is also designed to run directly from an operator shell,
+    # where only control-plane.env may have been loaded.
+    runtime = Path(
+        os.environ.get("WORKFLOW_RUNTIME_DIR", Path.home() / "workflow-runtime")
+    ).expanduser().resolve()
+    os.environ.setdefault("WorkFlow_SLURM_RUNTIME_DIR", str(runtime))
+    os.environ.setdefault("WorkFlow_MODELS_DIR", str(runtime / "models"))
+    os.environ.setdefault(
+        "CELLPOSE_LOCAL_MODELS_PATH", str(runtime / "models" / "cellpose")
+    )
 
     import dask
     import distributed

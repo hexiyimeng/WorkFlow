@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -38,6 +39,10 @@ def test_smoke_driver_checks_worker_types_and_cleans_up(monkeypatch, tmp_path, w
         "Gres=gpu:2 State=IDLE Partitions=compute\n")
     monkeypatch.setattr(ClusterInventoryService, "load", lambda self: inventory)
     monkeypatch.setenv("WorkFlow_DASK_ALLOW_INSECURE_CLUSTER", "1")
+    monkeypatch.setenv("WORKFLOW_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("WorkFlow_SLURM_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("WorkFlow_MODELS_DIR", raising=False)
+    monkeypatch.delenv("CELLPOSE_LOCAL_MODELS_PATH", raising=False)
     monkeypatch.setattr(sys, "argv", ["adaptive_smoke.py", "--run", "--timeout", "60"]
                         + (["--gpu"] if with_gpu else []))
     allocations = {}
@@ -74,6 +79,8 @@ def test_smoke_driver_checks_worker_types_and_cleans_up(monkeypatch, tmp_path, w
     monkeypatch.setattr(module, "command", command)
     monkeypatch.setattr(module, "smoke_task", task)
     assert module.main() == 0
+    assert os.environ["WorkFlow_SLURM_RUNTIME_DIR"] == str(tmp_path)
+    assert os.environ["WorkFlow_MODELS_DIR"] == str(tmp_path / "models")
     report = json.loads(next((tmp_path / "test-runs").glob("*/result.json")).read_text())
     assert report["status"] == "PASS" and report["cleanupConfirmed"]
     assert {phase["profile"] for phase in report["phases"]} == (

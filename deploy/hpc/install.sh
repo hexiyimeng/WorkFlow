@@ -83,7 +83,11 @@ export UV_CACHE_DIR
 (
   cd "$WORKFLOW_ROOT/backend"
   "$UV_BIN" sync --frozen --no-install-project --python 3.12
-  .venv/bin/python -m compileall -q .
+  # Compile project code only. Compiling the whole backend also walks the
+  # multi-gigabyte virtual environment and can make an otherwise finished
+  # installation appear to hang.
+  .venv/bin/python -m compileall -q \
+    __init__.py main.py api core nodes services tools
   .venv/bin/python -c \
     "import dask, dask_jobqueue, distributed, fastapi, zarr; print('backend imports: OK')"
   .venv/bin/python \

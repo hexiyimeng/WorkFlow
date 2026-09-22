@@ -211,6 +211,11 @@ powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
 在共享 checkout 已同步到当前版本、Python 环境与后端一致、没有正在执行的工作流时，使用后端相同的 `WorkFlow_*` 环境变量运行：
 
 ```bash
+set -a
+. "$HOME/workflow-runtime/config/control-plane.env"
+set +a
+export WORKFLOW_RUNTIME_DIR="$HOME/workflow-runtime"
+
 # 只读取集群资源并校验计划，不提交 Job
 backend/.venv/bin/python deploy/hpc/adaptive_smoke.py --gpu
 # 提交真实 Job 并验证扩缩容
