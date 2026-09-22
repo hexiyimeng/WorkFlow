@@ -8,12 +8,16 @@ from __future__ import annotations
 import math
 import hashlib
 import time
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 
 from distributed.deploy import Adaptive
 
 from core.worker_pool import WorkerPool
 from services.slurm_jobqueue_cluster import PlannedSlurmWorkerSpec
+
+
+PENDING_JOB_HOLD_SECONDS = 300
 
 
 def profile_target_jobs(scheduler, pool: WorkerPool, target_duration: float,
@@ -50,7 +54,8 @@ class ProfileAdaptive(Adaptive):
     def __init__(self, cluster, pool: WorkerPool,
                  baseline_names: Sequence[Sequence[str]],
                  spec_factory: Callable[[str, str], PlannedSlurmWorkerSpec],
-                 token_prefix: str, *, slots_per_worker: int = 1, **kwargs):
+                 token_prefix: str, *, slots_per_worker: int = 1,
+                 pending_wait_count: int | None = None, **kwargs):
         self.pool = pool
         self.slots_per_worker = slots_per_worker
         self.baseline_names = {
@@ -65,6 +70,16 @@ class ProfileAdaptive(Adaptive):
         self.failure: BaseException | None = None
         super().__init__(cluster, minimum=pool.minimum_jobs,
                          maximum=pool.maximum_jobs, **kwargs)
+        if pending_wait_count is None:
+            pending_wait_count = max(
+                self.wait_count,
+                math.ceil(PENDING_JOB_HOLD_SECONDS / self.interval)
+                if self.interval else self.wait_count,
+            )
+        if pending_wait_count < self.wait_count:
+            raise ValueError("pending_wait_count must be at least wait_count.")
+        self.pending_wait_count = pending_wait_count
+        self.pending_close_counts = defaultdict(int)
 
     @property
     def plan(self):
@@ -101,13 +116,54 @@ class ProfileAdaptive(Adaptive):
         return candidates[:max(0, len(self.plan) - target - pending)]
 
     async def recommendations(self, target):
-        result = await super().recommendations(target)
-        if result.get("status") == "down":
-            # Even partial baseline registration must never make it a pending
-            # elastic candidate in AdaptiveCore.
-            result["workers"] = [key for key in result["workers"]
-                                 if key in self.elastic_names]
-        return result
+        plan = self.plan
+        requested = self.requested
+        observed = self.observed
+        if target == len(plan):
+            self.close_counts.clear()
+            self.pending_close_counts.clear()
+            return {"status": "same"}
+        if target > len(plan):
+            self.close_counts.clear()
+            self.pending_close_counts.clear()
+            return {"status": "up", "n": target}
+
+        # Slurm queue time can be much longer than Dask's one-second Adaptive
+        # interval. Keep pending jobs across short workload gaps so they do not
+        # repeatedly lose their queue age. If a sustained decrease really does
+        # require fewer jobs, cancel the newest requests first.
+        pending = (requested - observed) & set(self.elastic_names)
+        excess = len(plan) - target
+        pending_candidates = [
+            key for key in reversed(self.elastic_names)
+            if key in pending
+        ][:excess]
+        observed_candidates = []
+        if target < len(plan) - len(pending_candidates):
+            observed_candidates = await self.workers_to_close(target=target)
+
+        firmly_close = set()
+        for key in pending_candidates:
+            self.pending_close_counts[key] += 1
+            if self.pending_close_counts[key] >= self.pending_wait_count:
+                firmly_close.add(key)
+        for key in observed_candidates:
+            self.close_counts[key] += 1
+            if self.close_counts[key] >= self.wait_count:
+                firmly_close.add(key)
+
+        active_pending = set(pending_candidates)
+        active_observed = set(observed_candidates)
+        for key in list(self.pending_close_counts):
+            if key in firmly_close or key not in active_pending:
+                del self.pending_close_counts[key]
+        for key in list(self.close_counts):
+            if key in firmly_close or key not in active_observed:
+                del self.close_counts[key]
+
+        if firmly_close:
+            return {"status": "down", "workers": list(firmly_close)}
+        return {"status": "same"}
 
     async def scale_up(self, n):
         if time.monotonic() < self.retry_after:
@@ -155,16 +211,16 @@ class ProfileAdaptive(Adaptive):
 
 def start_profile_adaptives(cluster, pools, baseline_specs, spec_factory, token_prefix):
     """Run on the owning Cluster's IOLoop."""
-    baseline_key = baseline_specs[0].allocation_id
+    baseline_key = "baseline"
     baseline_names = {pool.profile: [] for pool in pools}
     profile_slots = {}
-    for index, spec in enumerate(baseline_specs):
+    for spec in baseline_specs:
         # Factory already knows the Profile; find it from the plan's allocation ID.
         profile = next(pool.profile for pool in pools
                        if spec.allocation_id.rsplit("-", 1)[0] == pool.profile)
         processes = int(spec.options["processes"])
         profile_slots[profile] = spec.slots_per_worker
-        name = f"{baseline_key}-het-{index}"
+        name = f"{baseline_key}-{spec.allocation_id}"
         names = (name,) if processes == 1 else tuple(f"{name}-{i}" for i in range(processes))
         baseline_names[profile].append(names)
     cluster.profile_adaptives = [

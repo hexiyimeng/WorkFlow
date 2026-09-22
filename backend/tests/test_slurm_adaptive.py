@@ -74,7 +74,9 @@ def test_hetjob_submits_once_and_tracks_all_worker_names(monkeypatch, tmp_path):
         assert "--cpus-per-task=8 --mem=8192M --gres=none" in script
         assert "--cpus-per-task=4 --mem=4096M --gres=gpu:1" in script
         assert "wait -n" in script and "trap " in script
-        assert c.plan == {"CPU-1-het-0-0", "CPU-1-het-0-1", "CPU-1-het-1"}
+        assert c.plan == {"baseline-CPU-1-0", "baseline-CPU-1-1", "baseline-GPU-1"}
+        assert "--name baseline-CPU-1" in script
+        assert "--name baseline-GPU-1" in script
         assert len(records) == 1 and records[0].job_id == "70100"
         journal = json.loads((tmp_path / "CPU-1.json").read_text())
         assert journal["jobId"] == "70100"
@@ -109,7 +111,7 @@ def test_incremental_submission_and_whole_multiworker_job_removal(monkeypatch, t
         assert {"CPU-elastic-1-0", "CPU-elastic-1-1"}.issubset(c.plan)
         c.sync(c.scale_down, ["CPU-elastic-1-0", "CPU-elastic-1-1"])
         c.sync(c._correct_state)
-        assert set(c.workers) == {"CPU-1"}
+        assert set(c.workers) == {"baseline"}
         assert cancelled == ["70202"]
         c.stop_planned_jobs()
         assert set(cancelled) == {"70201", "70202"}
@@ -161,15 +163,44 @@ def test_pending_jobs_count_toward_target_and_baseline_is_never_retired():
                scheduler=scheduler(workers=[worker("base")]))
         adaptive = ProfileAdaptive(c, WorkerPool("GPU", 1, 4),
                                    [("base",)], lambda *args: None, "wf:test", interval=0,
-                                   wait_count=2)
+                                   wait_count=2, pending_wait_count=4)
         adaptive.elastic_names["elastic"] = ("elastic",)
         assert adaptive.plan == adaptive.requested == {"baseline:GPU:0", "elastic"}
         assert await adaptive.recommendations(2) == {"status": "same"}
+        assert await adaptive.recommendations(1) == {"status": "same"}
+        assert await adaptive.recommendations(1) == {"status": "same"}
         assert await adaptive.recommendations(1) == {"status": "same"}
         assert await adaptive.recommendations(1) == {"status": "down", "workers": ["elastic"]}
         c.scheduler.workers = {}  # a restarting baseline worker stays protected
         result = await adaptive.recommendations(1)
         assert all(not name.startswith("baseline:") for name in result.get("workers", []))
+    asyncio.run(run())
+
+
+def test_pending_scale_down_preserves_oldest_queue_request():
+    async def run():
+        c = NS(
+            worker_spec={"old": {}, "new": {}},
+            workers={"old": NS(job_id="70301"), "new": NS(job_id="70302")},
+            scheduler=scheduler(workers=[worker("base")]),
+        )
+        adaptive = ProfileAdaptive(
+            c,
+            WorkerPool("GPU", 1, 3),
+            [("base",)],
+            lambda *args: None,
+            "wf:test",
+            interval=0,
+            wait_count=1,
+            pending_wait_count=1,
+        )
+        adaptive.elastic_names["old"] = ("old",)
+        adaptive.elastic_names["new"] = ("new",)
+        assert await adaptive.recommendations(2) == {
+            "status": "down",
+            "workers": ["new"],
+        }
+
     asyncio.run(run())
 
 
@@ -312,10 +343,10 @@ def test_native_graph_triggers_only_its_profile_and_shrinks_extras(monkeypatch, 
             while time.monotonic() < deadline:
                 async def active_specs():
                     return set(c.worker_spec)
-                if c.sync(active_specs) == {"CPU-1"}:
+                if c.sync(active_specs) == {"baseline"}:
                     break
                 time.sleep(0.05)
-            assert c.sync(active_specs) == {"CPU-1"}
+            assert c.sync(active_specs) == {"baseline"}
             assert "71000" not in cancelled
             c.stop_planned_jobs()
             assert "71000" in cancelled

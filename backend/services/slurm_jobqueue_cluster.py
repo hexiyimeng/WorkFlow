@@ -193,8 +193,12 @@ class BaselineSLURMJob(PlannedSLURMJob):
         self.heterogeneous_directive = heterogeneous_directive
         super().__init__(scheduler, name=name, **kwargs)
         self.components = [
-            PlannedSLURMJob(scheduler, name=f"{name}-het-{index}", **dict(spec.options))
-            for index, spec in enumerate(component_specs)
+            PlannedSLURMJob(
+                scheduler,
+                name=f"{name}-{spec.allocation_id}",
+                **dict(spec.options),
+            )
+            for spec in component_specs
         ]
 
     def job_script(self):
@@ -258,14 +262,15 @@ class PlannedSLURMCluster(SLURMCluster):
         directory = getattr(self, "journal_directory", None)
         if directory:
             options["journal_directory"] = str(directory)
+        baseline_key = "baseline"
         suffixes = []
-        for index, spec in enumerate(specs):
+        for spec in specs:
             processes = int(spec.options["processes"])
             suffixes.extend(
-                [f"-het-{index}"] if processes == 1 else
-                [f"-het-{index}-{process}" for process in range(processes)]
+                [f"-{spec.allocation_id}"] if processes == 1 else
+                [f"-{spec.allocation_id}-{process}" for process in range(processes)]
             )
-        self.worker_spec[first.allocation_id] = {
+        self.worker_spec[baseline_key] = {
             "cls": BaselineSLURMJob, "options": options, "group": suffixes,
         }
         self.sync(self._correct_state)
