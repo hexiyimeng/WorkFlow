@@ -10,10 +10,11 @@ closed.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import logging
 import os
 from pathlib import Path
@@ -216,6 +217,18 @@ def _env_positive_float(
     return value
 
 
+def _queue_wait_seconds(env: Mapping[str, str]) -> float:
+    name = "WorkFlow_SLURM_QUEUE_START_TIMEOUT_SECONDS"
+    raw = env.get(name, "0").strip() or "0"
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite non-negative number.") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number.")
+    return value
+
+
 def _absolute_directory(value: object, *, name: str, create: bool = False) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty absolute path.")
@@ -408,7 +421,7 @@ class SlurmRuntimeConfig:
     worker_port_range: str = "20000:20999"
     nanny_port_range: str = "21000:21999"
     worker_start_timeout_seconds: float = 600.0
-    queue_start_timeout_seconds: float = 300.0
+    queue_start_timeout_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         worker = tuple(int(item) for item in self.worker_port_range.split(":"))
@@ -525,9 +538,7 @@ class SlurmRuntimeConfig:
             worker_start_timeout_seconds=_env_positive_float(
                 env, "WorkFlow_DASK_CLUSTER_START_TIMEOUT_SECONDS", 600.0
             ),
-            queue_start_timeout_seconds=_env_positive_float(
-                env, "WorkFlow_SLURM_QUEUE_START_TIMEOUT_SECONDS", 300.0
-            ),
+            queue_start_timeout_seconds=_queue_wait_seconds(env),
         )
 
 
@@ -756,7 +767,7 @@ def _allocation_holder_request(plan: SlurmAllocationPlan) -> SlurmResourceReques
         memory_gib=max(node.memory_gib for node in plan.nodes),
         time_limit=plan.time_limit,
         partition=plan.jobs[0].partition,
-        node_names=tuple(node.node for node in plan.nodes),
+        node_names=(),
     )
 
 
@@ -791,6 +802,20 @@ def validate_allocation_plan_policy(
                     f"Planned {label}={actual} on {node.node} exceeds "
                     f"site per-node limit {maximum}."
                 )
+    if plan.pools:
+        templates = {job.profile: job for job in plan.jobs}
+        maximums = (
+            (sum(pool.maximum_jobs for pool in plan.pools), policy.max_nodes, "Job nodes"),
+            (sum(pool.maximum_jobs * templates[pool.profile].cpu for pool in plan.pools),
+             policy.max_cpus, "cpus"),
+            (sum(pool.maximum_jobs * templates[pool.profile].gpu for pool in plan.pools),
+             policy.max_gpus, "gpus"),
+            (sum(pool.maximum_jobs * templates[pool.profile].memory_gib for pool in plan.pools),
+             policy.max_memory_gib, "memory GiB"),
+        )
+        for actual, maximum, label in maximums:
+            if actual > maximum:
+                raise ValueError(f"Adaptive maximum {label}={actual} exceeds site limit {maximum}.")
 
 
 def _worker_job_request(
@@ -804,7 +829,7 @@ def _worker_job_request(
         memory_gib=job.memory_gib,
         time_limit=plan.time_limit,
         partition=job.partition,
-        node_names=(job.node,),
+        node_names=(),
     )
 
 
@@ -1105,6 +1130,16 @@ class SlurmExecutionService:
         lines = [item.strip() for item in result.stdout.splitlines() if item.strip()]
         if not lines:
             return True, None
+        # squeue returns leader+offset rows for a heterogeneous allocation.
+        het_rows = [line.split("|", 4) for line in lines]
+        if all(len(row) == 5 and re.fullmatch(re.escape(job_id) + r"\+[0-9]+", row[0])
+               and (submission_token is None or row[1] == submission_token)
+               for row in het_rows):
+            active = [row for row in het_rows if row[2].upper() not in _SLURM_TERMINAL_STATES]
+            rows = active or het_rows
+            pending = next((row for row in rows if row[2].upper() not in {"RUNNING", "COMPLETING"}), None)
+            row = pending or rows[0]
+            return True, (row[2].upper(), ",".join(r[3] for r in rows), row[4])
         if len(lines) != 1:
             logger.warning("squeue returned ambiguous rows for root job %s", job_id)
             return False, None
@@ -1234,11 +1269,18 @@ class SlurmExecutionService:
         control_found, control_state = await self._query_scontrol_state(
             config, job_id, cluster, submission_token
         )
-        if control_found:
-            return control_found, control_state
-        return await self._query_accounting_state(
-            config, job_id, cluster, submission_token
-        )
+        if not control_found:
+            control_found, control_state = await self._query_accounting_state(
+                config, job_id, cluster, submission_token)
+        if control_state is not None:
+            # A hetjob leader ending is not proof that its other components
+            # have stopped writing. Check the entire allocation before release.
+            queue_ok, queue_state = await self._query_queue_state(
+                config, job_id, cluster, submission_token)
+            if not queue_ok or (queue_state is not None
+                                and queue_state[0] not in _SLURM_TERMINAL_STATES):
+                return True, None
+        return control_found, control_state
 
     async def _query_job_by_submission_token(
         self,
@@ -1266,11 +1308,13 @@ class SlurmExecutionService:
             fields = [field.strip() for field in raw_line.split("|", 2)]
             if len(fields) != 3 or fields[1] != submission_token:
                 continue
-            if re.fullmatch(r"[1-9][0-9]*", fields[0]) is None:
+            if re.fullmatch(r"[1-9][0-9]*(?:\+[0-9]+)?", fields[0]) is None:
                 raise SlurmSubmissionError(
                     "Slurm returned an invalid job ID for a submission token."
                 )
-            matches.append((fields[0], fields[2].upper()))
+            leader = fields[0].split("+", 1)[0]
+            if not any(item[0] == leader for item in matches):
+                matches.append((leader, fields[2].upper()))
         if len(matches) > 1:
             raise SlurmSubmissionError(
                 "Multiple Slurm jobs have the same WorkFlow submission token."
@@ -2192,20 +2236,19 @@ class SlurmExecutionService:
     ) -> None:
         """Wait for Slurm scheduling without consuming Worker startup time.
 
-        The Dask registration timeout starts only after every allocation is
-        running.  Queue wait has its own bound so a partially runnable set is
-        cancelled instead of retaining resources indefinitely.
+        The Dask registration timeout starts only after the baseline is running.
+        The optional queue deadline is separate; zero permits peak-time queuing.
         """
 
         last_state: tuple[str, str, str] | None = None
-        deadline = time.monotonic() + config.queue_start_timeout_seconds
+        deadline = (time.monotonic() + config.queue_start_timeout_seconds
+                    if config.queue_start_timeout_seconds else float("inf"))
         while True:
             if time.monotonic() >= deadline:
                 raise SlurmSubmissionError(
                     "The complete Worker allocation did not become runnable "
                     f"within {config.queue_start_timeout_seconds:g} seconds. "
-                    "The execution is being rolled back so partial Worker Jobs "
-                    "do not retain cluster resources."
+                    "The baseline allocation is being cancelled."
                 )
             query_ok, queue_state = await self._query_queue_state(
                 config,
@@ -2312,6 +2355,100 @@ class SlurmExecutionService:
                 f"{run_directory}/*-{job_id}.err and *-{job_id}.out."
             )
 
+    async def _execute_with_adaptive_monitor(self, config, baseline_jobs, run_directory,
+                                             graph, execution_id, selected_config, **kwargs):
+        """Watch allocation failures without imposing a timeout on elastic queues."""
+        cluster = dask_service.cluster
+        running_since = {}
+        missing_since = {}
+        ended = set()
+        announced = set()
+        stopping = asyncio.Event()
+        original_cleanup = kwargs.get("external_cleanup_barrier")
+
+        async def cleanup():
+            stopping.set()
+            if original_cleanup:
+                await original_cleanup()
+        kwargs["external_cleanup_barrier"] = cleanup
+
+        async def monitor():
+            while not stopping.is_set():
+                try:
+                    await self._assert_worker_allocations_alive(
+                        config=config, submitted_jobs=baseline_jobs, run_directory=run_directory)
+                except Exception:
+                    if stopping.is_set():
+                        return
+                    raise
+                if stopping.is_set():
+                    return
+                async def baseline_registered():
+                    return all(set(item.baseline_names).issubset(item.observed)
+                               for item in cluster.profile_adaptives)
+                if await asyncio.to_thread(cluster.sync, baseline_registered):
+                    missing_since.pop("baseline", None)
+                else:
+                    missing_since.setdefault("baseline", time.monotonic())
+                    if time.monotonic() - missing_since["baseline"] > config.worker_start_timeout_seconds:
+                        raise SlurmSubmissionError("Baseline workers did not recover before the registration deadline.")
+                for adaptive in cluster.profile_adaptives:
+                    if adaptive.failure is not None:
+                        raise SlurmSubmissionError(f"Adaptive submission failed: {adaptive.failure}")
+                records = await asyncio.to_thread(cluster.submitted_job_records)
+                for record in records:
+                    adaptive = next((item for item in cluster.profile_adaptives
+                                     if record.allocation_id in item.elastic_names), None)
+                    if (stopping.is_set() or adaptive is None or record.job_id in ended
+                            or record.allocation_id not in cluster.worker_spec):
+                        continue
+                    if record.job_id not in announced:
+                        announced.add(record.job_id)
+                        state_manager.add_log(
+                            f"Adaptive {adaptive.pool.profile}: submitted Slurm Job {record.job_id}",
+                            "info", execution_id=execution_id)
+                    query_ok, row = await self._query_queue_state(
+                        config, record.job_id, None, record.submission_token)
+                    if not query_ok:
+                        continue
+                    terminal = row is not None and row[0] in _SLURM_TERMINAL_STATES
+                    if row is None:
+                        _, terminal_record = await self._query_terminal_state(
+                            config, record.job_id, None, record.submission_token)
+                        terminal = terminal_record is not None
+                        missing_since.setdefault(record.job_id, time.monotonic())
+                        terminal = terminal or time.monotonic() - missing_since[record.job_id] > config.result_grace_seconds
+                    else:
+                        missing_since.pop(record.job_id, None)
+                    if row and row[0] == "RUNNING":
+                        running_since.setdefault(record.job_id, time.monotonic())
+                        async def registered():
+                            return record.allocation_id in adaptive.observed
+                        is_registered = await asyncio.to_thread(cluster.sync, registered)
+                        if not is_registered and time.monotonic() - running_since[record.job_id] > config.worker_start_timeout_seconds:
+                            terminal = True
+                    if terminal:
+                        ended.add(record.job_id)
+                        await asyncio.to_thread(cluster.sync, adaptive.allocation_ended, record.allocation_id)
+                try:
+                    await asyncio.wait_for(stopping.wait(), timeout=config.poll_interval_seconds)
+                except TimeoutError:
+                    pass
+
+        driver = asyncio.create_task(execute_graph_on_service_node(
+            graph, execution_id, selected_config, **kwargs))
+        watcher = asyncio.create_task(monitor())
+        try:
+            done, _ = await asyncio.wait((driver, watcher), return_when=asyncio.FIRST_COMPLETED)
+            if watcher in done:
+                await watcher
+            await driver
+        finally:
+            watcher.cancel()
+            if not driver.done():
+                driver.cancel()
+            await asyncio.gather(driver, watcher, return_exceptions=True)
+
     async def reconcile_active_job(self) -> str | None:
         """Terminate orphan Worker allocations; a dead local Driver cannot resume."""
         config = SlurmRuntimeConfig.from_environment()
@@ -2361,6 +2498,20 @@ class SlurmExecutionService:
                 raise SlurmSubmissionError(
                     f"Non-terminal Worker record {job_path} has invalid pending tokens."
                 )
+            pending_tokens = list(pending_tokens)
+            for journal_path in (job_path.parent / "allocations").glob("*.json"):
+                allocation = _read_json_file(journal_path)
+                token = allocation.get("submissionToken")
+                job_id = allocation.get("jobId")
+                if not isinstance(token, str) or re.fullmatch(r"[A-Za-z0-9:._-]+", token) is None:
+                    raise SlurmSubmissionError(f"Invalid ownership journal: {journal_path}")
+                if job_id is None:
+                    pending_tokens.append(token)
+                elif not isinstance(job_id, str) or re.fullmatch(r"[1-9][0-9]*", job_id) is None:
+                    raise SlurmSubmissionError(f"Invalid job in ownership journal: {journal_path}")
+                elif all(item[0] != job_id for item in jobs):
+                    jobs.append((job_id, None, token))
+            pending_tokens = list(set(pending_tokens) - {item[2] for item in jobs})
             for pending_token in pending_tokens:
                 if not isinstance(pending_token, str) or not pending_token:
                     raise SlurmSubmissionError(
@@ -2390,6 +2541,7 @@ class SlurmExecutionService:
                 "schemaVersion": JOB_SCHEMA_VERSION,
                 "jobId": jobs[0][0] if jobs else None,
                 "jobIds": [item[0] for item in jobs],
+                "clusters": [item[1] for item in jobs],
                 "submissionTokens": [item[2] for item in jobs],
                 "pendingSubmissionToken": None,
                 "pendingSubmissionTokens": [],
@@ -2442,7 +2594,9 @@ class SlurmExecutionService:
         )
         resource_request = _allocation_holder_request(allocation_plan)
         validate_allocation_plan_policy(allocation_plan, config.policy)
-        maximum_local_workers = max(sum(node.workers.values()) for node in allocation_plan.nodes)
+        # Slurm may co-locate jobs. Reserve enough port choices even at the
+        # configured elastic maximum, rather than relying on guessed placement.
+        maximum_local_workers = sum(pool.maximum_jobs * pool.processes for pool in allocation_plan.pools)
         for name, configured_range in (
             ("WorkFlow_DASK_WORKER_PORT_RANGE", config.worker_port_range),
             ("WorkFlow_DASK_NANNY_PORT_RANGE", config.nanny_port_range),
@@ -2483,13 +2637,14 @@ class SlurmExecutionService:
             if scheduler_started:
                 # Capture partially submitted jobs even when one SLURMJob
                 # failed while the heterogeneous spec set was starting.
+                await asyncio.to_thread(dask_service.stop_slurm_adaptive)
                 known_ids = {item[0] for item in submitted_jobs}
                 for record in await asyncio.to_thread(
                     dask_service.submitted_slurm_jobqueue_jobs
                 ):
                     if record.job_id in known_ids:
                         continue
-                    request = job_requests.get(record.allocation_id)
+                    request = job_requests.get(record.allocation_id, resource_request)
                     if request is not None:
                         submitted_jobs.append((
                             record.job_id,
@@ -2498,6 +2653,22 @@ class SlurmExecutionService:
                             request,
                         ))
                         known_ids.add(record.job_id)
+            for journal_path in (run_directory / "allocations").glob("*.json"):
+                allocation = _read_json_file(journal_path)
+                if allocation.get("jobId") is not None:
+                    continue
+                token = allocation["submissionToken"]
+                if any(item[2] == token for item in submitted_jobs):
+                    continue
+                query_ok, match = await self._query_job_by_submission_token(config, token)
+                if not query_ok:
+                    job_id = await self._recover_ambiguous_submission(
+                        config=config, execution_id=execution_id, submission_token=token)
+                elif match is not None:
+                    job_id = match[0]
+                else:
+                    continue
+                submitted_jobs.append((job_id, None, token, resource_request))
             cancelled_by_cluster = False
             if scheduler_started:
                 try:
@@ -2588,11 +2759,11 @@ class SlurmExecutionService:
                 job.allocation_id: job for job in allocation_plan.jobs
             }
             protocol = "tls://" if scheduler_address.startswith("tls://") else "tcp://"
-            for job_index, planned_job in enumerate(allocation_plan.jobs, start=1):
+            for planned_job in allocation_plan.jobs:
                 job_request = _worker_job_request(allocation_plan, planned_job)
                 config.policy.validate_request(job_request)
                 job_requests[planned_job.allocation_id] = job_request
-                submission_token = f"{submission_token_prefix}:{job_index}"
+                submission_token = f"{submission_token_prefix}:baseline"
                 planned_specs.append(build_planned_slurm_worker_spec(
                     allocation_plan,
                     planned_job,
@@ -2639,7 +2810,7 @@ class SlurmExecutionService:
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
             submission_task = asyncio.create_task(asyncio.to_thread(
-                dask_service.submit_slurm_jobqueue_workers, planned_specs
+                dask_service.submit_slurm_baseline, planned_specs, run_directory / "allocations"
             ))
             submitted_records, cancelled_during_submission = (
                 await _harvest_background_task(submission_task)
@@ -2661,9 +2832,8 @@ class SlurmExecutionService:
                     "profile": planned_job.profile,
                     "resources": job_request.to_dict(),
                     "message": (
-                        f"SLURMCluster Worker job {record.job_id} submitted: "
-                        f"{planned_job.workers} {planned_job.profile} Worker(s) "
-                        f"on {planned_job.node} ({planned_job.partition})."
+                        f"Baseline hetjob {record.job_id} submitted: "
+                        f"profiles={allocation_plan.worker_counts}."
                     ),
                 })
             self._jobs[execution_id] = ",".join(item[0] for item in submitted_jobs)
@@ -2756,7 +2926,26 @@ class SlurmExecutionService:
                 "submittedAt": submitted_at,
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
-            await execute_graph_on_service_node(
+            template_jobs = {job.profile: job for job in allocation_plan.jobs}
+            def elastic_spec(profile, name, token):
+                job = replace(template_jobs[profile], allocation_id=name)
+                request = _worker_job_request(allocation_plan, job)
+                config.policy.validate_request(request)
+                job_requests[name] = request
+                return build_planned_slurm_worker_spec(
+                    allocation_plan, job, execution_id=execution_id, submission_token=token,
+                    project_root=config.project_root, runtime_directory=config.runtime_directory,
+                    run_directory=run_directory,
+                    python_executable=config.project_root / "backend" / ".venv" / "bin" / "python",
+                    sbatch_executable=config.sbatch_executable, scancel_executable=config.scancel_executable,
+                    scheduler_host=config.scheduler_host, scheduler_port=config.scheduler_port,
+                    protocol=protocol, security=dask_service.client.security,
+                    worker_port_range=config.worker_port_range, nanny_port_range=config.nanny_port_range)
+            await asyncio.to_thread(dask_service.start_slurm_adaptive,
+                                    allocation_plan.pools, planned_specs, elastic_spec,
+                                    submission_token_prefix)
+            await self._execute_with_adaptive_monitor(
+                config, submitted_jobs, run_directory,
                 authoritative_graph,
                 execution_id,
                 selected_config,

@@ -1,18 +1,21 @@
 """Planner-aware ``dask-jobqueue`` integration for heterogeneous Slurm jobs.
 
 One :class:`PlannedSLURMCluster` owns the service-node Scheduler for a workflow.
-Each Resource Planner allocation becomes a distinct standard ``SLURMJob``
-worker spec, so profiles may use different partitions, nodes, CPU, memory, GPU
-and process counts while retaining SLURMCluster's Worker command and lifecycle.
+The minimum allocations form one heterogeneous Slurm job. Elastic allocations
+use independent standard ``SLURMJob`` specs with each profile's own resources.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
+import math
+import os
 from pathlib import Path
 import re
 import shlex
+import subprocess
 from typing import Mapping, Sequence
 
 from dask_jobqueue import SLURMCluster
@@ -30,6 +33,19 @@ _JOB_ID_RE = re.compile(r"[1-9][0-9]*\Z")
 _SAFE_JOB_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}\Z")
 _SAFE_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
+
+
+def detect_heterogeneous_directive(submit_command: str) -> str:
+    """Slurm renamed packjob/pack-group to hetjob/het-group in 20.02."""
+    output = subprocess.run(shlex.split(submit_command) + ["--version"],
+                            check=True, capture_output=True, text=True, timeout=10).stdout
+    match = re.search(r"\bslurm\s+(\d+)\.(\d+)", output, re.IGNORECASE)
+    if match is None:
+        raise RuntimeError(f"Cannot determine Slurm heterogeneous syntax from {output!r}")
+    version = tuple(map(int, match.groups()))
+    if version < (17, 11):
+        raise RuntimeError("Slurm heterogeneous jobs require Slurm 17.11 or newer")
+    return "packjob" if version < (20, 2) else "hetjob"
 
 
 def _absolute_executable(value: Path | str, *, name: str) -> Path:
@@ -96,8 +112,11 @@ class PlannedSlurmWorkerSpec:
     allocation_id: str
     submission_token: str
     options: Mapping[str, object]
+    slots_per_worker: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.slots_per_worker) is not int or self.slots_per_worker < 1:
+            raise ValueError("slots_per_worker must be a positive integer.")
         if _SAFE_JOB_NAME_RE.fullmatch(self.allocation_id) is None:
             raise ValueError(f"Invalid Slurm allocation id: {self.allocation_id!r}.")
         if _SAFE_TOKEN_RE.fullmatch(self.submission_token) is None:
@@ -121,15 +140,35 @@ class PlannedSLURMJob(SLURMJob):
         submission_token: str | None = None,
         submit_command: str | None = None,
         cancel_command: str | None = None,
+        journal_directory: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.allocation_id = allocation_id
         self.submission_token = submission_token
+        self.journal_directory = journal_directory
         if submit_command:
             self.submit_command = submit_command
         if cancel_command:
             self.cancel_command = cancel_command
+
+    def _write_journal(self) -> None:
+        if not self.journal_directory:
+            return
+        path = Path(self.journal_directory) / f"{self.allocation_id}.json"
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump({"allocationId": self.allocation_id, "jobId": self.job_id,
+                       "submissionToken": self.submission_token}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+
+    async def start(self) -> None:
+        # Persist ownership before sbatch, including ambiguous submission failures.
+        self._write_journal()
+        await super().start()
+        self._write_journal()
 
     async def close(self) -> None:
         """Cancel through dask-jobqueue and publish a terminal SpecCluster state."""
@@ -144,15 +183,105 @@ class PlannedSLURMJob(SLURMJob):
             await ProcessInterface.close(self)
 
 
+class BaselineSLURMJob(PlannedSLURMJob):
+    """One sbatch heterogeneous allocation, with one srun per resource component."""
+
+    def __init__(self, scheduler=None, name=None, *, component_specs,
+                 heterogeneous_directive="hetjob", **kwargs):
+        if heterogeneous_directive not in {"hetjob", "packjob"}:
+            raise ValueError("Invalid Slurm heterogeneous job directive")
+        self.heterogeneous_directive = heterogeneous_directive
+        super().__init__(scheduler, name=name, **kwargs)
+        self.components = [
+            PlannedSLURMJob(scheduler, name=f"{name}-het-{index}", **dict(spec.options))
+            for index, spec in enumerate(component_specs)
+        ]
+
+    def job_script(self):
+        headers = f"\n#SBATCH {self.heterogeneous_directive}\n".join(
+            "\n".join(line for line in job.job_header.splitlines()
+                      if index == 0 or not line.startswith(("#SBATCH -e ", "#SBATCH -o ", "#SBATCH -J ")))
+            for index, job in enumerate(self.components))
+        lines = [self.shebang, headers, "set -euo pipefail", "pids=()",
+                 "trap 'kill \"${pids[@]}\" 2>/dev/null || true; wait || true' EXIT TERM INT"]
+        for index, job in enumerate(self.components):
+            body = "\n".join([*job._job_script_prologue, "exec " + job._command_template])
+            group_name = "pack-group" if self.heterogeneous_directive == "packjob" else "het-group"
+            group = f" --{group_name}={index}" if len(self.components) > 1 else ""
+            gres = next((directive for directive in job.job_extra_directives
+                         if directive.startswith("--gres=")), "--gres=none")
+            lines.append(
+                f"srun{group} --nodes=1 --ntasks=1 --cpus-per-task={job.worker_cores} "
+                f"--mem={math.ceil(job.worker_memory / 1024**2)}M {gres} --export=ALL "
+                f"/bin/bash -c {shlex.quote(body)} &"
+            )
+            lines.append('pids+=("$!")')
+        # Workers are long-lived. Any component exiting ends the whole baseline.
+        lines.extend(["wait -n", "exit 1"])
+        return "\n".join(lines) + "\n"
+
+
 class PlannedSLURMCluster(SLURMCluster):
     """One on-demand Scheduler with heterogeneous planner-defined Slurm jobs."""
 
     job_cls = PlannedSLURMJob
 
+    def configure_journal(self, directory: Path) -> None:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        self.journal_directory = directory
+        self.profile_adaptives = []
+
+    async def add_job_specs(self, specs: Sequence[PlannedSlurmWorkerSpec]) -> None:
+        for spec in specs:
+            if spec.allocation_id in self.worker_spec:
+                raise ValueError(f"Duplicate allocation {spec.allocation_id}")
+            options = dict(spec.options)
+            directory = getattr(self, "journal_directory", None)
+            if directory:
+                options["journal_directory"] = str(directory)
+            entry = {"cls": PlannedSLURMJob, "options": options}
+            processes = int(options["processes"])
+            if processes > 1:
+                entry["group"] = [f"-{i}" for i in range(processes)]
+            self.worker_spec[spec.allocation_id] = entry
+        await self._correct_state()
+
+    def submit_baseline(self, specs: Sequence[PlannedSlurmWorkerSpec]):
+        if self.worker_spec or not specs:
+            raise ValueError("Baseline must be the first nonempty resource submission.")
+        first = specs[0]
+        options = dict(first.options)
+        options["component_specs"] = tuple(specs)
+        if len(specs) > 1:
+            options["heterogeneous_directive"] = detect_heterogeneous_directive(
+                str(options.get("submit_command") or self.job_cls.submit_command))
+        directory = getattr(self, "journal_directory", None)
+        if directory:
+            options["journal_directory"] = str(directory)
+        suffixes = []
+        for index, spec in enumerate(specs):
+            processes = int(spec.options["processes"])
+            suffixes.extend(
+                [f"-het-{index}"] if processes == 1 else
+                [f"-het-{index}-{process}" for process in range(processes)]
+            )
+        self.worker_spec[first.allocation_id] = {
+            "cls": BaselineSLURMJob, "options": options, "group": suffixes,
+        }
+        self.sync(self._correct_state)
+        return self.submitted_job_records()
+
     def submitted_job_records(self) -> tuple[SubmittedSlurmJob, ...]:
         candidates = list(self.workers.values())
         candidates.extend(tuple(getattr(self, "_created", ()) or ()))
         records: dict[str, SubmittedSlurmJob] = {}
+        directory = getattr(self, "journal_directory", None)
+        if directory:
+            for path in directory.glob("*.json"):
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if _JOB_ID_RE.fullmatch(str(data.get("jobId") or "")):
+                    records[data["allocationId"]] = SubmittedSlurmJob(
+                        data["allocationId"], data["jobId"], data["submissionToken"])
         for candidate in candidates:
             if not isinstance(candidate, PlannedSLURMJob):
                 continue
@@ -175,29 +304,16 @@ class PlannedSLURMCluster(SLURMCluster):
         self,
         specs: Sequence[PlannedSlurmWorkerSpec],
     ) -> tuple[SubmittedSlurmJob, ...]:
-        if self.worker_spec or self.workers:
-            raise RuntimeError("This SLURMCluster already has Worker jobs.")
         if not specs:
             raise ValueError("At least one planned Slurm Worker job is required.")
-        worker_spec: dict[str, dict[str, object]] = {}
-        for spec in specs:
-            if spec.allocation_id in worker_spec:
-                raise ValueError(
-                    f"Duplicate planned Slurm allocation {spec.allocation_id!r}."
-                )
-            worker_spec[spec.allocation_id] = {
-                "cls": PlannedSLURMJob,
-                "options": dict(spec.options),
-            }
-        self.worker_spec.update(worker_spec)
-        self.sync(self._correct_state)
+        self.sync(self.add_job_specs, specs)
 
         records = {
             record.allocation_id: record
             for record in self.submitted_job_records()
         }
         result: list[SubmittedSlurmJob] = []
-        for allocation_id in worker_spec:
+        for allocation_id in (spec.allocation_id for spec in specs):
             if allocation_id not in records:
                 raise RuntimeError(
                     f"SLURMCluster did not return a valid job id for {allocation_id!r}."
@@ -208,8 +324,19 @@ class PlannedSLURMCluster(SLURMCluster):
     def stop_planned_jobs(self) -> None:
         """Scale Worker jobs to zero while leaving the local Scheduler alive."""
 
+        self.stop_profile_adaptives()
         self.scale(jobs=0)
         self.sync(self._correct_state)
+
+    def stop_profile_adaptives(self) -> None:
+        async def stop():
+            for adaptive in getattr(self, "profile_adaptives", ()):
+                adaptive.stop()
+            # Let an in-flight sbatch finish before capturing records or cancelling.
+            import asyncio
+            while any(a._adapting for a in getattr(self, "profile_adaptives", ())):
+                await asyncio.sleep(0.05)
+        self.sync(stop)
 
 
 def build_planned_slurm_worker_spec(
@@ -251,12 +378,13 @@ def build_planned_slurm_worker_spec(
     directives = [
         "--nodes=1",
         "--ntasks-per-node=1",
-        f"--nodelist={job.node}",
         "--export=NONE",
         f"--comment={submission_token}",
         "--signal=B:TERM@90",
         f"--chdir={root}",
     ]
+    if job.excluded_nodes:
+        directives.append("--exclude=" + ",".join(job.excluded_nodes))
     if job.gpu:
         directives.append(f"--gres=gpu:{job.gpu}")
 
@@ -347,7 +475,7 @@ def build_planned_slurm_worker_spec(
         "python": str(python),
         "worker_command": "distributed.cli.dask_worker",
         "worker_extra_args": [
-            "--resources", resources,
+            "--resources", shlex.quote(resources),
             "--preload", "services.slurm_worker_preload",
             "--host", '"$WORKFLOW_DASK_WORKER_HOST"',
             "--worker-port", worker_port_range,
@@ -369,10 +497,12 @@ def build_planned_slurm_worker_spec(
         allocation_id=job.allocation_id,
         submission_token=submission_token,
         options=options,
+        slots_per_worker=int(job.logical_resources[job.profile]),
     )
 
 
 __all__ = [
+    "BaselineSLURMJob",
     "PlannedSLURMCluster",
     "PlannedSLURMJob",
     "PlannedSlurmWorkerSpec",

@@ -429,12 +429,13 @@ class WorkerDevicePlugin(WorkerPlugin):
         profile = os.environ.get("WORKFLOW_WORKER_PROFILE", "").strip()
         resources = _worker_resources(worker)
         if profile:
-            if resources.get(profile) != 1:
+            if profile not in {CPU_RESOURCE_NAME, GPU_RESOURCE_NAME} or profile.lower() != role:
+                raise RuntimeError("Worker type must be CPU or GPU and match its role.")
+            capacity = worker.state.nthreads if profile == CPU_RESOURCE_NAME else 1
+            if resources.get(profile) != capacity:
                 raise RuntimeError(
-                    "Worker must advertise WORKFLOW_WORKER_PROFILE with logical value 1."
+                    "Worker Profile capacity must match its thread/device slots."
                 )
-            if float(resources.get(CPU_RESOURCE_NAME, 0) or 0) <= 0:
-                raise RuntimeError("Every Worker Profile must advertise positive CPU capacity.")
 
         if role == "cpu":
             if not profile and resources.get(CPU_RESOURCE_NAME) != 1:
@@ -452,8 +453,8 @@ class WorkerDevicePlugin(WorkerPlugin):
 
         if role != "gpu":
             raise RuntimeError(f"Unknown Worker role: {role!r}.")
-        if not profile and resources.get(CPU_RESOURCE_NAME, 0) != 0:
-            raise RuntimeError("Legacy local GPU Worker must not advertise CPU capacity.")
+        if resources.get(CPU_RESOURCE_NAME, 0) != 0:
+            raise RuntimeError("GPU Worker must not accept CPU tasks.")
         if resources.get(GPU_RESOURCE_NAME) != 1:
             raise RuntimeError("GPU Worker must advertise logical GPU=1.")
 
@@ -484,7 +485,7 @@ class WorkerDevicePlugin(WorkerPlugin):
 
 
 class WorkerMemoryTrimPlugin(WorkerPlugin):
-    """Trim Linux Writer arenas after Dask releases completed task arguments.
+    """Trim shared CPU Worker arenas after Dask releases completed task arguments.
 
     A task-level ``finally`` block runs while Dask still owns the task's input
     arrays.  Trimming there cannot return those pages.  This plugin waits for
@@ -499,7 +500,7 @@ class WorkerMemoryTrimPlugin(WorkerPlugin):
         self._enabled = (
             should_schedule_malloc_trim()
             and os.environ.get("WORKFLOW_WORKER_PROFILE", "").strip()
-            == "cpu-writer"
+            == "CPU"
         )
         self._delay = max(
             0.05,
@@ -1055,18 +1056,14 @@ def cluster_resource_summary_from_scheduler_info(
         gpu_slots = float(resources.get(GPU_RESOURCE_NAME, 0) or 0)
         total_cpu_slots += cpu_slots
         total_gpu_slots += gpu_slots
-        # Profile Workers with a GPU also advertise their CPU allocation, but
-        # they are GPU Workers rather than CPU-only Workers. Keep the role
-        # counts disjoint while total_cpu_slots still reports all CPU capacity.
+        # Logical CPU slots belong only to CPU Workers. GPU Workers' physical
+        # CPUs are reserved in Slurm but are not CPU-task scheduling capacity.
         if cpu_slots > 0 and gpu_slots <= 0:
             cpu_workers.append(str(worker_address))
         if gpu_slots > 0:
             gpu_workers.append(str(worker_address))
         for name, amount in resources.items():
-            if (
-                name in {CPU_RESOURCE_NAME, GPU_RESOURCE_NAME}
-                or is_ownership_resource(name)
-            ):
+            if is_ownership_resource(name):
                 continue
             worker_profile_slots[name] = worker_profile_slots.get(name, 0.0) + float(amount)
 
@@ -1588,6 +1585,25 @@ class DaskService:
             raise RuntimeError("The active Dask cluster is not a PlannedSLURMCluster.")
         return tuple(submit(specs))
 
+    def submit_slurm_baseline(self, specs, journal_directory):
+        cluster = self.cluster
+        if cluster is None:
+            raise RuntimeError("No Slurm cluster exists.")
+        cluster.configure_journal(journal_directory)
+        return cluster.submit_baseline(specs)
+
+    def start_slurm_adaptive(self, pools, specs, spec_factory, token_prefix):
+        from services.slurm_adaptive import start_profile_adaptives
+        cluster = self.cluster
+        async def start():
+            start_profile_adaptives(cluster, pools, specs, spec_factory, token_prefix)
+        cluster.sync(start)
+
+    def stop_slurm_adaptive(self):
+        cluster = self.cluster
+        if cluster is not None and hasattr(cluster, "stop_profile_adaptives"):
+            cluster.stop_profile_adaptives()
+
     def stop_slurm_jobqueue_workers(self) -> None:
         """Ask SLURMCluster to cancel Worker jobs but keep Scheduler alive."""
 
@@ -1621,7 +1637,7 @@ class DaskService:
         submission_token: str | None = None,
         submission_tokens: Sequence[str] | None = None,
     ) -> ClusterResourceSummary:
-        """Wait for an exact set of logical Worker Profile capabilities."""
+        """Wait for the minimum logical Worker Profile capabilities."""
 
         normalized: dict[str, int] = {}
         for name, count in expected_profiles.items():
@@ -1659,7 +1675,7 @@ class DaskService:
                     continue
                 observed[matched[0]] += 1
             addresses = tuple(sorted(str(address) for address in workers))
-            if not unexpected and observed == normalized and len(workers) == expected_total:
+            if not unexpected and all(observed[name] >= count for name, count in normalized.items()):
                 stable = stable + 1 if addresses == previous_addresses else 1
                 previous_addresses = addresses
                 summary = cluster_resource_summary_from_scheduler_info(scheduler_info)
@@ -1732,7 +1748,8 @@ class DaskService:
                 profile.threads,
                 tuple(sorted(profile.logical_resources.items())),
                 selected_pools[name].processes,
-                selected_pools[name].scale,
+                selected_pools[name].minimum_jobs,
+                selected_pools[name].maximum_jobs,
             )
             for name, profile in selected_profiles.items()
         )
@@ -1749,7 +1766,8 @@ class DaskService:
             if self.client is not None and self.active_worker_profile_topology == topology:
                 summary = self.get_cluster_resource_summary(self.client)
                 if all(
-                    int(summary.worker_profile_slots.get(name, 0)) == count
+                    int(summary.worker_profile_slots.get(name, 0))
+                    == count * selected_profiles[name].logical_resources[name]
                     for name, count in expected_counts.items()
                 ):
                     return self.client

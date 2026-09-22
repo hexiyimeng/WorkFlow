@@ -3,13 +3,11 @@ import type { WorkerPool, WorkerProfile } from '../types';
 export const WORKER_PROFILES_STORAGE_KEY = 'worker_profiles';
 export const WORKER_POOLS_STORAGE_KEY = 'worker_pools';
 
-const PROFILE_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const PROFILE_NAME = /^(CPU|GPU)$/;
 const MEMORY = /^([0-9]+(?:\.[0-9]+)?)\s*(GB|GiB)$/i;
 const BUILT_IN_PROFILE_GPUS: Readonly<Record<string, 0 | 1>> = {
-  'cpu-general': 0,
-  'cpu-reader': 0,
-  'cpu-writer': 0,
-  'gpu-cellpose': 1,
+  CPU: 0,
+  GPU: 1,
 };
 
 export const fixedGpuForWorkerProfile = (name: string): 0 | 1 | undefined => (
@@ -34,6 +32,8 @@ const nonnegativeInteger = (value: unknown): value is number => (
   Number.isSafeInteger(value) && Number(value) >= 0
 );
 
+const profileTaskCapacity = (cpu: number, gpu: number): number => gpu > 0 ? gpu : cpu;
+
 export const isWorkerProfile = (value: unknown): value is WorkerProfile => {
   if (!isRecord(value) || typeof value.name !== 'string' || !PROFILE_NAME.test(value.name)) {
     return false;
@@ -46,11 +46,11 @@ export const isWorkerProfile = (value: unknown): value is WorkerProfile => {
     && positiveMemory(physical.memory)
     && nonnegativeInteger(physical.gpu)
     && Number(physical.gpu) <= 1
+    && gpu === fixedGpuForWorkerProfile(value.name)
     && Number(value.threads) === Number(physical.cpu)
     && isRecord(logical)
-    && Number(logical[value.name]) === 1
-    && Number(logical.CPU) === Number(physical.cpu)
-    && (gpu > 0 ? Number(logical.GPU) === gpu : logical.GPU === undefined)
+    && Number(logical[value.name]) === profileTaskCapacity(Number(value.threads), gpu)
+    && Object.keys(logical).length === 1
     && Array.isArray(value.capabilities)
     && value.capabilities.includes(value.name);
 };
@@ -60,7 +60,9 @@ export const isWorkerPool = (value: unknown): value is WorkerPool => (
   && typeof value.profile === 'string'
   && PROFILE_NAME.test(value.profile)
   && positiveInteger(value.processes)
-  && positiveInteger(value.scale)
+  && positiveInteger(value.minimum_jobs)
+  && positiveInteger(value.maximum_jobs)
+  && Number(value.maximum_jobs) >= Number(value.minimum_jobs)
 );
 
 const workerProfileError = (value: unknown, index: number): string | null => {
@@ -80,19 +82,19 @@ const workerProfileError = (value: unknown, index: number): string | null => {
   if (!nonnegativeInteger(physical.gpu) || Number(physical.gpu) > 1) {
     return `${label}: GPU / Worker must be 0 or 1.`;
   }
+  if (physical.gpu !== fixedGpuForWorkerProfile(value.name)) {
+    return `${label}: GPU / Worker does not match its Worker type.`;
+  }
   if (Number(value.threads) !== Number(physical.cpu)) {
     return `${label}: Threads / Worker must equal CPU / Worker for SLURMCluster.`;
   }
   const logical = value.logical_resources;
-  if (!isRecord(logical) || Number(logical[value.name]) !== 1) {
-    return `${label}: logical Profile capability must equal 1.`;
+  if (!isRecord(logical)
+    || Number(logical[value.name]) !== profileTaskCapacity(Number(value.threads), Number(physical.gpu))) {
+    return `${label}: logical Profile capacity must match its thread/device slots.`;
   }
-  if (Number(logical.CPU) !== Number(physical.cpu)) {
-    return `${label}: logical CPU does not match CPU / Worker.`;
-  }
-  const gpu = Number(physical.gpu);
-  if (gpu > 0 ? Number(logical.GPU) !== gpu : logical.GPU !== undefined) {
-    return `${label}: logical GPU does not match GPU / Worker.`;
+  if (Object.keys(logical).length !== 1) {
+    return `${label}: only its Worker type may be advertised as a task resource.`;
   }
   if (!Array.isArray(value.capabilities) || !value.capabilities.includes(value.name)) {
     return `${label}: capabilities must include its Profile name.`;
@@ -109,7 +111,9 @@ const workerPoolError = (value: unknown, index: number): string | null => {
     return `${label}: Profile reference is invalid.`;
   }
   if (!positiveInteger(value.processes)) return `${label}: Processes / Job must be a positive integer.`;
-  if (!positiveInteger(value.scale)) return `${label}: Scale must be a positive integer.`;
+  if (!positiveInteger(value.minimum_jobs)) return `${label}: Minimum Jobs must be a positive integer.`;
+  if (!positiveInteger(value.maximum_jobs)) return `${label}: Maximum Jobs must be a positive integer.`;
+  if (Number(value.maximum_jobs) < Number(value.minimum_jobs)) return `${label}: Maximum Jobs must be at least Minimum Jobs.`;
   return null;
 };
 
@@ -215,12 +219,13 @@ export const workerResourcePayload = (): {
 });
 
 export const defaultWorkerProfile = (name: string): WorkerProfile => {
-  const gpu = fixedGpuForWorkerProfile(name) ?? (name.startsWith('gpu-') ? 1 : 0);
+  if (!PROFILE_NAME.test(name)) throw new Error('Worker type must be CPU or GPU.');
+  const gpu = fixedGpuForWorkerProfile(name)!;
   const cpu = gpu > 0 ? 4 : 8;
   return {
     name,
     physical_resources: { cpu, memory: '32GB', gpu },
-    logical_resources: { [name]: 1, CPU: cpu, ...(gpu ? { GPU: gpu } : {}) },
+    logical_resources: { [name]: profileTaskCapacity(cpu, gpu) },
     capabilities: [name],
     threads: cpu,
   };
@@ -229,18 +234,15 @@ export const defaultWorkerProfile = (name: string): WorkerProfile => {
 export const defaultWorkerPool = (profile: string): WorkerPool => ({
   profile,
   processes: 1,
-  scale: 1,
+  minimum_jobs: 1,
+  maximum_jobs: 1,
 });
 
 export const synchronizeLogicalResources = (profile: WorkerProfile): WorkerProfile => ({
   ...profile,
   threads: profile.physical_resources.cpu,
   logical_resources: {
-    [profile.name]: 1,
-    CPU: profile.physical_resources.cpu,
-    ...(profile.physical_resources.gpu > 0
-      ? { GPU: profile.physical_resources.gpu }
-      : {}),
+    [profile.name]: profileTaskCapacity(profile.physical_resources.cpu, profile.physical_resources.gpu),
   },
   capabilities: [profile.name],
 });

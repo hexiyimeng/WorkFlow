@@ -26,7 +26,7 @@ DEFAULT_AXES = {
 
 
 def _materialize_zarr_block(block: np.ndarray) -> np.ndarray:
-    """Expose one decoded Zarr chunk as a managed cpu-reader dependency.
+    """Expose one decoded Zarr chunk as a managed CPU dependency.
 
     ``np.asarray`` is intentionally zero-copy for the normal NumPy result from
     Zarr.  The separate Dask layer is a scheduling/lifetime boundary, not a
@@ -155,7 +155,7 @@ class OMEZarrReader:
     PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr / OME-Zarr Reader"
-    required_worker_profile = "cpu-reader"
+    required_worker_profile = "CPU"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -260,7 +260,7 @@ class OMEZarrReader:
         )
 
         # Both the storage task and the explicit hand-off task belong to the
-        # cpu-reader profile.  The hand-off makes the decoded NumPy chunk a
+        # CPU profile.  The hand-off makes the decoded NumPy chunk a
         # concrete Dask dependency before Cellpose is eligible to run.  Dask
         # retains only the chunks needed by submitted Windows and releases
         # them after their downstream consumers finish; this is deliberately

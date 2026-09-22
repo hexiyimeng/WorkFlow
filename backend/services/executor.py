@@ -2083,18 +2083,46 @@ async def execute_graph(
                 message="Finalizing Window Execution",
             )
 
-        # postprocess remains a whole-workflow lifecycle hook.
-        for node_id in execution_roots:
+        # postprocess remains a whole-workflow lifecycle hook.  Deterministic
+        # priorities let a primary artifact (for example a stitched label
+        # Zarr) publish finalization metadata before a dependent summary sink
+        # (for example the Parquet cell table) consumes it.
+        postprocess_roots = sorted(
+            execution_roots,
+            key=lambda candidate: (
+                int(
+                    getattr(
+                        type(node_instances.get(candidate)),
+                        "POSTPROCESS_PRIORITY",
+                        1000,
+                    )
+                ),
+                execution_roots.index(candidate),
+            ),
+        )
+        for node_id in postprocess_roots:
             instance = node_instances.get(node_id)
             postprocess = getattr(instance, "postprocess", None)
             if callable(postprocess):
-                post_value = postprocess(
-                    outputs=results.get(node_id),
-                    state=getattr(instance, "_preprocess_state", None),
-                    runtime={"execution_id": execution_id, "node_id": node_id},
-                )
-                if inspect.isawaitable(post_value):
-                    post_value = await post_value
+                postprocess_kwargs = {
+                    "outputs": results.get(node_id),
+                    "state": getattr(instance, "_preprocess_state", None),
+                    "runtime": {"execution_id": execution_id, "node_id": node_id},
+                }
+                if inspect.iscoroutinefunction(postprocess):
+                    post_value = await postprocess(**postprocess_kwargs)
+                else:
+                    # Whole-output finalizers may scan Zarr chunk boundaries or
+                    # rewrite Parquet fragments.  Keep that filesystem work off
+                    # the asyncio/WebSocket event loop.
+                    post_value = await loop.run_in_executor(
+                        None,
+                        lambda fn=postprocess, call_kwargs=postprocess_kwargs: fn(
+                            **call_kwargs
+                        ),
+                    )
+                    if inspect.isawaitable(post_value):
+                        post_value = await post_value
                 if post_value is not None:
                     results[node_id] = post_value
 
@@ -2365,6 +2393,12 @@ async def execute_graph(
         results.clear()
         root_arrays.clear()
         node_instances.clear()
+        # Label-equivalence plans are persisted beside the output Zarr.  Their
+        # in-process copies only coordinate terminal Writers during this run
+        # and must not accumulate in a long-lived service-node Driver.
+        from core.label_stitching import clear_registered_label_stitch_plans
+
+        clear_registered_label_stitch_plans(execution_id)
         await asyncio.to_thread(reclaim_process_memory)
         # Keep the single-active-execution lease until all Driver/Worker
         # cleanup has completed. A following DAG may require a different

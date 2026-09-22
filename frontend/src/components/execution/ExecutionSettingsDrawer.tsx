@@ -120,7 +120,7 @@ const FieldError = ({ message }: { message?: string }) => (
   ) : null
 );
 
-type WorkerDraftField = 'cpu' | 'memoryGB' | 'gpu' | 'processes' | 'scale';
+type WorkerDraftField = 'cpu' | 'memoryGB' | 'gpu' | 'processes' | 'minimum_jobs' | 'maximum_jobs';
 type WorkerDraftErrors = Partial<Record<WorkerDraftField, string>>;
 
 const WORKER_FIELD_LABELS: Record<WorkerDraftField, string> = {
@@ -128,7 +128,8 @@ const WORKER_FIELD_LABELS: Record<WorkerDraftField, string> = {
   memoryGB: 'Memory / Worker',
   gpu: 'GPU / Worker',
   processes: 'Processes / Job',
-  scale: 'Scale (Slurm Jobs)',
+  minimum_jobs: 'Minimum Jobs',
+  maximum_jobs: 'Maximum Jobs',
 };
 
 interface WorkerResourceDraft {
@@ -136,7 +137,8 @@ interface WorkerResourceDraft {
   memoryGB: string;
   gpu: string;
   processes: string;
-  scale: string;
+  minimum_jobs: string;
+  maximum_jobs: string;
 }
 
 const memoryAmount = (value: string): string => (
@@ -201,7 +203,8 @@ const WorkerResourcesSection = ({
         memoryGB: memoryAmount(profile.physical_resources.memory),
         gpu: String(profile.physical_resources.gpu),
         processes: String(pool.processes),
-        scale: String(pool.scale),
+        minimum_jobs: String(pool.minimum_jobs),
+        maximum_jobs: String(pool.maximum_jobs),
       }];
     })));
     setFieldErrors({});
@@ -213,7 +216,7 @@ const WorkerResourcesSection = ({
       ...current,
       [name]: {
         ...(current[name] ?? {
-          cpu: '', memoryGB: '', gpu: '', processes: '', scale: '',
+          cpu: '', memoryGB: '', gpu: '', processes: '', minimum_jobs: '', maximum_jobs: '',
         }),
         [field]: value,
       },
@@ -254,10 +257,15 @@ const WorkerResourcesSection = ({
         const draft = drafts[pool.profile];
         const profile = nextProfiles.find(item => item.name === pool.profile);
         const processes = positiveIntegerDraft(draft?.processes ?? '');
-        const scale = positiveIntegerDraft(draft?.scale ?? '');
+        const minimum = positiveIntegerDraft(draft?.minimum_jobs ?? '');
+        const maximum = positiveIntegerDraft(draft?.maximum_jobs ?? '');
         const errors = nextErrors[pool.profile] ?? {};
         if (processes === null) errors.processes = 'Enter a positive whole number.';
-        if (scale === null) errors.scale = 'Enter a positive whole number.';
+        if (minimum === null) errors.minimum_jobs = 'Enter a positive whole number.';
+        if (maximum === null) errors.maximum_jobs = 'Enter a positive whole number.';
+        if (minimum !== null && maximum !== null && maximum < minimum) {
+          errors.maximum_jobs = 'Must be at least Minimum Jobs.';
+        }
         if (profile?.physical_resources.gpu && processes !== 1) {
           errors.processes = 'GPU Pools require exactly 1 process per Job.';
         }
@@ -265,7 +273,8 @@ const WorkerResourcesSection = ({
         return {
           ...pool,
           processes: profile?.physical_resources.gpu ? 1 : processes ?? 0,
-          scale: scale ?? 0,
+          minimum_jobs: minimum ?? 0,
+          maximum_jobs: maximum ?? 0,
         };
       });
       setFieldErrors(nextErrors);
@@ -303,22 +312,23 @@ const WorkerResourcesSection = ({
     <section className="space-y-3 rounded-[var(--radius-md)] border px-3 py-3"
       style={{ borderColor: 'var(--color-border-subtle)' }}>
       <div>
-        <h3 className="text-[11px] font-semibold">Worker Profiles and Pools</h3>
+        <h3 className="text-[11px] font-semibold">CPU and GPU Workers</h3>
         <p className="mt-1 text-[9px]" style={{ color: 'var(--color-text-muted)' }}>
-          Required by the current workflow. Saved only in this browser.
+          CPU nodes share one pool; GPU nodes share one pool. Saved only in this browser.
         </p>
       </div>
       {profiles.map(profile => {
         const draft = drafts[profile.name] ?? {
-          cpu: '', memoryGB: '', gpu: '', processes: '', scale: '',
+          cpu: '', memoryGB: '', gpu: '', processes: '', minimum_jobs: '', maximum_jobs: '',
         };
         const errors = fieldErrors[profile.name] ?? {};
         const fixedGpu = fixedGpuForWorkerProfile(profile.name);
         const gpuProfile = fixedGpu === 1 || (fixedGpu === undefined && draft.gpu === '1');
         const processes = positiveIntegerDraft(draft.processes);
-        const scale = positiveIntegerDraft(draft.scale);
-        const totalWorkers = processes !== null && scale !== null
-          ? scale * (gpuProfile ? 1 : processes)
+        const minimum = positiveIntegerDraft(draft.minimum_jobs);
+        const maximum = positiveIntegerDraft(draft.maximum_jobs);
+        const totalWorkers = processes !== null && minimum !== null && maximum !== null
+          ? `${minimum * processes} - ${maximum * processes}`
           : null;
         return (
           <fieldset key={profile.name} disabled={disabled || saving}
@@ -373,16 +383,18 @@ const WorkerResourcesSection = ({
                   className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2 disabled:opacity-60" />
                 <FieldError message={errors.processes} />
               </label>
-              <label>Scale (Slurm Jobs)
-                <input type="number" min="1" step="1" value={draft.scale}
-                  aria-invalid={Boolean(errors.scale)}
-                  onChange={event => updateDraft(profile.name, 'scale', event.target.value)}
-                  className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
-                <FieldError message={errors.scale} />
-              </label>
+              {(['minimum_jobs', 'maximum_jobs'] as const).map(field => (
+                <label key={field}>{WORKER_FIELD_LABELS[field]}
+                  <input type="number" min="1" step="1" value={draft[field]}
+                    aria-invalid={Boolean(errors[field])}
+                    onChange={event => updateDraft(profile.name, field, event.target.value)}
+                    className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2" />
+                  <FieldError message={errors[field]} />
+                </label>
+              ))}
             </div>
             <p className="mt-2 text-[9px]" style={{ color: 'var(--color-text-muted)' }}>
-              Total Workers: {totalWorkers ?? '—'}
+              Worker Range: {totalWorkers ?? '—'}
             </p>
           </fieldset>
         );
@@ -1004,19 +1016,17 @@ export default function ExecutionSettingsDrawer() {
               )}
               {allocationPlan && (
                 <>
-                  <dt style={{ color: 'var(--color-text-muted)' }}>Planned Workers</dt>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Minimum Workers</dt>
                   <dd className="text-right font-mono">{allocationPlan.totalWorkers}</dd>
-                  <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Jobs</dt>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Baseline Components</dt>
                   <dd className="text-right font-mono">{allocationPlan.jobs.length}</dd>
                   <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Partitions</dt>
                   <dd className="text-right font-mono">
                     {allocationPlan.partitions.join(', ')}
                   </dd>
-                  <dt style={{ color: 'var(--color-text-muted)' }}>Target Nodes</dt>
+                  <dt style={{ color: 'var(--color-text-muted)' }}>Node Placement</dt>
                   <dd className="text-right font-mono">
-                    {allocationPlan.nodes
-                      .map(node => `${node.node} (${node.partition})`)
-                      .join(', ')}
+                    Selected by Slurm
                   </dd>
                   <dt style={{ color: 'var(--color-text-muted)' }}>Slurm Resources</dt>
                   <dd className="text-right font-mono">

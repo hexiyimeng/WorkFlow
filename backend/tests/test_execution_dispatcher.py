@@ -19,7 +19,7 @@ def test_failed_metadata_preflight_still_returns_profile_requirements(
         node_id="zarr_writer",
         node_type="ZarrWriter",
         display_name="Zarr Writer",
-        worker_profile="cpu-writer",
+        worker_profile="CPU",
     ),))
 
     monkeypatch.setattr(execution_dispatcher, "validate_graph_structure", lambda graph: None)
@@ -59,7 +59,7 @@ def test_failed_metadata_preflight_still_returns_profile_requirements(
 
     assert result["resourcesSatisfied"] is False
     assert result["requiredResources"]["requiredWorkerProfiles"] == {
-        "cpu-writer": 1,
+        "CPU": 1,
     }
     assert "absolute path" in result["resourceError"]
     assert result["preflightError"]["type"] == "ValueError"
@@ -70,7 +70,7 @@ def test_preflight_filters_unrequired_profiles_before_validation(monkeypatch) ->
         node_id="cellpose",
         node_type="Cellpose",
         display_name="Cellpose",
-        worker_profile="gpu-cellpose",
+        worker_profile="GPU",
     ),))
 
     monkeypatch.setattr(execution_dispatcher, "validate_graph_structure", lambda graph: None)
@@ -105,23 +105,23 @@ def test_preflight_filters_unrequired_profiles_before_validation(monkeypatch) ->
         {"mode": "full_graph"},
         worker_profiles=[
             {
-                "name": "cpu-general",
+                "name": "CPU",
                 "physical_resources": {"cpu": 8, "memory": "32GB", "gpu": 1},
-                "logical_resources": {"cpu-general": 1, "CPU": 8, "GPU": 1},
-                "capabilities": ["cpu-general"],
+                "logical_resources": {"GPU": 1},
+                "capabilities": ["CPU"],
                 "threads": 8,
             },
             {
-                "name": "gpu-cellpose",
+                "name": "GPU",
                 "physical_resources": {"cpu": 4, "memory": "32GB", "gpu": 1},
-                "logical_resources": {"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
-                "capabilities": ["gpu-cellpose"],
+                "logical_resources": {"GPU": 1},
+                "capabilities": ["GPU"],
                 "threads": 4,
             },
         ],
         worker_pools=[
-            {"profile": "cpu-general", "processes": 1, "scale": 1},
-            {"profile": "gpu-cellpose", "processes": 1, "scale": 2},
+            {"profile": "CPU", "processes": 1, "minimum_jobs": 1, "maximum_jobs": 1},
+            {"profile": "GPU", "processes": 1, "minimum_jobs": 2, "maximum_jobs": 2},
         ],
     ))
 

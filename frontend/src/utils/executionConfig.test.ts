@@ -54,14 +54,14 @@ const profilePreflight: ExecutionPreflightResponse = {
   windowable: true,
   requiredResources: {
     requiredWorkerProfiles: {
-      'cpu-general': 3,
-      'gpu-inference': 2,
+      'CPU': 3,
+      'GPU': 2,
     },
     profileRequirements: [{
       nodeId: 'cellpose',
       nodeType: 'Cellpose',
       displayName: 'Cellpose',
-      workerProfile: 'gpu-inference',
+      workerProfile: 'GPU',
     }],
   },
   availableResources: {
@@ -73,11 +73,11 @@ const profilePreflight: ExecutionPreflightResponse = {
   resourcesSatisfied: null,
 };
 assert(
-  profilePreflight.requiredResources?.requiredWorkerProfiles['gpu-inference'] === 2,
+  profilePreflight.requiredResources?.requiredWorkerProfiles['GPU'] === 2,
   'preflight types should retain Worker Profile requirement counts',
 );
 assert(
-  profilePreflight.requiredResources?.profileRequirements[0]?.workerProfile === 'gpu-inference',
+  profilePreflight.requiredResources?.profileRequirements[0]?.workerProfile === 'GPU',
   'node requirements should expose their Worker Profile',
 );
 assert(
@@ -91,10 +91,10 @@ const profileNodeSpec: NodeSpec = {
   category: 'Segmentation',
   input: { required: {} },
   output: ['MASK'],
-  required_worker_profile: 'gpu-cellpose',
+  required_worker_profile: 'GPU',
 };
 assert(
-  profileNodeSpec.required_worker_profile === 'gpu-cellpose',
+  profileNodeSpec.required_worker_profile === 'GPU',
   'node specifications should expose their Worker Profile',
 );
 

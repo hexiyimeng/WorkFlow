@@ -44,7 +44,8 @@ export interface WorkerProfile {
 export interface WorkerPool {
   profile: string;
   processes: number;
-  scale: number;
+  minimum_jobs: number;
+  maximum_jobs: number;
 }
 
 export interface SlurmAllocationPlan {

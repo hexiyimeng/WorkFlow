@@ -69,8 +69,8 @@ def test_reader_has_explicit_cpu_reader_materialization_layer(tmp_path) -> None:
     assert len(read_layers) == 1
     assert read_layers[0].annotations == {
         "brainflow_node_id": "reader",
-        "required_worker_profile": "cpu-reader",
-        "resources": {"cpu-reader": 1.0},
+        "required_worker_profile": "CPU",
+        "resources": {"CPU": 1.0},
     }
 
 

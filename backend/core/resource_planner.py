@@ -58,6 +58,7 @@ class SlurmJobRequirement:
     memory_gib: int
     gpu: int
     logical_resources: Mapping[str, float]
+    excluded_nodes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -74,7 +75,7 @@ class SlurmJobRequirement:
                 "memoryGiB": self.memory_gib,
                 "gpus": self.gpu,
                 "partition": self.partition,
-                "nodelist": [self.node],
+                "nodelist": [],
             },
             "logicalResources": dict(self.logical_resources),
         }
@@ -110,6 +111,7 @@ class SlurmAllocationPlan:
     worker_counts: Mapping[str, int]
     jobs: tuple[SlurmJobRequirement, ...]
     nodes: tuple[NodeAllocation, ...]
+    pools: tuple[WorkerPool, ...] = ()
 
     @property
     def partition(self) -> str:
@@ -146,6 +148,7 @@ class SlurmAllocationPlan:
             "totalMemoryGiB": self.total_memory_gib,
             "jobs": [job.to_dict() for job in self.jobs],
             "nodes": [node.to_dict() for node in self.nodes],
+            "workerPools": [pool.to_dict() for pool in self.pools],
         }
 
 
@@ -159,17 +162,17 @@ class _NodeCapacity:
 
     def fits(self, *, cpu: int, memory_gib: int, gpu: int) -> bool:
         return (
-            self.cpu_used + cpu <= self.node.cpu
-            and self.memory_gib_used + memory_gib <= self.node.memory_gib
-            and self.gpu_used + gpu <= self.node.gpu
+            self.cpu_used + cpu <= self.node.cpu_total
+            and self.memory_gib_used + memory_gib <= self.node.memory_total_mib // 1024
+            and self.gpu_used + gpu <= self.node.gpu_total
         )
 
     def score(self, *, cpu: int, memory_gib: int, gpu: int) -> tuple[float, float, float, str]:
-        cpu_fraction = (self.cpu_used + cpu) / max(1, self.node.cpu)
-        memory_fraction = (self.memory_gib_used + memory_gib) / max(1, self.node.memory_gib)
+        cpu_fraction = (self.cpu_used + cpu) / max(1, self.node.cpu_total)
+        memory_fraction = (self.memory_gib_used + memory_gib) / max(1, self.node.memory_total_mib // 1024)
         gpu_fraction = (
-            (self.gpu_used + gpu) / self.node.gpu
-            if self.node.gpu
+            (self.gpu_used + gpu) / self.node.gpu_total
+            if self.node.gpu_total
             else (0.0 if gpu == 0 else float("inf"))
         )
         # Best-fit keeps large contiguous resources available on unused nodes.
@@ -260,7 +263,7 @@ def plan_workflow_resources(
         job_memory = physical.memory_gib * pool.processes
         job_gpu = physical.gpu * pool.processes
         worker_counts[name] = pool.worker_count
-        for scale_index in range(pool.scale):
+        for scale_index in range(pool.minimum_jobs):
             units.append((profile, pool, scale_index, job_cpu, job_memory, job_gpu))
 
     units.sort(
@@ -283,8 +286,8 @@ def plan_workflow_resources(
         if not fitting:
             raise ResourcePlanningError(
                 f"Cannot place Worker Pool {profile.name!r} instance "
-                f"{scale_index + 1}/{pool.scale}: it needs CPU={cpu}, "
-                f"memory={memory_gib}GiB, GPU={gpu}. Inventory capacity is exhausted."
+                f"{scale_index + 1}/{pool.minimum_jobs}: it needs CPU={cpu}, "
+                f"memory={memory_gib}GiB, GPU={gpu}. No eligible node supports this specification."
             )
         selected = min(
             fitting,
@@ -297,7 +300,7 @@ def plan_workflow_resources(
         job = SlurmJobRequirement(
             allocation_id=allocation_id,
             profile=profile.name,
-            node=selected.node.name,
+            node="",
             partition=selected.partition,
             workers=pool.processes,
             processes=pool.processes,
@@ -305,9 +308,12 @@ def plan_workflow_resources(
             memory_gib=memory_gib,
             gpu=gpu,
             logical_resources=profile.logical_resources,
+            excluded_nodes=tuple(excluded_nodes),
         )
         jobs.append(job)
-        node_jobs.setdefault(selected.node.name, []).append(job)
+        # Nodes are chosen by Slurm, not pinned to a transient free-capacity snapshot.
+        # Each component requests one node; use component IDs for policy accounting.
+        node_jobs.setdefault(allocation_id, []).append(job)
 
     node_allocations = tuple(
         NodeAllocation(
@@ -334,6 +340,7 @@ def plan_workflow_resources(
         worker_counts=dict(sorted(worker_counts.items())),
         jobs=tuple(sorted(jobs, key=lambda item: item.allocation_id)),
         nodes=node_allocations,
+        pools=tuple(pool_by_profile[name] for name in sorted(required_names)),
     )
 
 

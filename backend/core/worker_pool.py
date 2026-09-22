@@ -15,7 +15,8 @@ def _positive_integer(value: object, *, name: str) -> int:
 @dataclass(frozen=True, slots=True)
 class WorkerPool:
     profile: str
-    scale: int
+    minimum_jobs: int
+    maximum_jobs: int
     processes: int = 1
 
     def __post_init__(self) -> None:
@@ -24,7 +25,10 @@ class WorkerPool:
             "profile",
             normalize_worker_profile(self.profile, owner="WorkerPool"),
         )
-        _positive_integer(self.scale, name=f"WorkerPool[{self.profile}].scale")
+        _positive_integer(self.minimum_jobs, name=f"WorkerPool[{self.profile}].minimum_jobs")
+        _positive_integer(self.maximum_jobs, name=f"WorkerPool[{self.profile}].maximum_jobs")
+        if self.maximum_jobs < self.minimum_jobs:
+            raise ValueError("maximum_jobs must be greater than or equal to minimum_jobs.")
         _positive_integer(
             self.processes,
             name=f"WorkerPool[{self.profile}].processes",
@@ -32,7 +36,7 @@ class WorkerPool:
 
     @property
     def worker_count(self) -> int:
-        return self.scale * self.processes
+        return self.minimum_jobs * self.processes
 
     def validate_profile(self, profile: WorkerProfile) -> None:
         if profile.name != self.profile:
@@ -49,7 +53,8 @@ class WorkerPool:
         return {
             "profile": self.profile,
             "processes": self.processes,
-            "scale": self.scale,
+            "minimum_jobs": self.minimum_jobs,
+            "maximum_jobs": self.maximum_jobs,
             "workerCount": self.worker_count,
         }
 
@@ -63,7 +68,8 @@ class WorkerPool:
                 value.get("processes", 1),
                 name="WorkerPool.processes",
             ),
-            scale=_positive_integer(value.get("scale"), name="WorkerPool.scale"),
+            minimum_jobs=_positive_integer(value.get("minimum_jobs"), name="WorkerPool.minimum_jobs"),
+            maximum_jobs=_positive_integer(value.get("maximum_jobs"), name="WorkerPool.maximum_jobs"),
         )
 
 

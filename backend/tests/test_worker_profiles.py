@@ -67,12 +67,12 @@ from core.workflow_resources import (
 
 class CpuNode:
     DISPLAY_NAME = "CPU"
-    required_worker_profile = "cpu-reader"
+    required_worker_profile = "CPU"
 
 
 class GpuNode:
     DISPLAY_NAME = "GPU"
-    required_worker_profile = "gpu-cellpose"
+    required_worker_profile = "GPU"
 
 
 class DefaultProfileNode:
@@ -80,15 +80,15 @@ class DefaultProfileNode:
 
 
 class BananaNode:
-    required_worker_profile = "banana"
+    required_worker_profile = "CPU"
 
 
 class AppleNode:
-    required_worker_profile = "apple"
+    required_worker_profile = "CPU"
 
 
 class OrangeNode:
-    required_worker_profile = "orange"
+    required_worker_profile = "GPU"
 
 
 def test_slurm_dashboard_must_remain_on_service_node_loopback() -> None:
@@ -112,7 +112,7 @@ def test_dashboard_browser_host_override_preserves_dask_status_path() -> None:
 
 def test_writer_worker_trims_after_task_transition(monkeypatch) -> None:
     trimmed = threading.Event()
-    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-writer")
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "CPU")
     monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_DELAY_SECONDS", "0.01")
     monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_INTERVAL_SECONDS", "0.01")
     monkeypatch.setattr(
@@ -136,7 +136,7 @@ def test_writer_worker_trims_after_task_transition(monkeypatch) -> None:
 
 def test_writer_worker_trims_when_dask_releases_input_dependency(monkeypatch) -> None:
     trimmed = threading.Event()
-    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-writer")
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "CPU")
     monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_DELAY_SECONDS", "0.01")
     monkeypatch.setenv("WorkFlow_DASK_WORKER_MEMORY_TRIM_INTERVAL_SECONDS", "0.01")
     monkeypatch.setattr(
@@ -158,9 +158,9 @@ def test_writer_worker_trims_when_dask_releases_input_dependency(monkeypatch) ->
     plugin.teardown(SimpleNamespace())
 
 
-def test_non_writer_worker_does_not_schedule_post_task_trim(monkeypatch) -> None:
+def test_gpu_worker_does_not_schedule_post_task_trim(monkeypatch) -> None:
     trimmed = threading.Event()
-    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-reader")
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "GPU")
     monkeypatch.setattr(
         dask_service_module,
         "should_schedule_malloc_trim",
@@ -182,7 +182,7 @@ def test_non_writer_worker_does_not_schedule_post_task_trim(monkeypatch) -> None
 
 def test_slurm_preload_registers_worker_memory_lifecycle_plugin(monkeypatch) -> None:
     worker = SimpleNamespace(plugins={})
-    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "cpu-writer")
+    monkeypatch.setenv("WORKFLOW_WORKER_PROFILE", "CPU")
     monkeypatch.setattr(
         slurm_worker_preload,
         "should_schedule_malloc_trim",
@@ -207,10 +207,10 @@ def test_node_without_profile_uses_cpu_general_default() -> None:
 
 def test_legacy_profile_threads_migrate_to_slurmcluster_cpu_contract() -> None:
     profile = WorkerProfile.from_dict({
-        "name": "gpu-cellpose",
+        "name": "GPU",
         "physical_resources": {"cpu": 4, "memory": "32GB", "gpu": 1},
-        "logical_resources": {"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
-        "capabilities": ["gpu-cellpose"],
+        "logical_resources": {"GPU": 1},
+        "capabilities": ["GPU"],
         "threads": 1,
     })
     assert profile.threads == 4
@@ -231,8 +231,8 @@ def test_workflow_plan_counts_reachable_worker_profiles() -> None:
     )
 
     assert plan.required_worker_profiles == {
-        "cpu-reader": 2,
-        "gpu-cellpose": 1,
+        "CPU": 2,
+        "GPU": 1,
     }
     preflight = plan.to_preflight_dict()
     assert preflight["requiredWorkerProfiles"] == plan.required_worker_profiles
@@ -320,9 +320,9 @@ def test_planner_uses_multiple_discovered_partitions_but_excludes_management() -
         node_mappings={"Gpu": GpuNode},
     )
     profile = WorkerProfile(
-        name="gpu-cellpose",
+        name="GPU",
         physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
-        logical_resources={"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+        logical_resources={"GPU": 1},
         threads=4,
     )
     inventory_nodes = parse_scontrol_show_node(
@@ -346,14 +346,14 @@ def test_planner_uses_multiple_discovered_partitions_but_excludes_management() -
     allocation = plan_workflow_resources(
         workflow,
         [profile],
-        [WorkerPool(profile="gpu-cellpose", processes=1, scale=10)],
+        [WorkerPool(profile="GPU", processes=1, minimum_jobs=10, maximum_jobs=10)],
         inventory,
         partitions=partitions,
         time_limit="01:00:00",
     )
 
     assert set(allocation.partitions) == {"gpu", "compute", "tao"}
-    assert {node.node for node in allocation.nodes} == {"aio", "c001", "t001"}
+    assert all(not job.node for job in allocation.jobs)
     assert all(job.partition not in {"mn", "control"} for job in allocation.jobs)
     assert all(
         _worker_job_request(allocation, job).partition == job.partition
@@ -368,12 +368,12 @@ def test_planner_places_eight_gpu_jobs_on_two_real_nodes() -> None:
         node_mappings={"Gpu": GpuNode},
     )
     profile = WorkerProfile(
-        name="gpu-cellpose",
+        name="GPU",
         physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
-        logical_resources={"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+        logical_resources={"GPU": 1},
         threads=4,
     )
-    pool = WorkerPool(profile="gpu-cellpose", processes=1, scale=8)
+    pool = WorkerPool(profile="GPU", processes=1, minimum_jobs=8, maximum_jobs=8)
     inventory = parse_scontrol_show_node(
         "NodeName=c001 CPUTot=96 RealMemory=1024000 Gres=gpu:4 State=IDLE Partitions=compute\n"
         "NodeName=c003 CPUTot=96 RealMemory=1024000 Gres=gpu:4 State=IDLE Partitions=compute\n"
@@ -386,17 +386,12 @@ def test_planner_places_eight_gpu_jobs_on_two_real_nodes() -> None:
         partition="compute",
         time_limit="01:00:00",
     )
-    assert allocation.worker_counts == {"gpu-cellpose": 8}
-    assert {node.node: node.workers for node in allocation.nodes} == {
-        "c001": {"gpu-cellpose": 4},
-        "c003": {"gpu-cellpose": 4},
-    }
+    assert allocation.worker_counts == {"GPU": 8}
     assert len(allocation.jobs) == 8
     assert all(job.workers == 1 and job.gpu == 1 for job in allocation.jobs)
     requests = [_worker_job_request(allocation, job) for job in allocation.jobs]
     assert all(request.nodes == 1 and request.gpus == 1 for request in requests)
-    assert [request.node_names[0] for request in requests].count("c001") == 4
-    assert [request.node_names[0] for request in requests].count("c003") == 4
+    assert all(request.node_names == () for request in requests)
 
 
 def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
@@ -408,9 +403,9 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
         node_mappings={"Gpu": GpuNode},
     )
     profile = WorkerProfile(
-        name="gpu-cellpose",
+        name="GPU",
         physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
-        logical_resources={"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+        logical_resources={"GPU": 1},
         threads=4,
     )
     inventory = parse_scontrol_show_node(
@@ -420,7 +415,7 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
     allocation = plan_workflow_resources(
         workflow,
         [profile],
-        [WorkerPool(profile="gpu-cellpose", processes=1, scale=1)],
+        [WorkerPool(profile="GPU", processes=1, minimum_jobs=1, maximum_jobs=1)],
         inventory,
         partition="tao",
         time_limit="01:00:00",
@@ -452,7 +447,7 @@ def test_planned_slurm_job_uses_jobqueue_with_exact_planner_directives(
 
     assert issubclass(PlannedSLURMCluster, SLURMCluster)
     assert "#SBATCH -p tao" in script
-    assert "#SBATCH --nodelist=t001" in script
+    assert "#SBATCH --nodelist=" not in script
     assert "#SBATCH --gres=gpu:1" in script
     assert "#SBATCH --comment=wf:abcdef:1" in script
     assert "distributed.cli.dask_worker" in script
@@ -485,15 +480,15 @@ def test_slurmcluster_derives_worker_threads_from_cores_and_processes(
         node_mappings={"Cpu": CpuNode},
     )
     profile = WorkerProfile(
-        name="cpu-reader",
+        name="CPU",
         physical_resources=PhysicalResources(cpu=8, memory_gib=32, gpu=0),
-        logical_resources={"cpu-reader": 1, "CPU": 8},
+        logical_resources={"CPU": 8},
         threads=8,
     )
     allocation = plan_workflow_resources(
         workflow,
         [profile],
-        [WorkerPool(profile="cpu-reader", processes=4, scale=1)],
+        [WorkerPool(profile="CPU", processes=4, minimum_jobs=1, maximum_jobs=1)],
         parse_scontrol_show_node(
             "NodeName=t001 CPUTot=40 RealMemory=500000 Gres=(null) "
             "State=IDLE Partitions=tao\n"
@@ -545,30 +540,14 @@ def test_unplaceable_profile_rejects_complete_plan_before_any_submission() -> No
         },
     )
     profiles = [
-        WorkerProfile(
-            name="banana",
-            physical_resources=PhysicalResources(cpu=20, memory_gib=8, gpu=0),
-            logical_resources={"banana": 1, "CPU": 20},
-            threads=20,
-        ),
-        WorkerProfile(
-            name="apple",
-            physical_resources=PhysicalResources(cpu=10, memory_gib=8, gpu=0),
-            logical_resources={"apple": 1, "CPU": 10},
-            threads=10,
-        ),
-        WorkerProfile(
-            name="orange",
-            physical_resources=PhysicalResources(cpu=4, memory_gib=8, gpu=1),
-            logical_resources={"orange": 1, "CPU": 4, "GPU": 1},
-            threads=4,
-        ),
+        WorkerProfile("CPU", PhysicalResources(20, 8, 0), {"CPU": 20}, 20),
+        WorkerProfile("GPU", PhysicalResources(4, 8, 1), {"GPU": 1}, 4),
     ]
     pools = [
         WorkerPool(
             profile=item.name,
             processes=1,
-            scale=2 if item.name == "orange" else 1,
+            minimum_jobs=2 if item.name == "GPU" else 1, maximum_jobs=2 if item.name == "GPU" else 1,
         )
         for item in profiles
     ]
@@ -577,7 +556,7 @@ def test_unplaceable_profile_rejects_complete_plan_before_any_submission() -> No
         "State=IDLE Partitions=tao\n"
     )
 
-    with pytest.raises(ResourcePlanningError, match="orange"):
+    with pytest.raises(ResourcePlanningError, match="GPU"):
         plan_workflow_resources(
             workflow,
             profiles,
@@ -596,7 +575,8 @@ def test_unplaceable_profile_rejects_complete_plan_before_any_submission() -> No
 def test_active_slurm_execution_submits_workers_through_slurmcluster() -> None:
     source = inspect.getsource(SlurmExecutionService._execute_graph_impl)
     assert "start_slurm_jobqueue_scheduler" in source
-    assert "submit_slurm_jobqueue_workers" in source
+    assert "submit_slurm_baseline" in source
+    assert "start_slurm_adaptive" in source
     assert "build_sbatch_argv" not in source
     assert source.index('"type": "dashboard_ready"') < source.index(
         "activate_external_worker_profiles"
@@ -725,10 +705,10 @@ def test_planned_slurmcluster_owns_submit_and_scale_down_lifecycle(
         from services.slurm_jobqueue_cluster import PlannedSlurmWorkerSpec
 
         spec = PlannedSlurmWorkerSpec(
-            allocation_id="gpu-cellpose-1",
+            allocation_id="GPU-1",
             submission_token="wf:abcdef:1",
             options={
-                "allocation_id": "gpu-cellpose-1",
+                "allocation_id": "GPU-1",
                 "submission_token": "wf:abcdef:1",
                 "queue": "compute",
                 "cores": 4,
@@ -741,9 +721,9 @@ def test_planned_slurmcluster_owns_submit_and_scale_down_lifecycle(
         )
         records = cluster.submit_planned_jobs((spec,))
         assert [(item.allocation_id, item.job_id) for item in records] == [
-            ("gpu-cellpose-1", "55001")
+            ("GPU-1", "55001")
         ]
-        assert set(cluster.workers) == {"gpu-cellpose-1"}
+        assert set(cluster.workers) == {"GPU-1"}
 
         cluster.stop_planned_jobs()
         assert cluster.workers == {}
@@ -852,10 +832,10 @@ def test_dask_service_owns_planned_slurmcluster_scheduler_and_cleanup(
     try:
         records = service.submit_slurm_jobqueue_workers((
             PlannedSlurmWorkerSpec(
-                allocation_id="cpu-reader-1",
+                allocation_id="CPU-1",
                 submission_token="wf:abcdef:1",
                 options={
-                    "allocation_id": "cpu-reader-1",
+                    "allocation_id": "CPU-1",
                     "submission_token": "wf:abcdef:1",
                     "queue": "compute",
                     "cores": 4,
@@ -880,12 +860,12 @@ def test_cpu_pool_scale_multiplies_processes_without_changing_requirements() -> 
         node_mappings={"Cpu": CpuNode},
     )
     profile = WorkerProfile(
-        name="cpu-reader",
+        name="CPU",
         physical_resources=PhysicalResources(cpu=8, memory_gib=32, gpu=0),
-        logical_resources={"cpu-reader": 1, "CPU": 8},
+        logical_resources={"CPU": 8},
         threads=8,
     )
-    pool = WorkerPool(profile="cpu-reader", processes=4, scale=5)
+    pool = WorkerPool(profile="CPU", processes=4, minimum_jobs=5, maximum_jobs=5)
     inventory = parse_scontrol_show_node(
         "NodeName=c001 CPUTot=160 RealMemory=1048576 Gres=(null) "
         "State=IDLE Partitions=compute\n"
@@ -898,20 +878,20 @@ def test_cpu_pool_scale_multiplies_processes_without_changing_requirements() -> 
         partition="compute",
         time_limit="01:00:00",
     )
-    assert allocation.required_worker_profiles == {"cpu-reader": 1}
-    assert allocation.worker_counts == {"cpu-reader": 20}
+    assert allocation.required_worker_profiles == {"CPU": 1}
+    assert allocation.worker_counts == {"CPU": 20}
     assert len(allocation.jobs) == 5
     assert all(job.workers == 4 and job.cpu == 32 for job in allocation.jobs)
 
 
 def test_gpu_pool_rejects_multiple_processes_per_job() -> None:
     profile = WorkerProfile(
-        name="gpu-cellpose",
+        name="GPU",
         physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
-        logical_resources={"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+        logical_resources={"GPU": 1},
         threads=4,
     )
-    pool = WorkerPool(profile="gpu-cellpose", processes=2, scale=1)
+    pool = WorkerPool(profile="GPU", processes=2, minimum_jobs=1, maximum_jobs=1)
     try:
         pool.validate_profile(profile)
     except ValueError as exc:
@@ -923,72 +903,69 @@ def test_gpu_pool_rejects_multiple_processes_per_job() -> None:
 def test_built_in_cpu_profile_rejects_gpu_allocation() -> None:
     try:
         WorkerProfile(
-            name="cpu-general",
+            name="CPU",
             physical_resources=PhysicalResources(cpu=4, memory_gib=16, gpu=1),
-            logical_resources={"cpu-general": 1, "CPU": 4, "GPU": 1},
+            logical_resources={"GPU": 1},
             threads=4,
         )
     except ValueError as error:
         assert "requires physical_resources.gpu=0" in str(error)
     else:
-        raise AssertionError("cpu-general must never request a GPU")
+        raise AssertionError("CPU must never request a GPU")
 
 
 def test_unrequired_stale_profile_is_not_parsed_or_planned() -> None:
     profiles, pools = parse_required_worker_resources(
         [
             {
-                "name": "cpu-general",
+                "name": "CPU",
                 "physical_resources": {"cpu": 8, "memory": "32GB", "gpu": 1},
                 "logical_resources": {
-                    "cpu-general": 1,
                     "CPU": 8,
                     "GPU": 1,
                 },
-                "capabilities": ["cpu-general"],
+                "capabilities": ["CPU"],
                 "threads": 8,
             },
             {
-                "name": "gpu-cellpose",
+                "name": "GPU",
                 "physical_resources": {"cpu": 4, "memory": "32GB", "gpu": 1},
                 "logical_resources": {
-                    "gpu-cellpose": 1,
-                    "CPU": 4,
                     "GPU": 1,
                 },
-                "capabilities": ["gpu-cellpose"],
+                "capabilities": ["GPU"],
                 "threads": 4,
             },
         ],
         [
-            {"profile": "cpu-general", "processes": 1, "scale": 1},
-            {"profile": "gpu-cellpose", "processes": 1, "scale": 2},
+            {"profile": "CPU", "processes": 1, "minimum_jobs": 1, "maximum_jobs": 1},
+            {"profile": "GPU", "processes": 1, "minimum_jobs": 2, "maximum_jobs": 2},
         ],
-        ("gpu-cellpose",),
+        ("GPU",),
     )
 
-    assert [profile.name for profile in profiles] == ["gpu-cellpose"]
-    assert [pool.profile for pool in pools] == ["gpu-cellpose"]
+    assert [profile.name for profile in profiles] == ["GPU"]
+    assert [pool.profile for pool in pools] == ["GPU"]
 
 
 def test_local_worker_specs_use_profile_pool_counts_and_capabilities(tmp_path) -> None:
     reader = WorkerProfile(
-        name="cpu-reader",
+        name="CPU",
         physical_resources=PhysicalResources(cpu=8, memory_gib=32, gpu=0),
-        logical_resources={"cpu-reader": 1, "CPU": 8},
+        logical_resources={"CPU": 8},
         threads=8,
     )
     cellpose = WorkerProfile(
-        name="gpu-cellpose",
+        name="GPU",
         physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
-        logical_resources={"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+        logical_resources={"GPU": 1},
         threads=4,
     )
     _, specs = build_local_profile_cluster_specs(
         profiles={reader.name: reader, cellpose.name: cellpose},
         pools={
-            reader.name: WorkerPool(profile=reader.name, processes=4, scale=5),
-            cellpose.name: WorkerPool(profile=cellpose.name, processes=1, scale=2),
+            reader.name: WorkerPool(profile=reader.name, processes=4, minimum_jobs=5, maximum_jobs=5),
+            cellpose.name: WorkerPool(profile=cellpose.name, processes=1, minimum_jobs=2, maximum_jobs=2),
         },
         gpu_ids=("0", "1"),
         local_directory=str(tmp_path),
@@ -997,12 +974,12 @@ def test_local_worker_specs_use_profile_pool_counts_and_capabilities(tmp_path) -
     )
     assert len(specs) == 22
     assert sum(
-        spec["options"]["resources"].get("cpu-reader", 0) == 1
+        spec["options"]["resources"].get("CPU", 0) == 8
         for spec in specs.values()
     ) == 20
     gpu_specs = [
         spec for spec in specs.values()
-        if spec["options"]["resources"].get("gpu-cellpose") == 1
+        if spec["options"]["resources"].get("GPU") == 1
     ]
     assert [spec["options"]["env"]["CUDA_VISIBLE_DEVICES"] for spec in gpu_specs] == ["0", "1"]
 
@@ -1010,27 +987,21 @@ def test_local_worker_specs_use_profile_pool_counts_and_capabilities(tmp_path) -
 def test_worker_resources_use_distributed_2026_state_api() -> None:
     worker = SimpleNamespace(
         state=SimpleNamespace(total_resources={
-            "gpu-cellpose": 1,
             "GPU": 1,
-            "CPU": 4,
         }),
         resources={},
     )
 
     assert worker_logical_resources(worker) == {
-        "gpu-cellpose": 1.0,
         "GPU": 1.0,
-        "CPU": 4.0,
     }
 
 
 def test_block_runtime_accepts_profile_from_worker_total_resources(monkeypatch) -> None:
     worker = SimpleNamespace(
-        name="gpu-cellpose-0",
+        name="GPU-0",
         state=SimpleNamespace(total_resources={
-            "gpu-cellpose": 1,
             "GPU": 1,
-            "CPU": 4,
         }),
         resources={},
         worker_role="gpu",
@@ -1038,7 +1009,7 @@ def test_block_runtime_accepts_profile_from_worker_total_resources(monkeypatch) 
     )
     monkeypatch.setattr(distributed, "get_worker", lambda: worker)
 
-    assert BlockContextFactory().resolve_device_hint("gpu-cellpose") == "cuda:0"
+    assert BlockContextFactory().resolve_device_hint("GPU") == "cuda:0"
 
 
 def test_profile_worker_role_counts_are_disjoint() -> None:
@@ -1046,20 +1017,20 @@ def test_profile_worker_role_counts_are_disjoint() -> None:
         "address": "tcp://127.0.0.1:8786",
         "workers": {
             "tcp://127.0.0.1:1": {
-                "resources": {"cpu-reader": 1, "CPU": 8},
+                "resources": {"CPU": 8},
             },
             "tcp://127.0.0.1:2": {
-                "resources": {"gpu-cellpose": 1, "CPU": 4, "GPU": 1},
+                "resources": {"GPU": 1},
             },
         },
     })
 
     assert summary.cpu_workers == ("tcp://127.0.0.1:1",)
     assert summary.gpu_workers == ("tcp://127.0.0.1:2",)
-    assert summary.total_cpu_slots == 12
+    assert summary.total_cpu_slots == 8
     assert summary.worker_profile_slots == {
-        "cpu-reader": 1,
-        "gpu-cellpose": 1,
+        "CPU": 8,
+        "GPU": 1,
     }
 
 
@@ -1071,8 +1042,6 @@ def test_external_worker_ownership_uses_registered_hidden_resources() -> None:
         "workers": {
             "tcp://t001:20000": {
                 "resources": {
-                    "gpu-cellpose": 1,
-                    "CPU": 4,
                     "GPU": 1,
                     execution_ownership_resource(execution_id): 1,
                     submission_ownership_resource(submission_token): 1,
@@ -1087,7 +1056,7 @@ def test_external_worker_ownership_uses_registered_hidden_resources() -> None:
         submission_tokens=(submission_token,),
     )
     summary = cluster_resource_summary_from_scheduler_info(scheduler_info)
-    assert summary.worker_profile_slots == {"gpu-cellpose": 1}
+    assert summary.worker_profile_slots == {"GPU": 1}
 
 
 def test_external_worker_ownership_rejects_another_execution() -> None:

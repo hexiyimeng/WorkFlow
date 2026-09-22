@@ -37,7 +37,7 @@ class DaskROI:
     PREFLIGHT_SAFE = True
     CATEGORY = "WorkFlow/DataProcessing"
     DISPLAY_NAME = "ROI Crop"
-    required_worker_profile = "cpu-general"
+    required_worker_profile = "CPU"
 
     @classmethod
     def INPUT_TYPES(cls):

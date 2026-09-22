@@ -23,11 +23,11 @@ from services.executor import (
 
 
 class _ReaderNode:
-    required_worker_profile = "cpu-reader"
+    required_worker_profile = "CPU"
 
 
 class _GpuNode:
-    required_worker_profile = "gpu-cellpose"
+    required_worker_profile = "GPU"
 
 
 class _BlockNode:
@@ -52,7 +52,7 @@ def test_block_callable_does_not_capture_complete_upstream_plan() -> None:
         runtime=NodeRuntime(
             node_id="test",
             execution_id="execution",
-            worker_profile="cpu-general",
+            worker_profile="CPU",
         ),
         preprocess_state={},
         context_factory=BlockContextFactory(),
@@ -129,10 +129,10 @@ def test_resource_boundaries_keep_window_graph_culling_enabled() -> None:
     assert client.get_kwargs == {"sync": False}
     assert client.submitted_task_count is not None
     assert client.submitted_task_count < unculled_task_count / 10
-    assert {"cpu-reader", "gpu-cellpose"}.issubset(
+    assert {"CPU", "GPU"}.issubset(
         client.submitted_worker_profiles
     )
-    assert {"cpu-reader", "gpu-cellpose"}.issubset(
+    assert {"CPU", "GPU"}.issubset(
         client.submitted_resources
     )
 
@@ -224,7 +224,7 @@ def test_live_scheduler_routes_frozen_layers_to_matching_profiles() -> None:
                 "cls": Worker,
                 "options": {
                     "nthreads": 1,
-                    "resources": {"CPU": 1, "cpu-reader": 1},
+                    "resources": {"CPU": 1, "CPU": 1},
                 },
             },
             "gpu": {
@@ -234,7 +234,7 @@ def test_live_scheduler_routes_frozen_layers_to_matching_profiles() -> None:
                     "resources": {
                         "CPU": 1,
                         "GPU": 1,
-                        "gpu-cellpose": 1,
+                        "GPU": 1,
                     },
                 },
             },
@@ -247,14 +247,14 @@ def test_live_scheduler_routes_frozen_layers_to_matching_profiles() -> None:
         with dask.annotate(**dask_annotation_kwargs(_ReaderNode, "reader")):
             reader = source.map_blocks(
                 _assert_profile_and_add,
-                profile="cpu-reader",
+                profile="CPU",
                 amount=1,
                 dtype=source.dtype,
             )
         with dask.annotate(**dask_annotation_kwargs(_GpuNode, "cellpose")):
             output = reader.map_blocks(
                 _assert_profile_and_add,
-                profile="gpu-cellpose",
+                profile="GPU",
                 amount=2,
                 dtype=reader.dtype,
             )

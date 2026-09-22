@@ -9,11 +9,10 @@ WORKFLOW_BRANCH="${WORKFLOW_BRANCH:-master}"
 UV_VERSION="${UV_VERSION:-0.11.32}"
 UV_BIN="${UV_BIN:-$HOME/.workflow-deploy/bin/uv}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/workflow-uv}"
-MODEL_SHA256="e1440429eb384f95afe32bcba6510f90d518eaedc917ede549bed6804004abe2"
-MODEL_PATH="$WORKFLOW_RUNTIME_DIR/models/cellpose/cpsam"
+MODEL_SHA256="2dc3087a8abd7da46d1ab0ddd5824639933cc3ff63b382af3fa1939a392db93c"
+MODEL_PATH="$WORKFLOW_RUNTIME_DIR/models/cellpose/cyto3"
 MODEL_URLS=(
-  "https://huggingface.co/mouseland/cellpose-sam/resolve/main/cpsam"
-  "https://hf-mirror.com/mouseland/cellpose-sam/resolve/main/cpsam"
+  "https://www.cellpose.org/models/cyto3"
 )
 
 if [[ ! "$WORKFLOW_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \

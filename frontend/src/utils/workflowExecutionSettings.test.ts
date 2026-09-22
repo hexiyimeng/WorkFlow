@@ -259,8 +259,8 @@ const preflight: ExecutionPreflightResponse = {
   totalWindows: 125,
   requiredResources: {
     requiredWorkerProfiles: {
-      'cpu-general': 1,
-      'gpu-inference': 8,
+      'CPU': 1,
+      'GPU': 8,
     },
     profileRequirements: [],
   },
@@ -269,8 +269,8 @@ const summary = lastPreflightSummaryFromResponse(preflight, 1234);
 assert(summary.outputShape?.join(',') === '293,1077,1050', 'preflight summary should retain output shape');
 assert(summary.totalWindows === 125, 'preflight summary should retain total Windows');
 assert(
-  summary.requiredWorkerProfiles?.['cpu-general'] === 1
-    && summary.requiredWorkerProfiles['gpu-inference'] === 8,
+  summary.requiredWorkerProfiles?.['CPU'] === 1
+    && summary.requiredWorkerProfiles['GPU'] === 8,
   'preflight summary should retain Worker Profile requirements',
 );
 assert(summary.validatedAt === 1234, 'preflight summary should retain validation time');

@@ -6,18 +6,14 @@ import re
 from typing import Any, Mapping, Sequence
 
 
-CPU_GENERAL_PROFILE = "cpu-general"
-GPU_INFERENCE_PROFILE = "gpu-inference"
+CPU_GENERAL_PROFILE = "CPU"
+GPU_INFERENCE_PROFILE = "GPU"
 DEFAULT_WORKER_PROFILE = CPU_GENERAL_PROFILE
 
-_PROFILE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _MEMORY_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(gib|gb)\Z", re.IGNORECASE)
-_RESERVED_LOGICAL_RESOURCES = frozenset({"CPU", "GPU"})
 _BUILT_IN_PROFILE_GPUS = {
-    "cpu-general": 0,
-    "cpu-reader": 0,
-    "cpu-writer": 0,
-    "gpu-cellpose": 1,
+    "CPU": 0,
+    "GPU": 1,
 }
 
 
@@ -26,10 +22,10 @@ def normalize_worker_profile(value: object, *, owner: str = "Node") -> str:
         raise ValueError(
             f"{owner}.required_worker_profile must be a string, got {value!r}."
         )
-    normalized = value.strip().lower()
-    if _PROFILE_NAME_RE.fullmatch(normalized) is None:
+    normalized = value.strip()
+    if normalized not in _BUILT_IN_PROFILE_GPUS:
         raise ValueError(
-            f"{owner}.required_worker_profile must be a lowercase profile slug, "
+            f"{owner}.required_worker_profile must be CPU or GPU, "
             f"got {value!r}."
         )
     return normalized
@@ -116,11 +112,9 @@ def _logical_resources(
                 raise ValueError(f"logical_resources[{key!r}] must be positive.")
             result[key.strip()] = amount
 
-    expected = {
-        profile_name: 1.0,
-        "CPU": float(physical.cpu),
-        **({"GPU": float(physical.gpu)} if physical.gpu else {}),
-    }
+    expected = {profile_name: float(physical.gpu if profile_name == "GPU" else physical.cpu)}
+    if set(result) - set(expected):
+        raise ValueError(f"{profile_name} Worker must advertise only {profile_name} task resources.")
     for key, amount in expected.items():
         existing = result.get(key)
         if existing is not None and existing != amount:
@@ -128,8 +122,6 @@ def _logical_resources(
                 f"logical_resources[{key!r}] must equal physical capability {amount:g}."
             )
         result[key] = amount
-    if physical.gpu == 0 and "GPU" in result:
-        raise ValueError("A CPU-only profile must not advertise logical GPU capability.")
     return dict(sorted(result.items()))
 
 
@@ -166,11 +158,7 @@ class WorkerProfile:
 
     @property
     def capabilities(self) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name in self.logical_resources
-            if name not in _RESERVED_LOGICAL_RESOURCES
-        )
+        return (self.name,)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -205,7 +193,8 @@ class WorkerProfile:
             if isinstance(capabilities, (str, bytes)) or not isinstance(capabilities, Sequence):
                 raise ValueError(f"{name}.capabilities must be an array.")
             raw_logical = {
-                normalize_worker_profile(item, owner=f"{name}.capabilities"): 1
+                normalize_worker_profile(item, owner=f"{name}.capabilities"):
+                    (physical.gpu if name == "GPU" else physical.cpu)
                 for item in capabilities
             }
         return cls(
