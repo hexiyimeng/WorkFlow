@@ -98,26 +98,46 @@ export UV_CACHE_DIR
 if [[ -f "$MODEL_PATH" ]]; then
   echo "$MODEL_SHA256  $MODEL_PATH" | sha256sum -c -
 else
-  model_downloaded=false
-  for model_url in "${MODEL_URLS[@]}"; do
-    if curl -fL \
-      --retry 4 \
-      --retry-delay 3 \
-      --retry-connrefused \
-      --connect-timeout 20 \
-      --continue-at - \
-      -o "$MODEL_PATH.partial" \
-      "$model_url"; then
-      model_downloaded=true
+  model_reused=false
+  MODEL_CANDIDATES=(
+    "$HOME/.cellpose/models/cpsam"
+    "$WORKFLOW_ROOT/backend/models/cellpose/cpsam"
+    "$WORKFLOW_ROOT/models/cellpose/cpsam"
+  )
+  for model_candidate in "${MODEL_CANDIDATES[@]}"; do
+    if [[ -f "$model_candidate" ]] \
+      && echo "$MODEL_SHA256  $model_candidate" | sha256sum -c --status; then
+      echo "Reusing existing CPSAM model: $model_candidate"
+      if ! ln "$model_candidate" "$MODEL_PATH" 2>/dev/null; then
+        cp --reflink=auto "$model_candidate" "$MODEL_PATH"
+      fi
+      model_reused=true
       break
     fi
   done
-  if [[ "$model_downloaded" != true ]]; then
-    echo "All Cellpose model endpoints failed." >&2
-    exit 1
+  if [[ "$model_reused" != true ]]; then
+    model_downloaded=false
+    for model_url in "${MODEL_URLS[@]}"; do
+      if curl -fL \
+        --retry 4 \
+        --retry-delay 3 \
+        --retry-connrefused \
+        --connect-timeout 20 \
+        --continue-at - \
+        -o "$MODEL_PATH.partial" \
+        "$model_url"; then
+        model_downloaded=true
+        break
+      fi
+    done
+    if [[ "$model_downloaded" != true ]]; then
+      echo "All Cellpose model endpoints failed." >&2
+      exit 1
+    fi
+    echo "$MODEL_SHA256  $MODEL_PATH.partial" | sha256sum -c -
+    mv "$MODEL_PATH.partial" "$MODEL_PATH"
   fi
-  echo "$MODEL_SHA256  $MODEL_PATH.partial" | sha256sum -c -
-  mv "$MODEL_PATH.partial" "$MODEL_PATH"
+  echo "$MODEL_SHA256  $MODEL_PATH" | sha256sum -c -
 fi
 
 printf 'WorkFlow installation complete\nroot=%s\nruntime=%s\ncommit=%s\n' \
