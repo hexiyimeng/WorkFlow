@@ -100,7 +100,7 @@ bash "$HOME/apps/WorkFlow/deploy/hpc/install.sh"
 
 `workflow-runtime` 与源码分开，原因是模型、输入、输出和恢复记录需要跨代码升级保留且被 CN 共享：
 
-- `models/`：共享模型缓存，如 `models/cellpose/cyto3`。模型不应随 backend 源码更新重复下载。
+- `models/`：共享模型缓存，如 `models/cellpose/cpsam`。模型不应随 backend 源码更新重复下载。
 - `test-runs/`：smoke/probe 的一次性输入、Zarr/Parquet 输出、日志和结果；不是页面运行的默认生产输出。
 - `jobs/`、`state/`、`logs/`：Driver 与 Slurm Worker allocation 的持久化控制记录。
 - `output/`、`recovery/`：正式执行可使用的输出与 Window recovery 根目录。

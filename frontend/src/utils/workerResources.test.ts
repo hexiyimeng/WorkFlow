@@ -5,6 +5,7 @@ import {
   defaultWorkerProfile,
   loadWorkerPools,
   loadWorkerProfiles,
+  normalizeRequiredWorkerProfiles,
   saveRequiredWorkerResources,
   saveWorkerResources,
   synchronizeLogicalResources,
@@ -122,3 +123,27 @@ try {
 }
 assert(builtInGpuMismatchRejected,
   'built-in CPU must reject GPU allocation');
+
+values.set(WORKER_PROFILES_STORAGE_KEY, JSON.stringify([
+  { ...defaultWorkerProfile('CPU'), name: 'cpu-reader', capabilities: ['cpu-reader'] },
+  { ...defaultWorkerProfile('GPU'), name: 'gpu-cellpose', capabilities: ['gpu-cellpose'] },
+]));
+values.set(WORKER_POOLS_STORAGE_KEY, JSON.stringify([
+  { profile: 'cpu-reader', processes: 2, minimum_jobs: 1, maximum_jobs: 3 },
+  { profile: 'gpu-cellpose', processes: 1, minimum_jobs: 1, maximum_jobs: 4 },
+]));
+assert(loadWorkerProfiles().map(profile => profile.name).join(',') === 'CPU,GPU',
+  'legacy named Profiles must migrate to CPU and GPU');
+assert(loadWorkerPools().map(pool => pool.profile).join(',') === 'CPU,GPU',
+  'legacy named Pools must migrate to CPU and GPU');
+const migratedRequirements = normalizeRequiredWorkerProfiles({
+  'cpu-reader': 1,
+  'cpu-writer': 2,
+  'gpu-cellpose': 3,
+});
+assert(migratedRequirements.CPU === 3 && migratedRequirements.GPU === 3,
+  'legacy preflight requirements must merge into CPU and GPU counts');
+assert(defaultWorkerProfile('gpu-cellpose').name === 'GPU',
+  'default Profile creation must not crash on a legacy GPU type');
+assert(defaultWorkerPool('cpu-writer').profile === 'CPU',
+  'default Pool creation must not crash on a legacy CPU type');

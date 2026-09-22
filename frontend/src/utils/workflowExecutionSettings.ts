@@ -15,6 +15,7 @@ import {
   isValidWindowShape,
   preflightOutputShape,
 } from './executionConfig.ts';
+import { normalizeRequiredWorkerProfiles } from './workerResources.ts';
 
 export const WORKFLOW_EXECUTION_SETTINGS_VERSION = 1 as const;
 export const WORKFLOW_EXECUTION_SETTINGS_STORAGE_PREFIX = 'workflow.executionSettings.';
@@ -215,13 +216,14 @@ const sanitizeLastPreflight = (value: unknown): LastPreflightSummary | undefined
     summary.totalWindows = Number(value.totalWindows);
   }
   if (isRecord(value.requiredWorkerProfiles)) {
-    const profiles = Object.fromEntries(
+    const validProfiles = Object.fromEntries(
       Object.entries(value.requiredWorkerProfiles).filter(
         ([name, count]) => name.length > 0
           && Number.isSafeInteger(count)
           && Number(count) >= 0,
       ).map(([name, count]) => [name, Number(count)]),
     );
+    const profiles = normalizeRequiredWorkerProfiles(validProfiles);
     if (Object.keys(profiles).length > 0) summary.requiredWorkerProfiles = profiles;
   }
   if (Number.isSafeInteger(value.cpuWorkers) && Number(value.cpuWorkers) >= 0) {

@@ -21,6 +21,7 @@ import {
   fixedGpuForWorkerProfile,
   loadWorkerPools,
   loadWorkerProfiles,
+  normalizeRequiredWorkerProfiles,
   saveRequiredWorkerResources,
   synchronizeLogicalResources,
 } from '../../utils/workerResources';
@@ -607,9 +608,13 @@ export default function ExecutionSettingsDrawer() {
       ? Number(executionPreflight.totalWindows)
       : undefined)
     : lastPreflight?.totalWindows;
-  const requiredWorkerProfiles = executionPreflight
+  const rawRequiredWorkerProfiles = executionPreflight
     ? requiredResources?.requiredWorkerProfiles
     : lastPreflight?.requiredWorkerProfiles;
+  const normalizedWorkerProfiles = normalizeRequiredWorkerProfiles(rawRequiredWorkerProfiles);
+  const requiredWorkerProfiles = Object.keys(normalizedWorkerProfiles).length > 0
+    ? normalizedWorkerProfiles
+    : undefined;
   const profileSummary = requiredWorkerProfiles
     ? Object.entries(requiredWorkerProfiles)
       .map(([profile, count]) => `${profile} (${count} nodes)`)

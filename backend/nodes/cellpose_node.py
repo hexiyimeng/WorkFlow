@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import itertools
 import logging
 import math
@@ -21,13 +20,13 @@ from nodes.base import BaseMapOverlapNode
 
 logger = logging.getLogger("WorkFlow.Cellpose")
 
-# cyto3 scales Y/X relative to the model's nominal training diameter.
+# Cellpose scales Y/X relative to the model's nominal training diameter.
 # Keep this diagnostic constant local to the integration rather than importing
 # Cellpose during graph construction (which must remain lightweight and must
 # not initialize CUDA on the Driver).
 CELLPOSE_TRAINING_DIAMETER = 30.0
-INCOMPATIBLE_CELLPOSE4_MODEL_NAMES = {
-    "cpsam",
+INCOMPATIBLE_CPSAM_MODEL_NAMES = {
+    "cyto3",
     "cpsam_v2",
     "cpdino",
     "cpdino-vitb",
@@ -70,30 +69,13 @@ def create_cellpose_model(model_ref: str, device: str):
         "device": device_obj,
     }
 
-    ref = str(model_ref)
-    if Path(ref).exists():
-        kwargs["pretrained_model"] = ref
-    elif ref == "cyto3":
-        # Cellpose 3's super-generalist model uses the substantially smaller
-        # CPnet architecture.  Do not pass cyto3 as pretrained_model: the
-        # built-in model selector is responsible for resolving its weights.
-        kwargs["model_type"] = "cyto3"
-    else:
-        try:
-            signature = inspect.signature(models.CellposeModel)
-        except (TypeError, ValueError):
-            signature = None
-        parameters = signature.parameters if signature is not None else {}
-        if "model_type" in parameters:
-            kwargs["model_type"] = ref
-        else:
-            kwargs["pretrained_model"] = ref
+    kwargs["pretrained_model"] = str(model_ref)
 
     return models.CellposeModel(**kwargs)
 
 
 def validate_cellpose_model(model_ref: str, requested_name: str) -> None:
-    if str(model_ref) == "cyto3" and str(requested_name) == "cyto3":
+    if str(model_ref) == "cpsam" and str(requested_name) == "cpsam":
         return
     if not Path(model_ref).exists():
         configured_directory = get_provider_model_dir("cellpose")
@@ -126,6 +108,10 @@ def cellpose_block(
         )
 
     model_name = str(model_name or "").strip()
+    if model_name == "cyto3":
+        # Existing workflows created before the Cellpose 4 migration stored
+        # cyto3. They now execute with the requested CPSAM model.
+        model_name = "cpsam"
     if not model_name:
         raise ValueError(
             "Cellpose requires a model selected from the configured shared "
@@ -241,9 +227,9 @@ def cellpose_block(
         eval_kwargs: dict[str, Any] = {
             "batch_size": int(gpu_batch_size),
             "progress": None,
-            "bsize": 224,
+            "bsize": 256,
             "tile_overlap": 0.1,
-            # An explicit diameter makes cyto3 rescale Y/X before inference.
+            # An explicit diameter makes Cellpose rescale Y/X before inference.
             # Restore diameter-scaled masks to the caller's original shape.
             "resample": explicit_diameter > 0,
             "normalize": bool(normalize),
@@ -539,12 +525,12 @@ class Cellpose(BaseMapOverlapNode):
     def INPUT_TYPES(cls):
         installed_models = list_models("cellpose")
         model_names = [
-            "cyto3",
+            "cpsam",
             *(
                 name
                 for name in installed_models
-                if name != "cyto3"
-                and name.lower() not in INCOMPATIBLE_CELLPOSE4_MODEL_NAMES
+                if name != "cpsam"
+                and name.lower() not in INCOMPATIBLE_CPSAM_MODEL_NAMES
             ),
         ]
         return {
@@ -554,7 +540,7 @@ class Cellpose(BaseMapOverlapNode):
                 "secondary_channel": ("INT", {"default": -1, "min": -1, "max": 255}),
                 "model_name": (
                     model_names,
-                    {"default": "cyto3"},
+                    {"default": "cpsam"},
                 ),
                 "diameter": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 500.0}),
                 "flow_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0}),

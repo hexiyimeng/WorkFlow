@@ -10,6 +10,28 @@ const BUILT_IN_PROFILE_GPUS: Readonly<Record<string, 0 | 1>> = {
   GPU: 1,
 };
 
+export type WorkerProfileName = 'CPU' | 'GPU';
+
+export const normalizeWorkerProfileName = (value: unknown): WorkerProfileName | undefined => {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toUpperCase().replaceAll('_', '-');
+  if (normalized === 'CPU' || normalized.startsWith('CPU-')) return 'CPU';
+  if (normalized === 'GPU' || normalized.startsWith('GPU-')) return 'GPU';
+  return undefined;
+};
+
+export const normalizeRequiredWorkerProfiles = (
+  profiles: Record<string, number> | undefined,
+): Partial<Record<WorkerProfileName, number>> => {
+  const normalized: Partial<Record<WorkerProfileName, number>> = {};
+  for (const [name, count] of Object.entries(profiles ?? {})) {
+    const workerType = normalizeWorkerProfileName(name);
+    if (!workerType || !Number.isSafeInteger(count) || count < 0) continue;
+    normalized[workerType] = (normalized[workerType] ?? 0) + count;
+  }
+  return normalized;
+};
+
 export const fixedGpuForWorkerProfile = (name: string): 0 | 1 | undefined => (
   BUILT_IN_PROFILE_GPUS[name]
 );
@@ -117,46 +139,58 @@ const workerPoolError = (value: unknown, index: number): string | null => {
   return null;
 };
 
-const parseArray = <T>(key: string, validate: (value: unknown) => value is T): T[] => {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter(validate) : [];
-  } catch {
-    return [];
-  }
-};
-
 export const loadWorkerProfiles = (): WorkerProfile[] => {
   try {
     const raw = localStorage.getItem(WORKER_PROFILES_STORAGE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.map(value => {
-      if (!isRecord(value) || !isRecord(value.physical_resources)) return value;
-      const name = typeof value.name === 'string' ? value.name : '';
+    const profilesByType = new Map<WorkerProfileName, WorkerProfile>();
+    for (const value of parsed) {
+      if (!isRecord(value) || !isRecord(value.physical_resources)) continue;
+      const name = normalizeWorkerProfileName(value.name) ?? '';
       const fixedGpu = fixedGpuForWorkerProfile(name);
       const physicalResources = {
         ...value.physical_resources,
         ...(fixedGpu === undefined ? {} : { gpu: fixedGpu }),
       };
-      return synchronizeLogicalResources({
+      const migrated = synchronizeLogicalResources({
         ...value,
         name,
         physical_resources: physicalResources,
         threads: Number(value.physical_resources.cpu),
       } as WorkerProfile);
-    }).filter(isWorkerProfile);
+      if (!isWorkerProfile(migrated)) continue;
+      const workerType = migrated.name as WorkerProfileName;
+      const existing = profilesByType.get(workerType);
+      if (!existing || value.name === workerType) profilesByType.set(workerType, migrated);
+    }
+    return [...profilesByType.values()];
   } catch {
     return [];
   }
 };
 
-export const loadWorkerPools = (): WorkerPool[] => (
-  parseArray(WORKER_POOLS_STORAGE_KEY, isWorkerPool)
-);
+export const loadWorkerPools = (): WorkerPool[] => {
+  try {
+    const raw = localStorage.getItem(WORKER_POOLS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const poolsByType = new Map<WorkerProfileName, WorkerPool>();
+    for (const value of parsed) {
+      if (!isRecord(value)) continue;
+      const profile = normalizeWorkerProfileName(value.profile);
+      const migrated = { ...value, profile };
+      if (!profile || !isWorkerPool(migrated)) continue;
+      const existing = poolsByType.get(profile);
+      if (!existing || value.profile === profile) poolsByType.set(profile, migrated);
+    }
+    return [...poolsByType.values()];
+  } catch {
+    return [];
+  }
+};
 
 export const saveWorkerResources = (
   profiles: WorkerProfile[],
@@ -219,24 +253,29 @@ export const workerResourcePayload = (): {
 });
 
 export const defaultWorkerProfile = (name: string): WorkerProfile => {
-  if (!PROFILE_NAME.test(name)) throw new Error('Worker type must be CPU or GPU.');
-  const gpu = fixedGpuForWorkerProfile(name)!;
+  const workerType = normalizeWorkerProfileName(name);
+  if (!workerType) throw new Error('Worker type must be CPU or GPU.');
+  const gpu = fixedGpuForWorkerProfile(workerType)!;
   const cpu = gpu > 0 ? 4 : 8;
   return {
-    name,
+    name: workerType,
     physical_resources: { cpu, memory: '32GB', gpu },
-    logical_resources: { [name]: profileTaskCapacity(cpu, gpu) },
-    capabilities: [name],
+    logical_resources: { [workerType]: profileTaskCapacity(cpu, gpu) },
+    capabilities: [workerType],
     threads: cpu,
   };
 };
 
-export const defaultWorkerPool = (profile: string): WorkerPool => ({
-  profile,
-  processes: 1,
-  minimum_jobs: 1,
-  maximum_jobs: 1,
-});
+export const defaultWorkerPool = (profile: string): WorkerPool => {
+  const workerType = normalizeWorkerProfileName(profile);
+  if (!workerType) throw new Error('Worker type must be CPU or GPU.');
+  return {
+    profile: workerType,
+    processes: 1,
+    minimum_jobs: 1,
+    maximum_jobs: 1,
+  };
+};
 
 export const synchronizeLogicalResources = (profile: WorkerProfile): WorkerProfile => ({
   ...profile,
