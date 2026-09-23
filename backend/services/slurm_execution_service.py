@@ -1141,20 +1141,27 @@ class SlurmExecutionService:
             pending = next((row for row in rows if row[2].upper() not in {"RUNNING", "COMPLETING"}), None)
             row = pending or rows[0]
             return True, (row[2].upper(), ",".join(r[3] for r in rows), row[4])
-        if len(lines) != 1:
-            logger.warning("squeue returned ambiguous rows for root job %s", job_id)
-            return False, None
-        fields = lines[0].split("|", 4)
-        if len(fields) != 5 or fields[0].strip() != job_id:
+        root_rows = [line.split("|", 4) for line in lines]
+        if not all(len(fields) == 5 and fields[0].strip() == job_id
+                   for fields in root_rows):
             logger.warning("squeue returned a mismatched row for root job %s", job_id)
             return False, None
-        if submission_token is not None and fields[1].strip() != submission_token:
+        if submission_token is not None and any(
+            fields[1].strip() != submission_token for fields in root_rows
+        ):
             logger.error(
                 "Slurm job ID %s belongs to another submission token; refusing "
                 "to monitor or control it.",
                 job_id,
             )
             return False, None
+        # A job submitted to a comma-separated partition list appears once per
+        # partition while pending. Prefer a running copy; otherwise any copy is
+        # sufficient to establish that the same owned job is still queued.
+        fields = next(
+            (row for row in root_rows if row[2].strip().upper() in {"RUNNING", "COMPLETING"}),
+            root_rows[0],
+        )
         return True, (
             fields[2].strip().upper(),
             fields[3].strip(),

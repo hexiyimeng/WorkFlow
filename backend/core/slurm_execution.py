@@ -49,6 +49,17 @@ def _validate_partition(value: object, *, name: str = "partition") -> str:
     return value
 
 
+def _partition_names(value: object, *, name: str = "partition") -> tuple[str, ...]:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{name} must be a non-empty Slurm partition list.")
+    values = tuple(value.split(","))
+    if any(not item for item in values) or len(set(values)) != len(values):
+        raise ValueError(f"{name} must contain unique comma-separated partition names.")
+    for index, item in enumerate(values):
+        _validate_partition(item, name=f"{name}[{index}]")
+    return values
+
+
 def _slurm_time_seconds(value: object, *, name: str = "time_limit") -> int:
     """Validate a finite Slurm 19.05 time value and return its duration.
 
@@ -112,7 +123,7 @@ class SlurmResourceRequest:
         _require_int(self.gpus, name="gpus", minimum=0)
         _require_int(self.memory_gib, name="memory_gib", minimum=1)
         _slurm_time_seconds(self.time_limit)
-        _validate_partition(self.partition)
+        _partition_names(self.partition)
         if self.node_names:
             if len(self.node_names) != nodes:
                 raise ValueError("node_names must contain one name per requested node.")
@@ -125,6 +136,10 @@ class SlurmResourceRequest:
     @property
     def time(self) -> str:
         return self.time_limit
+
+    @property
+    def partition_names(self) -> tuple[str, ...]:
+        return _partition_names(self.partition)
 
     @property
     def total_cpus(self) -> int:
@@ -256,12 +271,18 @@ class SlurmPolicy:
     def validate_request(self, request: SlurmResourceRequest) -> None:
         """Validate a concrete request emitted by the Resource Planner."""
 
-        if request.partition in self.excluded_partitions or (
-            self.allowed_partitions
-            and request.partition not in self.allowed_partitions
-        ):
+        invalid_partitions = [
+            partition for partition in request.partition_names
+            if partition in self.excluded_partitions or (
+                self.allowed_partitions
+                and partition not in self.allowed_partitions
+            )
+        ]
+        if invalid_partitions:
             raise ValueError(
-                f"partition {request.partition!r} is not allowed by site policy."
+                "partition(s) not allowed by site policy: "
+                + ", ".join(invalid_partitions)
+                + "."
             )
         checks = (
             (request.nodes, self.max_nodes, "nodes"),

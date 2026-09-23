@@ -354,10 +354,14 @@ def test_planner_uses_multiple_discovered_partitions_but_excludes_management() -
     )
 
     assert set(allocation.partitions) == {"gpu", "compute", "tao"}
+    assert {
+        job.partition for job in allocation.jobs
+    } == {"gpu,compute,tao"}
     assert all(not job.node for job in allocation.jobs)
     assert all(job.partition not in {"mn", "control"} for job in allocation.jobs)
     assert all(
-        _worker_job_request(allocation, job).partition == job.partition
+        _worker_job_request(allocation, job).partition_names
+        == ("gpu", "compute", "tao")
         for job in allocation.jobs
     )
 

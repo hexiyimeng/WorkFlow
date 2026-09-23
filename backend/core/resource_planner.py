@@ -60,6 +60,10 @@ class SlurmJobRequirement:
     logical_resources: Mapping[str, float]
     excluded_nodes: tuple[str, ...] = ()
 
+    @property
+    def partition_names(self) -> tuple[str, ...]:
+        return tuple(self.partition.split(","))
+
     def to_dict(self) -> dict[str, object]:
         return {
             "allocationId": self.allocation_id,
@@ -155,7 +159,6 @@ class SlurmAllocationPlan:
 @dataclass(slots=True)
 class _NodeCapacity:
     node: ClusterNode
-    partition: str
     cpu_used: int = 0
     memory_gib_used: int = 0
     gpu_used: int = 0
@@ -229,20 +232,16 @@ def plan_workflow_resources(
     if len(set(selected_partitions)) != len(selected_partitions):
         raise ResourcePlanningError("Eligible Slurm partitions must be unique.")
 
-    candidates = []
-    for node in sorted(
+    eligible_nodes = sorted(
         inventory.for_partitions(
             selected_partitions,
             excluded_nodes=excluded_nodes,
         ),
         key=lambda item: item.name,
-    ):
-        selected_partition = next(
-            name for name in selected_partitions if name in node.partitions
-        )
-        candidates.append(
-            _NodeCapacity(node=node, partition=selected_partition)
-        )
+    )
+    candidates = []
+    for node in eligible_nodes:
+        candidates.append(_NodeCapacity(node=node))
     if not candidates:
         raise ResourcePlanningError(
             "No available Slurm node was reported for eligible partition(s): "
@@ -279,6 +278,21 @@ def plan_workflow_resources(
     jobs: list[SlurmJobRequirement] = []
     node_jobs: dict[str, list[SlurmJobRequirement]] = {}
     for profile, pool, scale_index, cpu, memory_gib, gpu in units:
+        compatible_partitions = tuple(
+            partition_name for partition_name in selected_partitions
+            if any(
+                partition_name in node.partitions
+                and cpu <= node.cpu_total
+                and memory_gib <= node.memory_total_mib // 1024
+                and gpu <= node.gpu_total
+                for node in eligible_nodes
+            )
+        )
+        if not compatible_partitions:
+            raise ResourcePlanningError(
+                f"No eligible Slurm partition supports Worker Pool {profile.name!r}: "
+                f"CPU={cpu}, memory={memory_gib}GiB, GPU={gpu}."
+            )
         fitting = [
             capacity for capacity in candidates
             if capacity.fits(cpu=cpu, memory_gib=memory_gib, gpu=gpu)
@@ -301,7 +315,7 @@ def plan_workflow_resources(
             allocation_id=allocation_id,
             profile=profile.name,
             node="",
-            partition=selected.partition,
+            partition=",".join(compatible_partitions),
             workers=pool.processes,
             processes=pool.processes,
             cpu=cpu,
@@ -330,7 +344,11 @@ def plan_workflow_resources(
         )
         for node_name, planned in sorted(node_jobs.items())
     )
-    used_partitions = {job.partition for job in jobs}
+    used_partitions = {
+        partition_name
+        for job in jobs
+        for partition_name in job.partition_names
+    }
     return SlurmAllocationPlan(
         partitions=tuple(
             name for name in selected_partitions if name in used_partitions

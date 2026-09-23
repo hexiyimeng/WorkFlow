@@ -268,6 +268,18 @@ def test_generated_baseline_scripts_parse_in_bash(tmp_path):
         assert result.returncode == 0, result.stderr
 
 
+def test_slurm_job_emits_all_compatible_partitions():
+    worker_spec = spec("GPU-1", "GPU")
+    options = dict(worker_spec.options)
+    options["queue"] = "gpu,compute,tao"
+    job = PlannedSLURMJob(
+        "tcp://127.0.0.1:8786",
+        name="baseline-GPU-1",
+        **options,
+    )
+    assert "#SBATCH -p gpu,compute,tao" in job.job_script()
+
+
 def test_heterogeneous_queue_query_and_token_recovery(monkeypatch):
     service = SlurmExecutionService()
     config = NS(squeue_executable="squeue")
@@ -282,6 +294,26 @@ def test_heterogeneous_queue_query_and_token_recovery(monkeypatch):
         assert await service._query_job_by_submission_token(config, "wf:test") == (True, ("70400", "RUNNING"))
         assert await service._query_queue_state(config, "70400", submission_token="wrong") == (False, None)
     asyncio.run(run())
+
+
+def test_multi_partition_queue_rows_are_one_owned_pending_job(monkeypatch):
+    service = SlurmExecutionService()
+    config = NS(squeue_executable="squeue")
+
+    def command(argv, **kwargs):
+        return NS(
+            returncode=0,
+            stdout=(
+                "70401|wf:test|PENDING|(null)|Resources\n"
+                "70401|wf:test|PENDING|(null)|Priority\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(service, "_run_command", command)
+    assert asyncio.run(
+        service._query_queue_state(config, "70401", submission_token="wf:test")
+    ) == (True, ("PENDING", "(null)", "Resources"))
 
 
 def test_native_graph_triggers_only_its_profile_and_shrinks_extras(monkeypatch, tmp_path):
