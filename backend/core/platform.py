@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import mimetypes
 import os
 import platform
@@ -88,6 +89,28 @@ def should_schedule_malloc_trim() -> bool:
     return is_linux()
 
 
+def trim_process_allocator() -> None:
+    """Return already-freed glibc pages without forcing a Python GC pass."""
+
+    if not is_linux():
+        return
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        # Allocator reclamation is a best-effort Linux optimization.  A libc
+        # without malloc_trim must not make task execution fail.
+        return
+
+
+def reclaim_process_memory() -> None:
+    """Collect Python cycles and return free glibc arenas when available."""
+
+    gc.collect()
+    trim_process_allocator()
+
+
 def rewrite_dashboard_url(dashboard_link: str | None, custom_host: str | None) -> str | None:
     if not dashboard_link:
         return None
@@ -102,6 +125,11 @@ def rewrite_dashboard_url(dashboard_link: str | None, custom_host: str | None) -
         scheme = parsed_custom.scheme or parsed_link.scheme or "http"
         port = parsed_custom.port or parsed_link.port
         netloc = f"{host}:{port}" if port else host
-        return urlunparse((scheme, netloc, parsed_custom.path.rstrip("/"), "", "", ""))
+        # A host-only browser override changes the SSH-forwarded host/port but
+        # must retain Dask's application path (normally ``/status``). Dropping
+        # it opens Tornado's root route, which is a valid server but returns
+        # a misleading 404.
+        path = parsed_custom.path.rstrip("/") or parsed_link.path
+        return urlunparse((scheme, netloc, path, "", "", ""))
 
     return custom_host

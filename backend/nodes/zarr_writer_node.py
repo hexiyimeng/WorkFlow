@@ -12,6 +12,17 @@ from typing import Any
 import dask.config
 import numpy as np
 
+from core.execution_paths import execution_path_suffix, normalize_execution_path
+from core.label_stitching import (
+    apply_label_stitch_plan,
+    discover_label_stitch_plan,
+    get_label_stitch_metadata,
+    label_stitch_plan_path,
+    load_label_stitch_plan,
+    register_label_stitch_plan,
+    save_label_stitch_plan,
+)
+from core.platform import trim_process_allocator
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
@@ -40,22 +51,13 @@ def _lock_acquire_timeout_seconds() -> float:
 
 
 def _normalize_output_path(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("ZarrWriter output_path must be a literal string.")
-    raw = value.strip()
-    if not raw:
-        raise ValueError("ZarrWriter output_path cannot be empty.")
-    if "\x00" in raw:
-        raise ValueError("ZarrWriter output_path contains a null byte.")
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        raise ValueError("ZarrWriter output_path must be an absolute path.")
-    if path.suffix.lower() != ".zarr":
+    normalized = normalize_execution_path(value, name="ZarrWriter output_path")
+    if execution_path_suffix(normalized).lower() != ".zarr":
         raise ValueError(
             "ZarrWriter output_path must include the complete final '.zarr' suffix; "
             "the framework does not append file extensions."
         )
-    return str(path.resolve())
+    return normalized
 
 
 def _normalize_dataset_path(value: str | None) -> str:
@@ -477,7 +479,7 @@ def _prepare_store(
         }
 
 
-def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
+def _write_zarr_block_impl(array: np.ndarray, ctx=None) -> np.ndarray:
     if ctx is None:
         raise RuntimeError("ZarrWriter block requires a BlockContext.")
     resources = ctx.resources or {}
@@ -537,14 +539,26 @@ def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
     return np.ones(tuple(int(x) for x in token_shape), dtype=TOKEN_DTYPE)
 
 
+def write_zarr_block(array: np.ndarray, ctx=None) -> np.ndarray:
+    """Write one Zarr block without retaining codec/native allocator arenas."""
+
+    try:
+        return _write_zarr_block_impl(array, ctx)
+    finally:
+        # The task argument is still owned by Dask at this point.  Trim codec
+        # temporaries now; the Worker lifecycle plugin trims again after Dask
+        # releases the input array.
+        trim_process_allocator()
+
+
 @register_node("ZarrWriter")
 class ZarrWriter(BaseMapBlocksNode):
     """Generic Zarr/OME-Zarr side-effect writer backed by map_blocks."""
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Zarr Writer"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 6
+    required_worker_profile = "CPU"
+    POSTPROCESS_PRIORITY = 100
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_path"
 
@@ -583,6 +597,8 @@ class ZarrWriter(BaseMapBlocksNode):
                 "compressor_name": (["default", "zstd", "blosc", "lz4", "none"], {"default": "default"}),
                 "overwrite": ("BOOLEAN", {"default": True}),
                 "write_metadata": ("BOOLEAN", {"default": True}),
+                "stitch_labels": ("BOOLEAN", {"default": True}),
+                "stitch_min_contact_voxels": ("INT", {"default": 1, "min": 1, "max": 1000000}),
             },
         }
 
@@ -621,6 +637,7 @@ class ZarrWriter(BaseMapBlocksNode):
             tuple(int(size) for size in axis_chunks)
             for axis_chunks in dask_arr.chunks
         )
+        stitch_metadata = get_label_stitch_metadata(dask_arr)
 
         logger.debug(
             "[ZarrWriter] input_shape=%s input_chunks=%s "
@@ -647,4 +664,107 @@ class ZarrWriter(BaseMapBlocksNode):
             "output_path": output_path,
             "store_kind": store_kind,
             "dataset_path": dataset_path,
+            "input_shape": input_shape,
+            "input_chunks": input_chunks,
+            "axes": axes,
+            "stitch_metadata": stitch_metadata,
+            "stitch_labels": bool(params.get("stitch_labels", True)),
+            "stitch_min_contact_voxels": int(
+                params.get("stitch_min_contact_voxels", 1)
+            ),
         }
+
+    def postprocess(self, outputs=None, state=None, runtime=None, **kwargs):
+        del kwargs
+        state = dict(state or {})
+        runtime = dict(runtime or {})
+        metadata = state.get("stitch_metadata")
+        if not state.get("stitch_labels", True) or not isinstance(metadata, dict):
+            return outputs
+
+        output_path = str(state["output_path"])
+        store_kind = str(state["store_kind"])
+        dataset_path = str(state["dataset_path"])
+        shape = tuple(int(value) for value in state["input_shape"])
+        chunks = tuple(
+            tuple(int(value) for value in axis_chunks)
+            for axis_chunks in state["input_chunks"]
+        )
+        axes = tuple(str(value).upper() for value in state["axes"])
+        namespace = str(metadata.get("namespace") or "")
+        execution_id = str(runtime.get("execution_id") or "")
+        min_contact_voxels = int(state.get("stitch_min_contact_voxels", 1))
+        if not namespace or not execution_id:
+            raise RuntimeError(
+                "Zarr label stitching requires an execution id and Cellpose label namespace."
+            )
+
+        import zarr
+
+        if store_kind == "ome_zarr":
+            root = zarr.open_group(output_path, mode="r+")
+            target = root[dataset_path]
+        else:
+            target = zarr.open(output_path, mode="r+")
+            root = target
+        if np.dtype(target.dtype) != np.dtype("uint64"):
+            raise ValueError(
+                "Globally stitched Cellpose labels require a uint64 Zarr target, "
+                f"got {target.dtype}."
+            )
+
+        plan_path = label_stitch_plan_path(output_path)
+        plan = load_label_stitch_plan(
+            plan_path,
+            namespace=namespace,
+            shape=shape,
+            chunks=chunks,
+            axes=axes,
+            min_contact_voxels=min_contact_voxels,
+        )
+        if plan is None:
+            plan = discover_label_stitch_plan(
+                target,
+                namespace=namespace,
+                chunks=chunks,
+                axes=axes,
+                min_contact_voxels=min_contact_voxels,
+            )
+            # Persist the complete equivalence plan before rewriting any label
+            # chunk.  A failed finalization can therefore resume idempotently.
+            save_label_stitch_plan(
+                plan_path,
+                plan,
+                shape=shape,
+                chunks=chunks,
+                axes=axes,
+                min_contact_voxels=min_contact_voxels,
+            )
+
+        rewritten_chunks = apply_label_stitch_plan(
+            target,
+            plan=plan,
+            chunks=chunks,
+        )
+        stitch_summary = {
+            "version": 1,
+            "namespace": namespace,
+            "status": "complete",
+            "boundary_count": int(plan.boundary_count),
+            "accepted_pair_count": int(plan.accepted_pair_count),
+            "merged_label_count": int(plan.aliases.size),
+            "rewritten_chunk_count": int(rewritten_chunks),
+            "min_contact_voxels": min_contact_voxels,
+            "plan": plan_path.name,
+        }
+        root.attrs["workflow_label_stitching"] = stitch_summary
+        register_label_stitch_plan(execution_id, namespace, plan)
+        logger.info(
+            "[ZarrWriter] label stitching complete: boundaries=%s, pairs=%s, "
+            "aliases=%s, rewritten_chunks=%s",
+            plan.boundary_count,
+            plan.accepted_pair_count,
+            plan.aliases.size,
+            rewritten_chunks,
+        )
+        return outputs

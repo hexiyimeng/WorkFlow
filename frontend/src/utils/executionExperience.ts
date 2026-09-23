@@ -41,14 +41,21 @@ const mergeValidation = (
 
 export const validationContextFromPreflight = (
   preflight: ExecutionPreflightResponse,
-): WorkflowExecutionSettingsValidationContext => ({
-  outputShape: preflightOutputShape(preflight),
-  availableAnchorNodeIds: (preflight.outputs ?? []).map(output => output.nodeId),
-  windowable: preflight.windowable,
-  windowUnavailableReason: preflight.reason,
-  resourcesSatisfied: preflight.resourcesSatisfied,
-  resourceError: preflight.resourceError,
-});
+): WorkflowExecutionSettingsValidationContext => {
+  const preflightError = preflight.preflightError?.message?.trim();
+  return {
+    outputShape: preflightOutputShape(preflight),
+    availableAnchorNodeIds: (preflight.outputs ?? []).map(output => output.nodeId),
+    windowable: preflightError ? false : preflight.windowable,
+    windowUnavailableReason: preflightError
+      ? `Preflight failed: ${preflightError}`
+      : preflight.reason,
+    resourcesSatisfied: preflightError ? false : preflight.resourcesSatisfied,
+    resourceError: preflightError
+      ? `Preflight failed: ${preflightError}`
+      : preflight.resourceError,
+  };
+};
 
 /**
  * Select a side-effect-free preflight payload. Incomplete Window drafts use

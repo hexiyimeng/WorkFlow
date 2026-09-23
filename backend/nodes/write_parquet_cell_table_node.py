@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,31 +9,38 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from core.execution_paths import normalize_execution_path
+from core.label_stitching import (
+    LOCAL_LABEL_MASK,
+    get_label_stitch_metadata,
+    get_registered_label_stitch_plan,
+)
+from core.platform import trim_process_allocator
 from core.registry import register_node
 from nodes.base import BaseMapBlocksNode
 
 
 TOKEN_DTYPE = np.dtype("uint8")
+logger = logging.getLogger("WorkFlow.WriteParquetCellTable")
 SPATIAL_AXES = ("Z", "Y", "X")
-LOCAL_ID_BITS = 24
 TILE_Z_BITS = 10
 TILE_Y_BITS = 15
 TILE_X_BITS = 15
 CELL_LOCAL_ID_WIDTH = 6
+GLOBAL_CELL_ID_ENCODING_VERSION = 2
+GLOBAL_CELL_ID_ENCODING_NAME = "source-block-uint32-local-ordinal-uint32"
+SOURCE_BLOCK_ID_BITS = 32
+LOCAL_ORDINAL_BITS = 32
+MAX_SOURCE_BLOCK_ID = (1 << SOURCE_BLOCK_ID_BITS) - 1
+MAX_LOCAL_ORDINAL = (1 << LOCAL_ORDINAL_BITS) - 1
+DATASET_METADATA_FILENAME = "_workflow_cell_table.json"
+STITCH_TRANSACTION_DIRECTORY = ".workflow-label-stitch-transaction"
+STITCH_TRANSACTION_PREPARING_DIRECTORY = ".workflow-label-stitch-transaction.preparing"
+STITCH_TRANSACTION_MANIFEST = "manifest.json"
 
 
 def _normalize_path(value: str, *, name: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{name} must be a literal string.")
-    raw = value.strip()
-    if not raw:
-        raise ValueError(f"{name} cannot be empty.")
-    if "\x00" in raw:
-        raise ValueError(f"{name} contains a null byte.")
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        raise ValueError(f"{name} must be an absolute path.")
-    return str(path.resolve())
+    return normalize_execution_path(value, name=name)
 
 
 def _block_id(block_index: tuple[int, ...]) -> str:
@@ -93,24 +101,28 @@ def _flatten_block_index(block_index: tuple[int, ...], numblocks: tuple[int, ...
     return int(flat)
 
 
-def _local_id_config(total_blocks: int) -> tuple[int, int]:
-    block_bits = max(0, int(total_blocks - 1).bit_length())
-    if block_bits >= LOCAL_ID_BITS:
+def _validate_source_block_capacity(total_blocks: int) -> None:
+    if total_blocks < 1 or total_blocks > MAX_SOURCE_BLOCK_ID + 1:
         raise ValueError(
-            f"WriteParquetCellTable cannot encode {total_blocks} blocks into the "
-            f"{LOCAL_ID_BITS}-bit local id budget."
+            "WriteParquetCellTable global_cell_id encoding supports between 1 "
+            f"and {MAX_SOURCE_BLOCK_ID + 1} source blocks, got {total_blocks}."
         )
-    return block_bits, LOCAL_ID_BITS - block_bits
 
 
-def _encode_local_id(block_flat_id: int, ordinal: int, *, ordinal_bits: int) -> int:
-    max_ordinal = (1 << ordinal_bits) - 1
-    if ordinal < 1 or ordinal > max_ordinal:
+def _encode_global_cell_id(source_block_id: int, ordinal: int) -> int:
+    """Return a collision-free uint64 id independent of the graph block count."""
+
+    if source_block_id < 0 or source_block_id > MAX_SOURCE_BLOCK_ID:
         raise ValueError(
-            f"Block has local cell ordinal {ordinal}, but only {max_ordinal} ordinals fit in "
-            f"{ordinal_bits} bits. Rechunk the mask or use smaller blocks."
+            f"Source block id {source_block_id} exceeds the "
+            f"{SOURCE_BLOCK_ID_BITS}-bit global_cell_id budget."
         )
-    return (int(block_flat_id) << ordinal_bits) | int(ordinal)
+    if ordinal < 1 or ordinal > MAX_LOCAL_ORDINAL:
+        raise ValueError(
+            f"Block has local cell ordinal {ordinal}, but the supported range "
+            f"is 1..{MAX_LOCAL_ORDINAL}."
+        )
+    return (int(source_block_id) << LOCAL_ORDINAL_BITS) | int(ordinal)
 
 
 def _encode_spatial_key(tile_z: int, tile_y: int, tile_x: int) -> int:
@@ -125,8 +137,26 @@ def _encode_spatial_key(tile_z: int, tile_y: int, tile_x: int) -> int:
     return (int(tile_z) << (TILE_Y_BITS + TILE_X_BITS)) | (int(tile_y) << TILE_X_BITS) | int(tile_x)
 
 
-def _encode_global_cell_id(spatial_key: int, local_id: int) -> int:
-    return (int(spatial_key) << LOCAL_ID_BITS) | int(local_id)
+def _id_encoding_metadata() -> dict[str, Any]:
+    return {
+        "version": GLOBAL_CELL_ID_ENCODING_VERSION,
+        "name": GLOBAL_CELL_ID_ENCODING_NAME,
+        "source_block_id_bits": SOURCE_BLOCK_ID_BITS,
+        "local_ordinal_bits": LOCAL_ORDINAL_BITS,
+        "global_cell_id": (
+            "source_block_id << local_ordinal_bits | local_ordinal"
+        ),
+    }
+
+
+def _has_current_id_encoding(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("version") == GLOBAL_CELL_ID_ENCODING_VERSION
+        and value.get("name") == GLOBAL_CELL_ID_ENCODING_NAME
+        and value.get("source_block_id_bits") == SOURCE_BLOCK_ID_BITS
+        and value.get("local_ordinal_bits") == LOCAL_ORDINAL_BITS
+    )
 
 
 def _parquet_schema(label_dtype: np.dtype):
@@ -171,7 +201,50 @@ def _metadata_is_complete(parquet_path: Path, metadata_path: Path, write_metadat
         data = json.loads(metadata_path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return bool(data.get("fragment_path") and data.get("schema") and data.get("block_index") is not None)
+    return bool(
+        data.get("fragment_path")
+        and data.get("schema")
+        and data.get("block_index") is not None
+        and _has_current_id_encoding(data.get("id_encoding"))
+    )
+
+
+def _write_dataset_metadata(output_path: Path) -> None:
+    _write_json_atomic(
+        output_path / DATASET_METADATA_FILENAME,
+        {
+            "format": "workflow-cell-table",
+            "schemaVersion": 1,
+            "id_encoding": _id_encoding_metadata(),
+        },
+    )
+
+
+def _validate_dataset_metadata(output_path: Path) -> None:
+    metadata_path = output_path / DATASET_METADATA_FILENAME
+    if not metadata_path.is_file():
+        raise ValueError(
+            "Cannot Resume WriteParquetCellTable because the existing output "
+            "uses the legacy global_cell_id encoding or has no dataset metadata. "
+            "Use Recovery Restart to reset the Window checkpoint and rebuild all "
+            "Parquet fragments with the current encoding."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot read WriteParquetCellTable dataset metadata {metadata_path}: {exc}"
+        ) from exc
+    if (
+        metadata.get("format") != "workflow-cell-table"
+        or metadata.get("schemaVersion") != 1
+        or not _has_current_id_encoding(metadata.get("id_encoding"))
+    ):
+        raise ValueError(
+            "Cannot Resume WriteParquetCellTable because its global_cell_id "
+            "encoding is incompatible with the current implementation. Use "
+            "Recovery Restart to rebuild every Parquet fragment consistently."
+        )
 
 
 def _block_output_paths(
@@ -204,35 +277,20 @@ def _extract_rows_from_mask(
     block_index: tuple[int, ...],
     numblocks: tuple[int, ...],
     tile_sizes: Mapping[str, int],
-    ordinal_bits: int,
 ) -> list[dict[str, Any]]:
     if mask_block.size == 0:
         return []
 
-    nonzero_coords = np.nonzero(mask_block > 0)
-    if len(nonzero_coords) == 0 or len(nonzero_coords[0]) == 0:
-        return []
+    # The former implementation materialized one int64 coordinate array per
+    # dimension for *every foreground voxel*, then duplicated all coordinates
+    # during lexsort.  A dense 3-D block could therefore need many times the
+    # mask size and glibc/PyArrow kept those arenas between Writer tasks.  Scan
+    # label bounding boxes once and allocate at most one label-sized boolean
+    # region at a time instead.
+    from scipy.ndimage import find_objects
 
-    labels = mask_block[nonzero_coords]
     spatial_indices = _spatial_axis_indices(axes)
     batch_indices = [idx for idx, axis in enumerate(axes) if axis not in SPATIAL_AXES]
-    key_arrays = [nonzero_coords[idx] for idx in batch_indices] + [labels]
-    order = np.lexsort(tuple(reversed(key_arrays))) if key_arrays else np.arange(labels.size)
-    sorted_labels = labels[order]
-    sorted_coords = [axis_coords[order] for axis_coords in nonzero_coords]
-
-    group_starts = [0]
-    for position in range(1, int(sorted_labels.size)):
-        changed = sorted_labels[position] != sorted_labels[position - 1]
-        if not changed:
-            for batch_axis in batch_indices:
-                if sorted_coords[batch_axis][position] != sorted_coords[batch_axis][position - 1]:
-                    changed = True
-                    break
-        if changed:
-            group_starts.append(position)
-    group_starts.append(int(sorted_labels.size))
-
     source_block_id = _flatten_block_index(block_index, numblocks)
     spatial_block = _spatial_values_from_tuple(block_index, axes)
     spatial_prefix = _spatial_block_prefix(block_index, numblocks, axes)
@@ -240,60 +298,139 @@ def _extract_rows_from_mask(
     cell_prefix = f"{non_spatial_prefix}_{spatial_prefix}" if non_spatial_prefix else spatial_prefix
     rows: list[dict[str, Any]] = []
 
-    for ordinal, (start, stop) in enumerate(zip(group_starts[:-1], group_starts[1:]), start=1):
-        label = int(sorted_labels[start])
-        local_id = _encode_local_id(source_block_id, ordinal, ordinal_bits=ordinal_bits)
+    batch_shape = tuple(int(mask_block.shape[index]) for index in batch_indices)
+    batch_coordinates = np.ndindex(batch_shape) if batch_shape else ((),)
+    ordinal = 0
+    view_axes = tuple(axis for axis in axes if axis in SPATIAL_AXES)
+    view_axis_by_name = {axis: index for index, axis in enumerate(view_axes)}
 
-        spatial_stats: dict[str, dict[str, int | float]] = {}
-        touches = False
-        for axis_name in SPATIAL_AXES:
-            axis_index = spatial_indices[axis_name]
-            if axis_index is None:
-                spatial_stats[axis_name] = {"min": 0, "max": 0, "centroid": 0.0}
+    for batch_coordinate in batch_coordinates:
+        selector: list[int | slice] = [slice(None)] * int(mask_block.ndim)
+        for axis_index, coordinate in zip(batch_indices, batch_coordinate):
+            selector[axis_index] = int(coordinate)
+        mask_view = np.asarray(mask_block[tuple(selector)])
+        encoded_labels = np.dtype(mask_view.dtype) == np.dtype("uint64")
+        local_mask_view = (
+            np.bitwise_and(mask_view, np.uint64(LOCAL_LABEL_MASK)).astype(
+                np.uint32,
+                copy=False,
+            )
+            if encoded_labels
+            else mask_view
+        )
+        max_label = int(local_mask_view.max()) if local_mask_view.size else 0
+        if max_label <= 0:
+            continue
+
+        for label, label_slices in enumerate(
+            find_objects(local_mask_view, max_label=max_label),
+            start=1,
+        ):
+            if label_slices is None:
                 continue
-            local_values = sorted_coords[axis_index][start:stop]
-            local_min = int(local_values.min())
-            local_max = int(local_values.max())
-            if local_min == 0 or local_max == int(mask_block.shape[axis_index]) - 1:
-                touches = True
-            axis_origin = int(origin[axis_index])
-            spatial_stats[axis_name] = {
-                "min": axis_origin + local_min,
-                "max": axis_origin + local_max,
-                "centroid": float(axis_origin + float(local_values.mean())),
-            }
+            label_region = local_mask_view[label_slices] == label
+            area = int(np.count_nonzero(label_region))
+            if area == 0:
+                continue
+            ordinal += 1
+            if encoded_labels:
+                encoded_region = mask_view[label_slices]
+                encoded_values = np.unique(encoded_region[label_region])
+                if encoded_values.size != 1:
+                    raise RuntimeError(
+                        "One block-local Cellpose ordinal maps to multiple provisional "
+                        f"global ids: {encoded_values.tolist()}."
+                    )
+                global_cell_id = int(encoded_values[0])
+                local_ordinal = int(label)
+            else:
+                global_cell_id = _encode_global_cell_id(
+                    source_block_id,
+                    ordinal,
+                )
+                local_ordinal = int(ordinal)
 
-        tile_z = int(spatial_stats["Z"]["centroid"]) // int(tile_sizes["Z"])
-        tile_y = int(spatial_stats["Y"]["centroid"]) // int(tile_sizes["Y"])
-        tile_x = int(spatial_stats["X"]["centroid"]) // int(tile_sizes["X"])
-        spatial_key = _encode_spatial_key(tile_z, tile_y, tile_x)
+            spatial_stats: dict[str, dict[str, int | float]] = {}
+            touches = False
+            for axis_name in SPATIAL_AXES:
+                original_axis_index = spatial_indices[axis_name]
+                view_axis_index = view_axis_by_name.get(axis_name)
+                if original_axis_index is None or view_axis_index is None:
+                    spatial_stats[axis_name] = {
+                        "min": 0,
+                        "max": 0,
+                        "centroid": 0.0,
+                    }
+                    continue
 
-        row = {
-            "global_cell_id": _encode_global_cell_id(spatial_key, local_id),
-            "cell_id_str": f"{cell_prefix}{label:0{CELL_LOCAL_ID_WIDTH}d}",
-            "spatial_key": spatial_key,
-            "source_block_id": source_block_id,
-            "block_z": spatial_block["Z"],
-            "block_y": spatial_block["Y"],
-            "block_x": spatial_block["X"],
-            "tile_z": tile_z,
-            "tile_y": tile_y,
-            "tile_x": tile_x,
-            "local_ordinal": ordinal,
-            "label": label,
-            "centroid_z": float(spatial_stats["Z"]["centroid"]),
-            "centroid_y": float(spatial_stats["Y"]["centroid"]),
-            "centroid_x": float(spatial_stats["X"]["centroid"]),
-            "bbox_z_min": int(spatial_stats["Z"]["min"]),
-            "bbox_z_max": int(spatial_stats["Z"]["max"]),
-            "bbox_y_min": int(spatial_stats["Y"]["min"]),
-            "bbox_y_max": int(spatial_stats["Y"]["max"]),
-            "bbox_x_min": int(spatial_stats["X"]["min"]),
-            "bbox_x_max": int(spatial_stats["X"]["max"]),
-            "area_or_volume": int(stop - start),
-            "touches_block_boundary": bool(touches),
-        }
-        rows.append(row)
+                label_slice = label_slices[view_axis_index]
+                local_min = int(label_slice.start or 0)
+                local_stop = int(label_slice.stop or local_min)
+                local_max = local_stop - 1
+                if local_min == 0 or local_stop == int(mask_view.shape[view_axis_index]):
+                    touches = True
+
+                reduction_axes = tuple(
+                    index
+                    for index in range(label_region.ndim)
+                    if index != view_axis_index
+                )
+                if reduction_axes:
+                    axis_counts = label_region.sum(
+                        axis=reduction_axes,
+                        dtype=np.int64,
+                    )
+                else:
+                    axis_counts = label_region.astype(np.int64, copy=False)
+                local_positions = np.arange(
+                    local_min,
+                    local_stop,
+                    dtype=np.float64,
+                )
+                local_centroid = float(
+                    np.dot(local_positions, axis_counts) / area
+                )
+                axis_origin = int(origin[original_axis_index])
+                spatial_stats[axis_name] = {
+                    "min": axis_origin + local_min,
+                    "max": axis_origin + local_max,
+                    "centroid": float(axis_origin + local_centroid),
+                }
+
+            tile_z = int(spatial_stats["Z"]["centroid"]) // int(tile_sizes["Z"])
+            tile_y = int(spatial_stats["Y"]["centroid"]) // int(tile_sizes["Y"])
+            tile_x = int(spatial_stats["X"]["centroid"]) // int(tile_sizes["X"])
+            spatial_key = _encode_spatial_key(tile_z, tile_y, tile_x)
+
+            rows.append({
+                "global_cell_id": global_cell_id,
+                "cell_id_str": (
+                    f"g{global_cell_id:016x}"
+                    if encoded_labels
+                    else f"{cell_prefix}{label:0{CELL_LOCAL_ID_WIDTH}d}"
+                ),
+                "spatial_key": spatial_key,
+                "source_block_id": source_block_id,
+                "block_z": spatial_block["Z"],
+                "block_y": spatial_block["Y"],
+                "block_x": spatial_block["X"],
+                "tile_z": tile_z,
+                "tile_y": tile_y,
+                "tile_x": tile_x,
+                "local_ordinal": local_ordinal,
+                "label": global_cell_id if encoded_labels else label,
+                "centroid_z": float(spatial_stats["Z"]["centroid"]),
+                "centroid_y": float(spatial_stats["Y"]["centroid"]),
+                "centroid_x": float(spatial_stats["X"]["centroid"]),
+                "bbox_z_min": int(spatial_stats["Z"]["min"]),
+                "bbox_z_max": int(spatial_stats["Z"]["max"]),
+                "bbox_y_min": int(spatial_stats["Y"]["min"]),
+                "bbox_y_max": int(spatial_stats["Y"]["max"]),
+                "bbox_x_min": int(spatial_stats["X"]["min"]),
+                "bbox_x_max": int(spatial_stats["X"]["max"]),
+                "area_or_volume": area,
+                "touches_block_boundary": bool(touches),
+            })
     return rows
 
 
@@ -305,7 +442,7 @@ def _write_json_atomic(path: Path, data: Mapping[str, Any]) -> None:
     tmp.replace(path)
 
 
-def write_cell_table_block(mask: np.ndarray, ctx=None) -> np.ndarray:
+def _write_cell_table_block_impl(mask: np.ndarray, ctx=None) -> np.ndarray:
     if ctx is None:
         raise RuntimeError("WriteParquetCellTable block requires a BlockContext.")
     resources = ctx.resources or {}
@@ -345,7 +482,6 @@ def write_cell_table_block(mask: np.ndarray, ctx=None) -> np.ndarray:
         block_index=tuple(int(x) for x in block_index),
         numblocks=tuple(int(x) for x in numblocks),
         tile_sizes=resources.get("tile_sizes"),
-        ordinal_bits=int(resources.get("ordinal_bits")),
     )
     if bool(resources.get("sort_by_spatial_key", True)):
         rows = sorted(rows, key=lambda row: (int(row["spatial_key"]), int(row["global_cell_id"])))
@@ -400,9 +536,8 @@ def write_cell_table_block(mask: np.ndarray, ctx=None) -> np.ndarray:
             "compression": resources.get("compression", "zstd"),
             "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "id_encoding": {
+                **_id_encoding_metadata(),
                 "spatial_key_bits": {"z": TILE_Z_BITS, "y": TILE_Y_BITS, "x": TILE_X_BITS},
-                "local_id_bits": LOCAL_ID_BITS,
-                "global_cell_id": "spatial_key << local_id_bits | local_id",
                 "cell_id_str": (
                     "zero-padded block indices in ZYX order followed by the "
                     f"{CELL_LOCAL_ID_WIDTH}-digit block-local mask label"
@@ -414,14 +549,345 @@ def write_cell_table_block(mask: np.ndarray, ctx=None) -> np.ndarray:
     return np.ones(ctx.output_chunk_shape or ((1,) * int(mask.ndim)), dtype=TOKEN_DTYPE)
 
 
+def write_cell_table_block(mask: np.ndarray, ctx=None) -> np.ndarray:
+    """Write one fragment and release large native temporary allocations."""
+
+    try:
+        return _write_cell_table_block_impl(mask, ctx)
+    finally:
+        # Arrow and NumPy may keep allocator arenas after the temporary table,
+        # coordinate projections, and compression buffers are destroyed.  The
+        # CPU process is intentionally reused for thousands of blocks,
+        # so return those pages before the next Zarr/Parquet task is scheduled.
+        try:
+            import pyarrow as pa
+
+            release_unused = getattr(pa.default_memory_pool(), "release_unused", None)
+            if callable(release_unused):
+                release_unused()
+        except Exception:
+            pass
+        # Do not force gc.collect() while Dask still owns the task arguments.
+        # A Worker lifecycle plugin performs another delayed trim after those
+        # input arrays have actually been released.
+        trim_process_allocator()
+
+
+def _write_parquet_rows_atomic(
+    parquet_path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    compression: str,
+    row_group_size: int,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = _parquet_schema(np.dtype("uint64"))
+    table = pa.Table.from_arrays(
+        [
+            pa.array([row.get(field.name) for row in rows], type=field.type)
+            for field in schema
+        ],
+        schema=schema,
+    )
+    tmp_path = parquet_path.with_name(f".{parquet_path.name}.stitching.tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    pq.write_table(
+        table,
+        tmp_path,
+        compression=compression,
+        row_group_size=int(row_group_size),
+        write_statistics=True,
+    )
+    tmp_path.replace(parquet_path)
+
+
+def _stitch_fragment_paths(
+    *,
+    output_dir: Path,
+    axes: tuple[str, ...],
+    numblocks: tuple[int, ...],
+    plan,
+) -> dict[Path, tuple[Path, tuple[int, ...]]]:
+    """Resolve every physical fragment touched by a stitch component."""
+
+    total_blocks = int(np.prod(numblocks, dtype=np.int64))
+    paths: dict[Path, tuple[Path, tuple[int, ...]]] = {}
+    involved_ids = set(int(value) for value in plan.aliases)
+    involved_ids.update(int(value) for value in plan.canonical)
+    for global_id in involved_ids:
+        source_block_id = int(global_id) >> LOCAL_ORDINAL_BITS
+        if source_block_id < 0 or source_block_id >= total_blocks:
+            raise ValueError(
+                f"Parquet stitch id {global_id} encodes invalid source block "
+                f"{source_block_id} for grid {numblocks!r}."
+            )
+        block_index = tuple(
+            int(value) for value in np.unravel_index(source_block_id, numblocks)
+        )
+        parquet_path, metadata_path = _block_output_paths(
+            str(output_dir),
+            axes,
+            block_index,
+            numblocks,
+        )
+        paths[parquet_path] = (metadata_path, block_index)
+    return paths
+
+
+def _restore_parquet_stitch_transaction(output_dir: Path) -> None:
+    """Roll back a partially committed Parquet stitch finalization."""
+
+    transaction_dir = output_dir / STITCH_TRANSACTION_DIRECTORY
+    if not transaction_dir.is_dir():
+        return
+    manifest_path = transaction_dir / STITCH_TRANSACTION_MANIFEST
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            "Cannot recover an interrupted Parquet label-stitch transaction: "
+            f"missing {manifest_path}."
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for relative_name in manifest.get("files", []):
+        relative_path = Path(str(relative_name))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise RuntimeError(
+                "Invalid path in Parquet label-stitch transaction manifest: "
+                f"{relative_name!r}."
+            )
+        backup = transaction_dir / "originals" / relative_path
+        destination = output_dir / relative_path
+        if not backup.is_file():
+            raise RuntimeError(
+                "Cannot recover an interrupted Parquet label-stitch transaction: "
+                f"missing backup {backup}."
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.restoring.tmp")
+        shutil.copy2(backup, temporary)
+        temporary.replace(destination)
+    shutil.rmtree(transaction_dir)
+
+
+def _prepare_parquet_stitch_transaction(
+    output_dir: Path,
+    paths: Mapping[Path, tuple[Path, tuple[int, ...]]],
+    *,
+    namespace: str,
+) -> Path:
+    """Durably snapshot affected fragments before any in-place rewrite."""
+
+    transaction_dir = output_dir / STITCH_TRANSACTION_DIRECTORY
+    preparing_dir = output_dir / STITCH_TRANSACTION_PREPARING_DIRECTORY
+    if transaction_dir.exists():
+        raise RuntimeError(
+            f"Parquet label-stitch transaction already exists: {transaction_dir}."
+        )
+    if preparing_dir.exists():
+        shutil.rmtree(preparing_dir)
+    originals_dir = preparing_dir / "originals"
+    copied: list[str] = []
+    for parquet_path, (metadata_path, _) in sorted(paths.items(), key=lambda item: str(item[0])):
+        if not parquet_path.is_file():
+            raise FileNotFoundError(
+                "Cannot finalize the stitched cell table because a source fragment "
+                f"is missing: {parquet_path}"
+            )
+        for source in (parquet_path, metadata_path):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(output_dir)
+            backup = originals_dir / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, backup)
+            copied.append(relative.as_posix())
+    _write_json_atomic(
+        preparing_dir / STITCH_TRANSACTION_MANIFEST,
+        {
+            "version": 1,
+            "namespace": str(namespace),
+            "files": copied,
+        },
+    )
+    preparing_dir.replace(transaction_dir)
+    return transaction_dir
+
+
+def _finalize_stitched_parquet(
+    *,
+    output_dir: Path,
+    axes: tuple[str, ...],
+    numblocks: tuple[int, ...],
+    tile_sizes: Mapping[str, int],
+    compression: str,
+    row_group_size: int,
+    plan,
+) -> dict[str, int]:
+    """Merge only Parquet fragments touched by cross-block equivalences."""
+
+    import pyarrow.parquet as pq
+
+    mapping = plan.mapping()
+    components: dict[int, set[int]] = {}
+    for alias, canonical in mapping.items():
+        components.setdefault(int(canonical), {int(canonical)}).add(int(alias))
+    if not components:
+        return {"component_count": 0, "merged_row_count": 0, "rewritten_fragment_count": 0}
+
+    total_blocks = int(np.prod(numblocks, dtype=np.int64))
+
+    def fragment_for_id(global_id: int) -> tuple[Path, Path, tuple[int, ...]]:
+        source_block_id = int(global_id) >> LOCAL_ORDINAL_BITS
+        if source_block_id < 0 or source_block_id >= total_blocks:
+            raise ValueError(
+                f"Parquet stitch id {global_id} encodes invalid source block "
+                f"{source_block_id} for grid {numblocks!r}."
+            )
+        block_index = tuple(
+            int(value) for value in np.unravel_index(source_block_id, numblocks)
+        )
+        parquet_path, metadata_path = _block_output_paths(
+            str(output_dir),
+            axes,
+            block_index,
+            numblocks,
+        )
+        return parquet_path, metadata_path, block_index
+
+    paths = _stitch_fragment_paths(
+        output_dir=output_dir,
+        axes=axes,
+        numblocks=numblocks,
+        plan=plan,
+    )
+
+    rows_by_path: dict[Path, list[dict[str, Any]]] = {}
+    row_location: dict[int, tuple[Path, dict[str, Any]]] = {}
+    for parquet_path in sorted(paths, key=str):
+        if not parquet_path.is_file():
+            raise FileNotFoundError(
+                "Cannot finalize the stitched cell table because a source fragment "
+                f"is missing: {parquet_path}"
+            )
+        # Read the physical file directly.  ``pq.read_table`` interprets the
+        # block_z=... parent directories as Hive partitions and then conflicts
+        # with the explicit uint32 block_z column stored in the fragment.
+        rows = pq.ParquetFile(parquet_path).read().to_pylist()
+        rows_by_path[parquet_path] = rows
+        for row in rows:
+            global_id = int(row["global_cell_id"])
+            if global_id in mapping or global_id in components:
+                row_location[global_id] = (parquet_path, row)
+
+    affected_ids = {
+        member for members in components.values() for member in members
+    }
+    for parquet_path, rows in rows_by_path.items():
+        rows_by_path[parquet_path] = [
+            row for row in rows if int(row["global_cell_id"]) not in affected_ids
+        ]
+
+    merged_row_count = 0
+    for canonical, members in sorted(components.items()):
+        member_rows = [
+            row_location[member][1]
+            for member in sorted(members)
+            if member in row_location
+        ]
+        if not member_rows:
+            continue
+        owner_path, _, owner_block_index = fragment_for_id(canonical)
+        base = dict(row_location.get(canonical, (owner_path, member_rows[0]))[1])
+        total_area = sum(int(row["area_or_volume"]) for row in member_rows)
+        if total_area <= 0:
+            continue
+
+        for axis_name in SPATIAL_AXES:
+            lower = axis_name.lower()
+            base[f"bbox_{lower}_min"] = min(
+                int(row[f"bbox_{lower}_min"]) for row in member_rows
+            )
+            base[f"bbox_{lower}_max"] = max(
+                int(row[f"bbox_{lower}_max"]) for row in member_rows
+            )
+            base[f"centroid_{lower}"] = float(
+                sum(
+                    float(row[f"centroid_{lower}"]) * int(row["area_or_volume"])
+                    for row in member_rows
+                )
+                / total_area
+            )
+
+        source_block_id = int(canonical) >> LOCAL_ORDINAL_BITS
+        local_ordinal = int(canonical) & ((1 << LOCAL_ORDINAL_BITS) - 1)
+        spatial_block = _spatial_values_from_tuple(owner_block_index, axes)
+        tile_z = int(base["centroid_z"]) // int(tile_sizes["Z"])
+        tile_y = int(base["centroid_y"]) // int(tile_sizes["Y"])
+        tile_x = int(base["centroid_x"]) // int(tile_sizes["X"])
+        base.update(
+            {
+                "global_cell_id": int(canonical),
+                "cell_id_str": f"g{int(canonical):016x}",
+                "spatial_key": _encode_spatial_key(tile_z, tile_y, tile_x),
+                "source_block_id": source_block_id,
+                "block_z": spatial_block["Z"],
+                "block_y": spatial_block["Y"],
+                "block_x": spatial_block["X"],
+                "tile_z": tile_z,
+                "tile_y": tile_y,
+                "tile_x": tile_x,
+                "local_ordinal": local_ordinal,
+                "label": int(canonical),
+                "area_or_volume": total_area,
+                # Conservatively retain the flag when any fragment also touches
+                # a boundary for which no match may have been accepted.
+                "touches_block_boundary": any(
+                    bool(row["touches_block_boundary"]) for row in member_rows
+                ),
+            }
+        )
+        rows_by_path.setdefault(owner_path, []).append(base)
+        merged_row_count += len(member_rows) - 1
+
+    for parquet_path, rows in rows_by_path.items():
+        rows.sort(key=lambda row: (int(row["spatial_key"]), int(row["global_cell_id"])))
+        _write_parquet_rows_atomic(
+            parquet_path,
+            rows,
+            compression=compression,
+            row_group_size=row_group_size,
+        )
+        metadata_path, _ = paths[parquet_path]
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            spatial_keys = [int(row["spatial_key"]) for row in rows]
+            metadata["row_count"] = len(rows)
+            metadata["spatial_key_min"] = min(spatial_keys) if spatial_keys else None
+            metadata["spatial_key_max"] = max(spatial_keys) if spatial_keys else None
+            metadata["label_stitching"] = {
+                "version": 1,
+                "status": "complete",
+                "namespace": plan.namespace,
+            }
+            _write_json_atomic(metadata_path, metadata)
+
+    return {
+        "component_count": len(components),
+        "merged_row_count": int(merged_row_count),
+        "rewritten_fragment_count": len(rows_by_path),
+    }
+
+
 @register_node("WriteParquetCellTable")
 class WriteParquetCellTable(BaseMapBlocksNode):
     """Write one Parquet cell-table fragment for each mask block."""
 
     CATEGORY = "WorkFlow/IO"
     DISPLAY_NAME = "Write Parquet Cell Table"
-    EXECUTION_RESOURCE = "cpu"
-    EXECUTION_WORKERS = 6
+    required_worker_profile = "CPU"
+    POSTPROCESS_PRIORITY = 200
     OUTPUT_NODE = True
     OUTPUT_PATH_INPUT = "output_dir"
     CHUNK_POLICY = {"mode": "rechunk_to_primary"}
@@ -462,6 +928,7 @@ class WriteParquetCellTable(BaseMapBlocksNode):
                 "overwrite": ("BOOLEAN", {"default": True}),
                 "write_block_metadata": ("BOOLEAN", {"default": True}),
                 "sort_by_spatial_key": ("BOOLEAN", {"default": True}),
+                "stitch_labels": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -499,13 +966,20 @@ class WriteParquetCellTable(BaseMapBlocksNode):
                     "Cannot resume WriteParquetCellTable because the output target "
                     f"is not a directory: {output_path}"
                 )
+            _validate_dataset_metadata(output_path)
         else:
-            if output_path.exists() and bool(params.get("overwrite", True)):
+            if output_path.exists():
+                if not bool(params.get("overwrite", True)):
+                    raise FileExistsError(
+                        "WriteParquetCellTable output directory already exists and "
+                        f"overwrite is disabled: {output_path}"
+                    )
                 shutil.rmtree(output_path)
             output_path.mkdir(parents=True, exist_ok=True)
+            _write_dataset_metadata(output_path)
 
         total_blocks = int(np.prod(tuple(int(x) for x in mask.numblocks), dtype=np.int64)) if mask.numblocks else 1
-        _, ordinal_bits = _local_id_config(total_blocks)
+        _validate_source_block_capacity(total_blocks)
         compression = str(params.get("compression") or "zstd").strip().lower()
         if compression not in {"zstd", "snappy"}:
             raise ValueError(f"compression must be 'zstd' or 'snappy', got {compression!r}.")
@@ -519,6 +993,7 @@ class WriteParquetCellTable(BaseMapBlocksNode):
             )
         if "Y" not in axes or "X" not in axes:
             raise ValueError(f"WriteParquetCellTable requires Y and X axes, got {axes!r}.")
+        stitch_metadata = get_label_stitch_metadata(mask)
 
         return {
             "axes": axes,
@@ -534,5 +1009,95 @@ class WriteParquetCellTable(BaseMapBlocksNode):
             "write_block_metadata": bool(params.get("write_block_metadata", True)),
             "sort_by_spatial_key": bool(params.get("sort_by_spatial_key", True)),
             "numblocks": tuple(int(x) for x in mask.numblocks),
-            "ordinal_bits": ordinal_bits,
+            "stitch_metadata": stitch_metadata,
+            "stitch_labels": bool(params.get("stitch_labels", True)),
         }
+
+    def postprocess(self, outputs=None, state=None, runtime=None, **kwargs):
+        del kwargs
+        state = dict(state or {})
+        runtime = dict(runtime or {})
+        metadata = state.get("stitch_metadata")
+        if not state.get("stitch_labels", True) or not isinstance(metadata, dict):
+            return outputs
+
+        namespace = str(metadata.get("namespace") or "")
+        execution_id = str(runtime.get("execution_id") or "")
+        if not namespace or not execution_id:
+            raise RuntimeError(
+                "Parquet label stitching requires an execution id and Cellpose label namespace."
+            )
+        plan = get_registered_label_stitch_plan(execution_id, namespace)
+        if plan is None:
+            raise RuntimeError(
+                "WriteParquetCellTable cannot finalize cross-block Cellpose labels "
+                "without a ZarrWriter connected to the same Cellpose mask. Add a "
+                "terminal ZarrWriter or disable stitch_labels explicitly."
+            )
+
+        output_dir = Path(str(state["output_dir"]))
+        dataset_metadata_path = output_dir / DATASET_METADATA_FILENAME
+        dataset_metadata = json.loads(
+            dataset_metadata_path.read_text(encoding="utf-8")
+        )
+        completed = dataset_metadata.get("label_stitching")
+        transaction_dir = output_dir / STITCH_TRANSACTION_DIRECTORY
+        if (
+            isinstance(completed, Mapping)
+            and completed.get("status") == "complete"
+            and completed.get("namespace") == namespace
+        ):
+            if transaction_dir.exists():
+                shutil.rmtree(transaction_dir)
+            return outputs
+
+        # Parquet consists of many files, so replacing every affected fragment
+        # cannot be atomic as one filesystem operation.  Restore any interrupted
+        # attempt, snapshot all pristine fragments, then keep that snapshot until
+        # the dataset-level completion marker has been committed.
+        _restore_parquet_stitch_transaction(output_dir)
+        axes = tuple(str(value).upper() for value in state["axes"])
+        numblocks = tuple(int(value) for value in state["numblocks"])
+        paths = _stitch_fragment_paths(
+            output_dir=output_dir,
+            axes=axes,
+            numblocks=numblocks,
+            plan=plan,
+        )
+        if paths:
+            transaction_dir = _prepare_parquet_stitch_transaction(
+                output_dir,
+                paths,
+                namespace=namespace,
+            )
+        summary = _finalize_stitched_parquet(
+            output_dir=output_dir,
+            axes=axes,
+            numblocks=numblocks,
+            tile_sizes=dict(state["tile_sizes"]),
+            compression=str(state["compression"]),
+            row_group_size=int(state["row_group_size"]),
+            plan=plan,
+        )
+        dataset_metadata = json.loads(
+            dataset_metadata_path.read_text(encoding="utf-8")
+        )
+        dataset_metadata["label_stitching"] = {
+            "version": 1,
+            "status": "complete",
+            "namespace": namespace,
+            "component_count": int(summary["component_count"]),
+            "merged_row_count": int(summary["merged_row_count"]),
+            "rewritten_fragment_count": int(summary["rewritten_fragment_count"]),
+        }
+        _write_json_atomic(dataset_metadata_path, dataset_metadata)
+        if transaction_dir.exists():
+            shutil.rmtree(transaction_dir)
+        logger.info(
+            "[WriteParquetCellTable] label stitching complete: components=%s, "
+            "merged_rows=%s, rewritten_fragments=%s",
+            summary["component_count"],
+            summary["merged_row_count"],
+            summary["rewritten_fragment_count"],
+        )
+        return outputs

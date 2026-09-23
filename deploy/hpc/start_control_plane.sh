@@ -20,10 +20,10 @@ if [[ -z "${WORKFLOW_RUNTIME_DIR:-}" ]]; then
 fi
 
 PYTHON="$WORKFLOW_ROOT/backend/.venv/bin/python"
-EXECUTION_SCRIPT="${WorkFlow_SLURM_EXECUTION_SCRIPT:-$WORKFLOW_ROOT/deploy/hpc/slurm/workflow_workers.sbatch}"
 WEB_PORT="${WORKFLOW_WEB_PORT:-8000}"
 SCHEDULER_HOST="${WorkFlow_DASK_SCHEDULER_HOST:-}"
 SCHEDULER_PORT="${WorkFlow_DASK_SCHEDULER_PORT:-8786}"
+DASHBOARD_ADDRESS="${WorkFlow_DASK_DASHBOARD_ADDRESS:-127.0.0.1:8787}"
 WORKER_PORT_RANGE="${WorkFlow_DASK_WORKER_PORT_RANGE:-20000:20999}"
 NANNY_PORT_RANGE="${WorkFlow_DASK_NANNY_PORT_RANGE:-21000:21999}"
 SLURM_MAX_NODES="${WorkFlow_SLURM_MAX_NODES:-8}"
@@ -38,10 +38,6 @@ esac
 case "$WORKFLOW_RUNTIME_DIR" in
   /*) ;;
   *) echo "WORKFLOW_RUNTIME_DIR must be an absolute path." >&2; exit 2 ;;
-esac
-case "$EXECUTION_SCRIPT" in
-  /*) ;;
-  *) echo "WorkFlow_SLURM_EXECUTION_SCRIPT must be an absolute path." >&2; exit 2 ;;
 esac
 if [[ ! "$WEB_PORT" =~ ^[0-9]+$ ]] || (( WEB_PORT < 1 || WEB_PORT > 65535 )); then
   echo "WORKFLOW_WEB_PORT must be an integer between 1 and 65535." >&2
@@ -64,6 +60,19 @@ if [[ ! "$SCHEDULER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
 fi
 if [[ ! "$SCHEDULER_PORT" =~ ^[0-9]+$ ]] || (( SCHEDULER_PORT < 1 || SCHEDULER_PORT > 65535 )); then
   echo "WorkFlow_DASK_SCHEDULER_PORT must be an integer between 1 and 65535." >&2
+  exit 2
+fi
+if [[ ! "$DASHBOARD_ADDRESS" =~ ^127\.0\.0\.1:([0-9]+)$ ]]; then
+  echo "WorkFlow_DASK_DASHBOARD_ADDRESS must use 127.0.0.1:PORT." >&2
+  exit 2
+fi
+DASHBOARD_PORT="${BASH_REMATCH[1]}"
+if (( DASHBOARD_PORT < 1024 || DASHBOARD_PORT > 65535 )); then
+  echo "WorkFlow_DASK_DASHBOARD_ADDRESS must use an unprivileged valid port." >&2
+  exit 2
+fi
+if (( DASHBOARD_PORT == WEB_PORT || DASHBOARD_PORT == SCHEDULER_PORT )); then
+  echo "Dashboard, web and Scheduler ports must be different." >&2
   exit 2
 fi
 resource_settings=(
@@ -121,6 +130,11 @@ for reserved_port in "$WEB_PORT" "$SCHEDULER_PORT"; do
     exit 2
   fi
 done
+if (( (DASHBOARD_PORT >= WORKER_PORT_MIN && DASHBOARD_PORT <= WORKER_PORT_MAX) ||
+      (DASHBOARD_PORT >= NANNY_PORT_MIN && DASHBOARD_PORT <= NANNY_PORT_MAX) )); then
+  echo "Dashboard port must not fall inside a Worker or Nanny port range." >&2
+  exit 2
+fi
 
 TLS_CA="${WorkFlow_DASK_TLS_CA:-}"
 TLS_CERT="${WorkFlow_DASK_TLS_CERT:-}"
@@ -155,24 +169,15 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "Run deploy/hpc/install.sh first." >&2
   exit 1
 fi
-if [[ ! -f "$EXECUTION_SCRIPT" ]]; then
-  echo "Missing Slurm execution script: $EXECUTION_SCRIPT" >&2
-  exit 1
-fi
-case "$EXECUTION_SCRIPT" in
-  */workflow_execution.sbatch)
-    echo "workflow_execution.sbatch is the removed compute-node Driver entrypoint." >&2
-    echo "Use deploy/hpc/slurm/workflow_workers.sbatch so only Workers run on compute nodes." >&2
-    exit 2
-    ;;
-esac
 SBATCH_COMMAND="${WorkFlow_SLURM_SBATCH:-sbatch}"
 SQUEUE_COMMAND="${WorkFlow_SLURM_SQUEUE:-squeue}"
+SINFO_COMMAND="${WorkFlow_SLURM_SINFO:-sinfo}"
 SCONTROL_COMMAND="${WorkFlow_SLURM_SCONTROL:-scontrol}"
 SCANCEL_COMMAND="${WorkFlow_SLURM_SCANCEL:-scancel}"
 for command_name in \
   "$SBATCH_COMMAND" \
   "$SQUEUE_COMMAND" \
+  "$SINFO_COMMAND" \
   "$SCONTROL_COMMAND" \
   "$SCANCEL_COMMAND"; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -183,6 +188,7 @@ for command_name in \
 done
 SBATCH_COMMAND="$(command -v "$SBATCH_COMMAND")"
 SQUEUE_COMMAND="$(command -v "$SQUEUE_COMMAND")"
+SINFO_COMMAND="$(command -v "$SINFO_COMMAND")"
 SCONTROL_COMMAND="$(command -v "$SCONTROL_COMMAND")"
 SCANCEL_COMMAND="$(command -v "$SCANCEL_COMMAND")"
 if [[ -v WorkFlow_SLURM_SACCT && -z "$WorkFlow_SLURM_SACCT" ]]; then
@@ -202,7 +208,6 @@ fi
 mkdir -p \
   "$WORKFLOW_RUNTIME_DIR/logs" \
   "$WORKFLOW_RUNTIME_DIR/state" \
-  "$WORKFLOW_RUNTIME_DIR/requests" \
   "$WORKFLOW_RUNTIME_DIR/jobs" \
   "$WORKFLOW_RUNTIME_DIR/models" \
   "$WORKFLOW_RUNTIME_DIR/output" \
@@ -214,15 +219,16 @@ mkdir -p \
 # Slurm and never run in this service process.
 export PYTHONPATH="$WORKFLOW_ROOT/backend"
 export WorkFlow_EXECUTION_BACKEND="slurm"
-export WorkFlow_SLURM_EXECUTION_SCRIPT="$EXECUTION_SCRIPT"
 export WorkFlow_SLURM_RUNTIME_DIR="$WORKFLOW_RUNTIME_DIR"
 export WorkFlow_SLURM_SBATCH="$SBATCH_COMMAND"
 export WorkFlow_SLURM_SQUEUE="$SQUEUE_COMMAND"
+export WorkFlow_SLURM_SINFO="$SINFO_COMMAND"
 export WorkFlow_SLURM_SACCT="$SACCT_COMMAND"
 export WorkFlow_SLURM_SCONTROL="$SCONTROL_COMMAND"
 export WorkFlow_SLURM_SCANCEL="$SCANCEL_COMMAND"
 export WorkFlow_DASK_SCHEDULER_HOST="$SCHEDULER_HOST"
 export WorkFlow_DASK_SCHEDULER_PORT="$SCHEDULER_PORT"
+export WorkFlow_DASK_DASHBOARD_ADDRESS="$DASHBOARD_ADDRESS"
 export WorkFlow_DASK_WORKER_PORT_RANGE="$WORKER_PORT_RANGE"
 export WorkFlow_DASK_NANNY_PORT_RANGE="$NANNY_PORT_RANGE"
 export WorkFlow_DASK_ALLOW_INSECURE_CLUSTER="$ALLOW_INSECURE_CLUSTER"
@@ -237,6 +243,11 @@ export WorkFlow_MODELS_DIR="$WORKFLOW_RUNTIME_DIR/models"
 export CELLPOSE_LOCAL_MODELS_PATH="$WORKFLOW_RUNTIME_DIR/models/cellpose"
 export WorkFlow_CUDA_MODE="disabled"
 export CUDA_VISIBLE_DEVICES=""
+# The on-demand SLURMCluster Scheduler lives inside this long-running process.
+# Bound glibc arena proliferation and aggressively return pages released after
+# Window graph materialization.  Operators can still override either value.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-0}"
 
 printf '%s\n' \
   "Starting the WorkFlow control plane" \
@@ -244,15 +255,19 @@ printf '%s\n' \
   "runtime=$WORKFLOW_RUNTIME_DIR" \
   "listen=http://127.0.0.1:$WEB_PORT" \
   "execution_backend=slurm" \
-  "execution_script=$EXECUTION_SCRIPT" \
+  "worker_command=dask_jobqueue.SLURMJob" \
   "driver=service-node-process" \
   "scheduler=on-demand:$SCHEDULER_HOST:$SCHEDULER_PORT" \
-  "workers=slurm-compute-nodes" \
+  "dashboard=on-demand-loopback:http://$DASHBOARD_ADDRESS/status" \
+  "cluster_manager=dask_jobqueue.SLURMCluster" \
+  "workers=slurm-nodes-discovered-by-sinfo-and-scontrol" \
+  "worker_network=per-node-route-selected-ipv4" \
   "worker_ports=$WORKER_PORT_RANGE" \
   "nanny_ports=$NANNY_PORT_RANGE" \
   "slurm_node_envelope=max_nodes:$SLURM_MAX_NODES,cpus:$SLURM_CPUS_PER_NODE,gpus:$SLURM_GPUS_PER_NODE,memory_gib:$SLURM_MEMORY_GIB_PER_NODE" \
   "dask_tls_files=$([[ -n "$TLS_CA" ]] && printf configured || printf absent-explicitly-allowed)" \
-  "slurm_commands=sbatch:$SBATCH_COMMAND,squeue:$SQUEUE_COMMAND,sacct:${SACCT_COMMAND:-unavailable},scontrol:$SCONTROL_COMMAND,scancel:$SCANCEL_COMMAND"
+  "slurm_partitions=${WorkFlow_SLURM_PARTITION:-${WorkFlow_SLURM_ALLOWED_PARTITIONS:-auto}},excluded:${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn,control}" \
+  "slurm_commands=sbatch:$SBATCH_COMMAND,squeue:$SQUEUE_COMMAND,sacct:${SACCT_COMMAND:-unavailable},sinfo:$SINFO_COMMAND,scontrol:$SCONTROL_COMMAND,scancel:$SCANCEL_COMMAND"
 
 cd "$WORKFLOW_ROOT/backend"
 exec "$PYTHON" -m uvicorn main:app \

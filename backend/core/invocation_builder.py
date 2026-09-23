@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
-from core.execution_resources import resolve_execution_resource
+from core.worker_profiles import resolve_worker_profile
 from core.node_invocation import NodeInvocation, NodeRuntime
 from core.type_system import is_dask_array_type, validate_port_type
 
@@ -131,7 +131,7 @@ def build_node_invocation(
             execution_id=execution_id,
             is_preflight=bool(is_preflight),
             is_resuming=bool(is_resuming),
-            execution_resource=resolve_execution_resource(node_cls),
+            worker_profile=resolve_worker_profile(node_cls),
         ),
         input_defs=input_defs,
         inputs=dict(prepared_inputs),

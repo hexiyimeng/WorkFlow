@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import itertools
 import logging
 import math
@@ -11,17 +10,27 @@ from typing import Any
 import numpy as np
 
 from core.model_registry import get_provider_model_dir, list_models
+from core.label_stitching import (
+    attach_label_stitch_metadata,
+    encode_provisional_labels,
+)
 from core.registry import register_node
 from nodes.base import BaseMapOverlapNode
 
 
 logger = logging.getLogger("WorkFlow.Cellpose")
 
-# Cellpose 4.x scales Y/X relative to the model's nominal training diameter.
+# Cellpose scales Y/X relative to the model's nominal training diameter.
 # Keep this diagnostic constant local to the integration rather than importing
 # Cellpose during graph construction (which must remain lightweight and must
 # not initialize CUDA on the Driver).
 CELLPOSE_TRAINING_DIAMETER = 30.0
+INCOMPATIBLE_CPSAM_MODEL_NAMES = {
+    "cyto3",
+    "cpsam_v2",
+    "cpdino",
+    "cpdino-vitb",
+}
 
 
 def create_cellpose_model(model_ref: str, device: str):
@@ -60,24 +69,14 @@ def create_cellpose_model(model_ref: str, device: str):
         "device": device_obj,
     }
 
-    ref = str(model_ref)
-    if Path(ref).exists():
-        kwargs["pretrained_model"] = ref
-    else:
-        try:
-            signature = inspect.signature(models.CellposeModel)
-        except (TypeError, ValueError):
-            signature = None
-        parameters = signature.parameters if signature is not None else {}
-        if "model_type" in parameters:
-            kwargs["model_type"] = ref
-        else:
-            kwargs["pretrained_model"] = ref
+    kwargs["pretrained_model"] = str(model_ref)
 
     return models.CellposeModel(**kwargs)
 
 
 def validate_cellpose_model(model_ref: str, requested_name: str) -> None:
+    if str(model_ref) == "cpsam" and str(requested_name) == "cpsam":
+        return
     if not Path(model_ref).exists():
         configured_directory = get_provider_model_dir("cellpose")
         raise FileNotFoundError(
@@ -109,6 +108,10 @@ def cellpose_block(
         )
 
     model_name = str(model_name or "").strip()
+    if model_name == "cyto3":
+        # Existing workflows created before the Cellpose 4 migration stored
+        # cyto3. They now execute with the requested CPSAM model.
+        model_name = "cpsam"
     if not model_name:
         raise ValueError(
             "Cellpose requires a model selected from the configured shared "
@@ -227,9 +230,7 @@ def cellpose_block(
             "bsize": 256,
             "tile_overlap": 0.1,
             # An explicit diameter makes Cellpose rescale Y/X before inference.
-            # Cellpose 4.x only restores diameter-scaled flows/masks to the
-            # caller's shape when resample=True.  Keep the cheaper path when no
-            # diameter scaling was requested.
+            # Restore diameter-scaled masks to the caller's original shape.
             "resample": explicit_diameter > 0,
             "normalize": bool(normalize),
             "flow_threshold": float(flow_threshold),
@@ -313,12 +314,26 @@ def cellpose_block(
     return output.astype(np.uint32, copy=False)
 
 
+def encode_cellpose_output_block(
+    mask: np.ndarray,
+    *,
+    axes: tuple[str, ...],
+    block_info=None,
+) -> np.ndarray:
+    """Give every block-local Cellpose object a collision-free provisional ID."""
+
+    return encode_provisional_labels(
+        np.asarray(mask),
+        axes=tuple(axes),
+        block_info=block_info,
+    )
+
+
 @register_node("Cellpose")
 class Cellpose(BaseMapOverlapNode):
     CATEGORY = "WorkFlow/Segmentation"
     DISPLAY_NAME = "Cellpose"
-    EXECUTION_RESOURCE = "gpu"
-    EXECUTION_WORKERS = 1
+    required_worker_profile = "GPU"
 
     MAP_INPUTS = ["image"]
     PRIMARY_INPUT = "image"
@@ -344,6 +359,52 @@ class Cellpose(BaseMapOverlapNode):
         "chunks": "same_as_primary",
         "enforce_ndim": True,
     }
+
+    def execute(self, **kwargs):
+        """Build Cellpose lazily, then encode local labels before fan-out to Writers.
+
+        Cellpose numbers every independently inferred block from one.  Passing
+        those values directly to multiple Writers makes equal integers in two
+        blocks look like the same object while a real cross-boundary object can
+        have two different integers.  The uint64 encoding is only a provisional
+        identity; terminal Writers reconcile matching boundary objects after
+        every Window has completed.
+        """
+
+        import dask.array as da
+
+        invocation = self.get_invocation(kwargs)
+        (local_masks,) = super().execute(**kwargs)
+        input_axes = tuple(
+            str(axis).upper()
+            for axis in ((self._axes_by_name or {}).get(self.PRIMARY_INPUT) or ())
+        )
+        output_axes = tuple(axis for axis in input_axes if axis != "C")
+        encoded = da.map_blocks(
+            encode_cellpose_output_block,
+            local_masks,
+            axes=output_axes,
+            dtype=np.uint64,
+            meta=np.array((), dtype=np.uint64),
+            name=f"{self.make_task_name(invocation.runtime)}-global-labels",
+        )
+        # The namespace deliberately excludes execution_id.  A Recovery Resume
+        # receives a fresh frontend execution id but continues writing the same
+        # deterministic block/local ids from the immutable saved graph.  Using
+        # the transient execution id here would make a persisted stitch plan
+        # unusable after an interrupted finalization.
+        namespace = f"cellpose:{invocation.runtime.node_id or 'cellpose'}:v1"
+        attach_label_stitch_metadata(
+            encoded,
+            {
+                "version": 1,
+                "namespace": namespace,
+                "axes": output_axes,
+                "encoding": "source-block-uint32-local-ordinal-uint32",
+            },
+        )
+        self.assert_lazy_collection(encoded)
+        return (encoded,)
 
     def preprocess(self, dask_arr=None, params=None, runtime=None):
         """Log one graph-level estimate of the largest model input block."""
@@ -462,7 +523,16 @@ class Cellpose(BaseMapOverlapNode):
 
     @classmethod
     def INPUT_TYPES(cls):
-        model_names = list_models("cellpose")
+        installed_models = list_models("cellpose")
+        model_names = [
+            "cpsam",
+            *(
+                name
+                for name in installed_models
+                if name != "cpsam"
+                and name.lower() not in INCOMPATIBLE_CPSAM_MODEL_NAMES
+            ),
+        ]
         return {
             "required": {
                 "image": ("DASK_ARRAY[any]",),
@@ -470,7 +540,7 @@ class Cellpose(BaseMapOverlapNode):
                 "secondary_channel": ("INT", {"default": -1, "min": -1, "max": 255}),
                 "model_name": (
                     model_names,
-                    {"default": model_names[0] if model_names else ""},
+                    {"default": "cpsam"},
                 ),
                 "diameter": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 500.0}),
                 "flow_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0}),
@@ -481,5 +551,5 @@ class Cellpose(BaseMapOverlapNode):
             },
         }
 
-    RETURN_TYPES = ("DASK_ARRAY[uint32]",)
+    RETURN_TYPES = ("DASK_ARRAY[uint64]",)
     RETURN_NAMES = ("mask",)

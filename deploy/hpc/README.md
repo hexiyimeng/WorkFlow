@@ -12,9 +12,9 @@ WorkFlow 在 HPC 上分成“服务进程”和“按工作流申请的计算资
   ├─ workflow Driver：在一次执行期间运行
   └─ Dask Scheduler：有工作流时按需启动，执行结束立即关闭
        ↓ TCP/TLS（集群内网）
-Slurm allocation（由当前 Graph 的 resourcePlan 动态决定）
-  ├─ compute node 0：一个 Worker agent → CPU/GPU Nannies/Workers
-  ├─ compute node 1：一个 Worker agent → CPU/GPU Nannies/Workers
+Slurm Pool jobs（由 Resource Planner 的具体计划决定）
+  ├─ compute node 0：dask-jobqueue SLURMJob → Dask Nannies/Workers
+  ├─ compute node 1：dask-jobqueue SLURMJob → Dask Nannies/Workers
   └─ ...
 ```
 
@@ -24,15 +24,23 @@ Slurm allocation（由当前 Graph 的 resourcePlan 动态决定）
 
 ## Slurm 怎样申请一个或多个 CN
 
-后端只分析当前 terminal outputs 可达的 Graph 节点。节点类通过 `EXECUTION_RESOURCE` 和 `EXECUTION_WORKERS` 声明 CPU/GPU Worker 需求。资源策略把全图 Worker 总数装箱到最少的可行节点数：
+后端只分析当前 terminal outputs 可达的 Graph 节点。节点类声明 `required_worker_profile`，分析结果只包含 `requiredWorkerProfiles`，不再把节点数量解释成 Worker 数量，也不再从固定 CPU/GPU Worker 配置猜测 CPU、GPU 或内存。
 
-1. 先尝试一个 CN。
-2. 如果该节点的 GPU、CPU 或内存容量装不下，就依次尝试 2、3……个 CN。
-3. 节点数不能超过 `WorkFlow_SLURM_MAX_NODES`，每个节点不能超过配置的 per-node envelope。
-4. 找到布局后，提交一个包含 N 个节点的 Slurm allocation。
-5. `srun --ntasks-per-node=1` 在每个已分配 CN 上启动一个 Worker agent；agent 按持久化布局启动该节点应有的 CPU/GPU Workers。
+Worker 类型只有 `CPU` 和 `GPU`。读取、写入和普通计算节点共用 CPU 池，GPU 节点共用 GPU 池。页面按当前 Graph 需求配置两类资源并保存在浏览器；每类配置 CPU、内存、GPU、`processes`、`minimum_jobs` 和 `maximum_jobs`，不提供固定 `scale` 字段。数量以 Job 为单位，最大值包含基础 Job 和排队中的扩容 Job。GPU Job 固定一个 Worker、一个 GPU；CPU Job 启动 `processes` 个 CPU Worker。
 
-Slurm 19.05 的 `--gres=gpu:N` 是同构的每节点申请。若最后一个节点只需较少 GPU，allocation 可能保守地多申请少量 GPU，但 Worker agent 不会把多余设备暴露给任何任务。例如 10 个 GPU Workers、每节点最多 4 张卡会形成逻辑布局 `4 + 3 + 3`，Slurm 同构申请为 3 个节点、每节点 4 张卡。
+CPU Worker 声明 `resources={"CPU": cores_per_worker}`，CPU task 要求 `{"CPU": 1}`。GPU Worker 声明 `resources={"GPU": gpu_count}`，GPU task 要求 `{"GPU": 1}`。不再声明 reader/writer/model 名称资源。GPU Worker 的物理 CPU 仍由 Slurm 申请，但不声明 CPU 任务额度，避免 CPU task 占用 GPU Worker。当前 GPU Worker 仍是一进程一张卡，GPU 并发额度为 1；多卡通过多个 GPU Worker 获得。CPU / Worker 与线程数一致；每 Job 的 CPU 申请量为 CPU / Worker × Processes / Job。
+
+提交前通过 `sinfo` / `scontrol show node` 校验分区、硬件总容量与站点限制。已被其他作业占用的资源可以排队，Planner 不再要求当前空闲，也不输出 `--nodelist`。排除节点仍通过 `--exclude` 传给 Slurm。节点数按资源组件保守计数，页面不把规划结果当作实际分配节点。
+
+没有显式设置 `WorkFlow_SLURM_PARTITION` 或 `WorkFlow_SLURM_ALLOWED_PARTITIONS` 时，Planner 会考虑 `sinfo` 发现的所有分区，默认排除管理分区 `mn` 和 `control`。一个资源组件属于一个 partition，实际节点由 Slurm 选择。节点 GPU 能力只由 GRES/TRES 决定，因此 `compute`、`tao` 等非 `gpu` 命名的分区同样可以承载 GPU Worker。
+
+首次提交将各类 `minimum_jobs` 组合为一个 heterogeneous job，由 Slurm 联合分配。提交前读取 `sbatch --version`：Slurm 17.11–19.05 使用 `#SBATCH packjob` / `srun --pack-group`，20.02 及以后使用 `#SBATCH hetjob` / `srun --het-group`。这只是同一机制在不同版本中的命令名称。获批后逐组件启动 Worker，最低各类 Worker 注册并通过身份验证后执行 Graph。只有一个组件时使用普通单 Job。集群必须支持 heterogeneous jobs，并使用 `sched/backfill`；联合申请不能保证立即获批，组件的放置限制仍由站点 Slurm 决定。
+
+运行时 `ProfileAdaptive` 复用 Dask Adaptive 的轮询和缩容稳定确认机制，分别读取 Scheduler 中 CPU、GPU 任务的状态、耗时估计和数据内存，计算两类目标 Job 数。CPU 执行槽按每 Worker 的线程数计算，GPU 执行槽按 GPU 数计算，再按每 Job 的进程数换算为整数 Job；待注册或重启时仍使用已配置的执行槽数。数据保留所需的内存容量独立计算。`target_duration` 使用 Dask 默认配置，页面不要求用户估算耗时。每类扩容继续使用自己的 `SLURMJob` 规格，排队 Job 计入申请数量。任务图及依赖调度仍由 Dask 负责。
+
+基础 hetjob 在执行期间保留。缩容先取消多余排队申请，再通过 Dask 安全退役额外 Job 内的全部 Worker；数据迁移失败时保留该 Job。额外 Job 排队不阻塞已有资源执行。基础申请默认持续排队；管理员可设置 `WorkFlow_SLURM_QUEUE_START_TIMEOUT_SECONDS` 为正数限制等待，`0` 表示不限制。Worker 注册超时从 Job RUNNING 后开始计算。
+
+每次提交前把所有权 token 写入执行目录的 `allocations/*.json`，成功后记录 Job ID。服务重启同时检查基础记录和动态申请记录，按 token 找回尚未记录 ID 的申请，回收孤儿资源。正常结束先停止 Adaptive 并等待正在提交的操作结束，再回收全部 Job；确认 hetjob 的组件均停止后，才释放 Scheduler 和执行锁。
 
 Graph 不能注入任意 `sbatch` 参数。partition、时限和容量均由管理员环境变量控制。若在 `MAX_NODES` 内仍装不下，preflight/提交会明确失败；不会把 Worker 回退到服务节点。
 
@@ -92,18 +100,16 @@ bash "$HOME/apps/WorkFlow/deploy/hpc/install.sh"
 
 `workflow-runtime` 与源码分开，原因是模型、输入、输出和恢复记录需要跨代码升级保留且被 CN 共享：
 
-- `data/demo_images.zip`：`prepare_test_data.sh` 下载的 Cellpose 示例 PNG 压缩包，只是测试输入缓存，不是 Zarr 输出。
-- `models/`：共享模型缓存，如 `models/cellpose/cpsam`。大模型不应随 backend 源码更新重复下载。
+- `models/`：共享模型缓存，如 `models/cellpose/cpsam`。模型不应随 backend 源码更新重复下载。
 - `test-runs/`：smoke/probe 的一次性输入、Zarr/Parquet 输出、日志和结果；不是页面运行的默认生产输出。
-- `jobs/`、`requests/`、`state/`、`logs/`：Driver 与 Slurm Worker allocation 的持久化控制记录。
+- `jobs/`、`state/`、`logs/`：Driver 与 Slurm Worker allocation 的持久化控制记录。
 - `output/`、`recovery/`：正式执行可使用的输出与 Window recovery 根目录。
 
 ## 必要配置
 
-下面是一个站点配置示例，具体容量必须由管理员根据 partition 实际节点填写：
+下面是一个站点安全上限示例。实际可分配容量来自每次 Run 的 `sinfo`/`scontrol` 快照；这些值只作为管理员上限，不作为节点资源发现结果：
 
 ```bash
-export WorkFlow_SLURM_PARTITION=compute
 export WorkFlow_SLURM_MAX_NODES=8
 export WorkFlow_SLURM_CPUS_PER_NODE=64
 export WorkFlow_SLURM_GPUS_PER_NODE=8
@@ -114,36 +120,23 @@ export WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example
 export WorkFlow_DASK_SCHEDULER_PORT=8786
 export WorkFlow_DASK_WORKER_PORT_RANGE=20000:20999
 export WorkFlow_DASK_NANNY_PORT_RANGE=21000:21999
+export WorkFlow_SLURM_QUEUE_START_TIMEOUT_SECONDS=0
 ```
 
 默认值为 `MAX_NODES=8`、`CPUS_PER_NODE=64`、`GPUS_PER_NODE=8`、`MEMORY_GIB_PER_NODE=512`、Scheduler 端口 `8786`、Worker 端口 `20000:20999`、Nanny 端口 `21000:21999`。`WorkFlow_DASK_SCHEDULER_HOST` 没有默认值，必须显式设置。
 每个端口范围的宽度至少要覆盖“单个 CN 上可能启动的最大 Worker 数”，不同 CN 可以复用同一范围。
 
-全局上限和每 Worker 换算仍可配置：
+保留的站点级上限：
 
 ```text
 WorkFlow_SLURM_ALLOWED_PARTITIONS
 WorkFlow_SLURM_TIME_LIMIT
-WorkFlow_SLURM_BASE_CPUS
-WorkFlow_SLURM_BASE_MEMORY_GIB
-WorkFlow_SLURM_CPUS_PER_CPU_WORKER
-WorkFlow_SLURM_CPUS_PER_GPU_WORKER
-WorkFlow_SLURM_CPU_WORKER_MEMORY_GIB
-WorkFlow_SLURM_GPU_WORKER_MEMORY_GIB
-WorkFlow_SLURM_MAX_CPU_WORKERS
-WorkFlow_SLURM_MAX_GPU_WORKERS
 WorkFlow_SLURM_MAX_CPUS
 WorkFlow_SLURM_MAX_GPUS
 WorkFlow_SLURM_MAX_MEMORY_GIB
 ```
 
-全局 `MAX_CPUS/MAX_GPUS/MAX_MEMORY_GIB` 限制整个 execution；per-node 变量定义单个 CN 装箱容量。生产 Worker launcher 是：
-
-```text
-WorkFlow_SLURM_EXECUTION_SCRIPT=<repo>/deploy/hpc/slurm/workflow_workers.sbatch
-```
-
-不要再将旧的 `workflow_execution.sbatch` 用作正式页面执行入口；它把 Driver/Scheduler 放入 CN，与本架构不符。
+全局 `MAX_CPUS/MAX_GPUS/MAX_MEMORY_GIB` 限制整个 execution；per-node 变量是额外的站点安全上限。Worker 启动命令完全由 `dask_jobqueue.SLURMJob` 根据 `cores` 和 `processes` 生成：`nthreads = cores / processes`。项目不再维护独立的 Worker sbatch/launcher，也不再允许单独配置与 CPU/Worker 矛盾的 Threads/Worker。
 
 ## 启动控制面
 
@@ -152,7 +145,6 @@ WorkFlow_SLURM_EXECUTION_SCRIPT=<repo>/deploy/hpc/slurm/workflow_workers.sbatch
 ```bash
 cd "$HOME/apps/WorkFlow"
 WorkFlow_SLURM_SACCT='' \
-WorkFlow_SLURM_PARTITION=compute \
 WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example \
 WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1 \
   bash deploy/hpc/control_plane.sh restart
@@ -190,11 +182,11 @@ WorkFlow_DASK_SCHEDULER_PORT=8786 \
 
 1. 服务节点序列化当前 editor Graph，并进行只读 preflight/resource planning。
 2. Driver 在服务进程内按需启动固定 host/port 的 Scheduler。
-3. 后端持久化 execution/request/layout，再按 Graph 计划提交 `workflow_workers.sbatch`。
-4. Slurm 选择满足同构请求的一个或多个 CN；`srun` 每节点启动一个 Worker agent。
-5. 所有预期 CPU/GPU Workers 注册且身份、资源、设备拓扑验证通过后，Driver 才提交图。
-6. terminal output Futures 成功后，Driver 更新 Window completion bitmap。
-7. 成功、失败或取消都先停止计算并 `scancel` Worker allocation，再关闭 Scheduler。
+3. Resource Planner 校验各类最低资源和最大扩容范围；Slurm 决定实际节点。
+4. `PlannedSLURMCluster` 把最低资源组合为一次 hetjob 提交；标准 `SLURMJob` 负责生成各组件的 Worker 命令。
+5. 最低各类 Workers 注册且身份、逻辑能力和 GPU 隔离验证通过后，Driver 提交图，并开启按 Profile 的 Adaptive。
+6. 额外 Job 按负载独立加入、退出；terminal output Futures 成功后，Driver 更新 Window completion bitmap。
+7. 成功、失败或取消先停止 Adaptive，再回收基础和额外 Job。只有 dask-jobqueue 回收失败时才使用受所有权校验保护的 `scancel` fallback。确认全部 Job 终止后再关闭 Scheduler。
 
 Window resume/restart 仍由 Recovery 界面显式发起，并使用 recovery 目录中的不可变 Graph。服务进程重启时无法让已经消失的 Driver 继续计算；启动清理必须取消孤儿 Worker allocation，之后由用户显式 Resume。普通 New Run 不会静默变成 Resume。
 
@@ -212,7 +204,33 @@ powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
 
 ## 测试边界
 
-`submit_multi_worker_smoke.sh` 是旧的单 CN Dask 进程/GPU 基础设施检查，不等于最终跨节点 Driver/Scheduler 架构验收。最终验收至少应真实执行：
+### 最低资源与 Adaptive 实测
+
+已完成的真实集群结果见 [2026-09-20 实测记录](validation/slurm-adaptive-2026-09-20.md)，包含扩缩容通过与 GPU 扩容排队两种情况及验证边界。
+
+在共享 checkout 已同步到当前版本、Python 环境与后端一致、没有正在执行的工作流时，使用后端相同的 `WorkFlow_*` 环境变量运行：
+
+```bash
+set -a
+. "$HOME/workflow-runtime/config/control-plane.env"
+set +a
+export WORKFLOW_RUNTIME_DIR="$HOME/workflow-runtime"
+
+# 只读取集群资源并校验计划，不提交 Job
+backend/.venv/bin/python deploy/hpc/adaptive_smoke.py --gpu
+# 提交真实 Job 并验证扩缩容
+backend/.venv/bin/python deploy/hpc/adaptive_smoke.py --gpu --run
+```
+
+测试默认使用 CPU 类型，`--gpu` 额外加入 GPU 类型。每类最低 1 个 Job、最多 2 个，每 Job 为 1 CPU；CPU Job 为 4 GiB，GPU Job 为 8 GiB、1 GPU。最多申请 4 CPU、24 GiB、2 GPU；不带 `--gpu` 时最多 2 CPU、8 GiB。遵守站点配置上限，Job 时限不超过 15 分钟。
+
+脚本先验证最低资源通过一次 hetjob 提交并全部注册，再用原生 delayed 依赖图逐类施加负载，检查对应类型扩容、额外 Worker 执行任务、空闲后缩回最低值及基础 Worker 保留。使用生产 Adaptive 默认参数，不要求填写目标任务耗时。GPU 模式会实际执行一个小型 CUDA 运算，但不加载 Cellpose 模型。
+
+结果保存在 `workflow-runtime/test-runs/smoke-*/result.json` 和 `samples.jsonl`，包含本次 Job、排队原因、Worker 分布及测试服务进程 CPU/RSS。`PASS` 要求每类额外 Worker 都曾注册并执行任务；若排队使扩容未能实际参与计算，则记为 `INCONCLUSIVE`，不能据此宣称扩容通过。`--timeout` 仅控制实测等待期限，不改变生产环境的排队策略。结束或中断时只取消本次唯一 token 所属 Job，并检查队列清理结果。
+
+这些采样是轻量调度测试的观测值。测试服务进程包含 Scheduler 和测试 Driver，未施加真实 Web/Dashboard 并发或生产任务图压力，不能直接作为生产 Scheduler 的容量结论。Scheduler 当前仍与后端同进程；Worker 的 `cores` / `memory` 不为 Scheduler 预留资源。若实测发现服务进程资源争用，应为控制服务分配有保障的 CPU/内存，或进一步将 Scheduler 分离为独立进程。
+
+最终的跨节点 Driver/Scheduler 架构验收至少应真实执行：
 
 - Scheduler connectivity probe；
 - 1 个 CN、多个 CPU Workers；

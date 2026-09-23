@@ -77,6 +77,43 @@ assert(
   'rendered Execution Settings must contain no recovery actions',
 );
 
+const failedPreflightMarkup = renderToStaticMarkup(
+  <FlowContext.Provider value={{
+    ...baseContext,
+    activeExecutionSettings: {
+      ...settings,
+      lastPreflight: {
+        outputShape: [293, 1077, 1050],
+        totalWindows: 0,
+        validatedAt: 1,
+      },
+    },
+    executionSettingsValidation: null,
+    executionPreflight: {
+      windowable: false,
+      outputShape: null,
+      totalWindows: null,
+      resourcesSatisfied: false,
+      resourceError: "Set the Reader array_path explicitly, for example 's0'.",
+      preflightError: {
+        type: 'ValueError',
+        message: "Set the Reader array_path explicitly, for example 's0'.",
+      },
+    },
+  } as unknown as FlowContextType}>
+    <ExecutionSettingsDrawer />
+  </FlowContext.Provider>,
+);
+assert(
+  failedPreflightMarkup.includes("Preflight failed: Set the Reader array_path explicitly, for example &#x27;s0&#x27;."),
+  'the drawer must prominently display the current Reader preflight failure',
+);
+assert(
+  failedPreflightMarkup.includes('>Preflight failed</dd>')
+    && !failedPreflightMarkup.includes('>0</dd>'),
+  'a current failed preflight must not display a stale cached zero-window summary',
+);
+
 const recoveryContext = {
   isRecoveryBrowserOpen: true,
   recoveredGraphView: null,

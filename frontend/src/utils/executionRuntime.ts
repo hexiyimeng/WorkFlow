@@ -16,6 +16,27 @@ export const isExecutionStateUnresolved = (phase: ExecutionPhase): boolean =>
 export const blocksExecutionChanges = (phase: ExecutionPhase): boolean =>
   isLiveExecutionPhase(phase) || isExecutionStateUnresolved(phase);
 
+export const websocketReconnectDelayMs = (attempt: number): number => {
+  const normalizedAttempt = Number.isFinite(attempt)
+    ? Math.max(1, Math.trunc(attempt))
+    : 1;
+  return Math.min(30_000, 1_000 * (2 ** Math.min(normalizedAttempt - 1, 5)));
+};
+
+export const websocketDisconnectMessage = (
+  closeCode: number,
+  hasUnresolvedExecution: boolean,
+  retryDelayMs: number,
+): string => {
+  const reason = closeCode === 1006
+    ? 'The backend transport closed abnormally (WebSocket 1006), usually because the SSH/VPN/network path disappeared.'
+    : `The backend WebSocket closed (code ${closeCode}).`;
+  const execution = hasUnresolvedExecution
+    ? ' The workflow may still be running on the backend; its status will be reconciled after reconnecting.'
+    : '';
+  return `${reason}${execution} Retrying in ${Math.ceil(retryDelayMs / 1000)}s.`;
+};
+
 const LOCKED_NODE_LAYOUT_CHANGE_TYPES = new Set([
   'position',
   'dimensions',
