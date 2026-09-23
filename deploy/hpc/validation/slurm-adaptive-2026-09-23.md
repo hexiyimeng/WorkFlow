@@ -67,3 +67,31 @@
 - 测试退出后确认 `squeue -u songzh -h` 为空，所有测试 Job 已清理。
 
 对应实现提交：`3c9ec55 Schedule workers across compatible Slurm partitions`。
+
+## GPU 架构兼容性复测
+
+跨分区启用后，实际 CPSAM 工作流有两个弹性 GPU Job 落到 `gpu/aio`，并在加载
+Transformer 权重时报告 `cudaErrorNoKernelImageForDevice`。日志确认该节点是 Tesla
+V100（Compute Capability 7.0），而原 `torch 2.11.0+cu128` wheel 只包含 `sm_75`、
+`sm_80`、`sm_86`、`sm_90`、`sm_100` 和 `sm_120`。权重 shape 一致，失败原因是
+PyTorch 二进制没有 V100 对应的 `sm_70` kernel。
+
+现场探针目录：
+`/share/home/songzh/workflow-runtime/test-runs/gpu-compat-20260923-110643`
+
+| 节点 | 分区 | GPU | CC | cu128 CUDA 运算 | cu128 CPSAM 加载 |
+| --- | --- | --- | --- | --- | --- |
+| `aio` | `gpu` | Tesla V100-SXM2-32GB | 7.0 | 失败 | 未进入加载 |
+| `c001` | `compute` | NVIDIA A40 | 8.6 | 通过 | 通过 |
+| `c002` | `compute` | NVIDIA A40 | 8.6 | 通过 | 通过 |
+| `c003` | `compute` | NVIDIA A40 | 8.6 | 通过 | 通过 |
+| `t000` | `tao` | NVIDIA A100-PCIE-40GB | 8.0 | 通过 | 通过 |
+| `t002` | `tao` | NVIDIA GeForce RTX 3090 | 8.6 | 通过 | 通过 |
+
+`t001` 的两张 GPU 当时均被其他用户占用，定向探针保持 `PENDING (Resources)`，没有
+绕过 Slurm 登录节点直接访问设备。该节点探针随后取消并清理。
+
+随后在独立临时环境中测试 `torch 2.11.0+cu126`。该 wheel 包含 `sm_50`、`sm_60`、
+`sm_70`、`sm_75`、`sm_80`、`sm_86` 和 `sm_90`。V100、A40、A100 和 RTX 3090
+均完成 CUDA 运算并成功加载同一个共享 CPSAM 模型。因此项目锁定改为
+`torch 2.11.0+cu126` / `torchvision 0.26.0+cu126`，保留所有当前 GPU 分区的使用能力。
