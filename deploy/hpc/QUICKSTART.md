@@ -150,19 +150,15 @@ watch -n 2 "squeue -u $USER -o '%.18i %.16P %.9T %.32R %.40k'"
 
 ## 7. 从本机访问页面
 
-例如，平时在 Windows 上用 `ssh alice@login.hpc.example.org` 登录集群，先进入
-本机的 WorkFlow 仓库目录，再执行：
+当前测试集群的 Windows 命令：
 
 ```powershell
-cd D:\Projects\WorkFlow
-powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
-  -User alice `
-  -ClusterHost login.hpc.example.org
+powershell -ExecutionPolicy Bypass -File D:\Workspace\Python_Projects\WorkFlow\deploy\hpc\open_workflow_tunnel.ps1 -User songzh -ClusterHost 10.200.201.2
 ```
 
-将 `D:\Projects\WorkFlow`、`alice`、`login.hpc.example.org` 换成自己的
-本机仓库路径、SSH 用户名和登录地址。脚本会打开 SSH
-认证窗口；输入密码后会自动打开 WorkFlow 页面。使用期间不要关闭该窗口。
+`10.200.201.2` 是从本机 SSH 登录集群的地址，不是 Dask Scheduler 地址。部署到
+其他集群时，再替换脚本路径、用户名和 SSH 登录地址。脚本会打开 SSH 认证窗口；
+输入密码后会自动打开 WorkFlow 页面。使用期间不要关闭该窗口。
 
 认证成功后访问：
 
