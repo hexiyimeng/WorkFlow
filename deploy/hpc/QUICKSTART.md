@@ -150,15 +150,18 @@ watch -n 2 "squeue -u $USER -o '%.18i %.16P %.9T %.32R %.40k'"
 
 ## 7. 从本机访问页面
 
-Windows 示例（替换成自己的 SSH 用户名和地址）：
+例如，平时在 Windows 上用 `ssh alice@login.hpc.example.org` 登录集群，先进入
+本机的 WorkFlow 仓库目录，再执行：
 
 ```powershell
+cd D:\Projects\WorkFlow
 powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
-  -User your-user `
-  -ClusterHost login.cluster.example
+  -User alice `
+  -ClusterHost login.hpc.example.org
 ```
 
-部署到其他集群时，将用户名和地址替换为对应的 SSH 登录信息。脚本会打开 SSH
+将 `D:\Projects\WorkFlow`、`alice`、`login.hpc.example.org` 换成自己的
+本机仓库路径、SSH 用户名和登录地址。脚本会打开 SSH
 认证窗口；输入密码后会自动打开 WorkFlow 页面。使用期间不要关闭该窗口。
 
 认证成功后访问：
