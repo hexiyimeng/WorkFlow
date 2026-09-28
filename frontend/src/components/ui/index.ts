@@ -11,5 +11,3 @@ export { IconButton } from './IconButton';
 export type { IconButtonVariant, IconButtonSize } from './IconButton';
 
 export { TextField } from './TextField';
-
-export { SectionHeader } from './SectionHeader';

@@ -17,6 +17,16 @@ frontend/dist
 backend/models
 backend/demo_data
 backend/demo_output
+models
+workflow-runtime
+deploy/hpc/validation
+
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
 
 tmp
 output

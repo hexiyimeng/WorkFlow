@@ -63,7 +63,6 @@ export const useUndoRedo = (
     // (add / delete / connect / move) is undoable with a single Ctrl+Z.
     const stripped = serializeNodesForStorage(currentState.current.nodes);
     setPast([{ nodes: stripped, edges: currentState.current.edges }]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // intentionally once on mount
 
   useEffect(() => {

@@ -17,6 +17,32 @@ WORKFLOW_ROOT="${WORKFLOW_ROOT:-$DEFAULT_WORKFLOW_ROOT}"
 WORKFLOW_RUNTIME_DIR="${WORKFLOW_RUNTIME_DIR:-${HOME:?HOME is required}/workflow-runtime}"
 PYTHON="$WORKFLOW_ROOT/backend/.venv/bin/python"
 PROBE="$SCRIPT_DIR/scheduler_connectivity_probe.py"
+CONFIG_PATH="${WORKFLOW_CONTROL_PLANE_CONFIG_FILE:-$WORKFLOW_RUNTIME_DIR/config/control-plane.env}"
+
+# Use the same persisted site settings as the control plane so the operator can
+# run this probe directly after `control_plane.sh configure`.
+if [[ -e "$CONFIG_PATH" || -L "$CONFIG_PATH" ]]; then
+  if [[ -L "$CONFIG_PATH" || ! -f "$CONFIG_PATH" || ! -r "$CONFIG_PATH" ]]; then
+    echo "Control-plane config must be a readable regular non-symlink file: $CONFIG_PATH" >&2
+    exit 2
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" != *=* ]]; then
+      echo "Control-plane config must use NAME=VALUE syntax: $CONFIG_PATH" >&2
+      exit 2
+    fi
+    name="${line%%=*}"
+    value="${line#*=}"
+    case "$name" in
+      WorkFlow_DASK_SCHEDULER_HOST|WorkFlow_DASK_SCHEDULER_PORT|WorkFlow_SLURM_PARTITION|WorkFlow_SLURM_EXCLUDED_PARTITIONS|WorkFlow_SLURM_ACCOUNT|WorkFlow_SLURM_QOS|WorkFlow_SLURM_RESERVATION|WorkFlow_SLURM_SINFO|WorkFlow_SLURM_SRUN)
+        printf -v "$name" '%s' "$value"
+        ;;
+    esac
+  done < "$CONFIG_PATH"
+fi
+
 HOST="${WorkFlow_DASK_SCHEDULER_HOST:-}"
 PORT="${WorkFlow_DASK_SCHEDULER_PORT:-8786}"
 PARTITION="${WorkFlow_SLURM_PARTITION:-}"

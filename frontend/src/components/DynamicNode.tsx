@@ -402,7 +402,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
       });
     }
     return { linkInputs: links, outputs: outs, widgets: wids };
-  }, [nodeSpec, values, effectiveValues]);
+  }, [nodeSpec, effectiveValues]);
 
   const hasIO = linkInputs.length > 0 || outputs.length > 0;
   const hasWidgets = widgets.length > 0;

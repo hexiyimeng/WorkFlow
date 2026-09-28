@@ -13,7 +13,7 @@ def test_slurm_backend_accepts_posix_output_path_on_any_control_plane_os(
 ) -> None:
     monkeypatch.setenv("WorkFlow_EXECUTION_BACKEND", "slurm")
 
-    path = "/share/home/songzh/workflow-runtime/data/processed01.zarr"
+    path = "/shared/project/workflow-runtime/data/processed01.zarr"
 
     assert normalize_execution_path(path, name="output_path") == path
     assert ZarrWriter.validate_output_path(path) == path
