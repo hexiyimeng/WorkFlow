@@ -40,3 +40,10 @@ backend/examples/
 
 output/pdf
 tmp/
+
+# Local cluster reports, site configuration and runtime artifacts
+deploy/hpc/validation/
+deploy/hpc/*.env
+deploy/hpc/*.local.sh
+deploy/hpc/logs/
+deploy/hpc/test-runs/

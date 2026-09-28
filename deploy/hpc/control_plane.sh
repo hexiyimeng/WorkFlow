@@ -40,6 +40,11 @@ CONTROL_PLANE_ENVIRONMENT=(
   WorkFlow_DASK_WORKER_PORT_RANGE
   WorkFlow_DASHBOARD_HOST
   WorkFlow_SLURM_ALLOWED_PARTITIONS
+  WorkFlow_SLURM_ACCOUNT
+  WorkFlow_SLURM_QOS
+  WorkFlow_SLURM_RESERVATION
+  WorkFlow_SLURM_SRUN
+  WorkFlow_SLURM_WORKER_SETUP
   WorkFlow_SLURM_CANCEL_GRACE_SECONDS
   WorkFlow_SLURM_CPUS_PER_NODE
   WorkFlow_SLURM_EXCLUDED_NODES
@@ -140,7 +145,7 @@ write_control_plane_config() {
     "${WorkFlow_DASK_DASHBOARD_ADDRESS:-127.0.0.1:8787}" \
     "${WorkFlow_DASK_DASHBOARD_TOKEN_EXPIRATION_SECONDS:-86400}" \
     "${WorkFlow_DASHBOARD_HOST:-127.0.0.1:18787}" \
-    "${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn,control}" \
+    "${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-}" \
     "${WorkFlow_SLURM_MAX_CPUS:-256}"; do
     if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
       echo "Control-plane configuration values must not contain newlines." >&2
@@ -159,7 +164,7 @@ write_control_plane_config() {
       "WorkFlow_DASK_DASHBOARD_TOKEN_EXPIRATION_SECONDS=${WorkFlow_DASK_DASHBOARD_TOKEN_EXPIRATION_SECONDS:-86400}" \
       "WorkFlow_DASHBOARD_HOST=${WorkFlow_DASHBOARD_HOST:-127.0.0.1:18787}" \
       "WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=$allow_insecure" \
-      "WorkFlow_SLURM_EXCLUDED_PARTITIONS=${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn,control}" \
+      "WorkFlow_SLURM_EXCLUDED_PARTITIONS=${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-}" \
       "WorkFlow_SLURM_MAX_CPUS=${WorkFlow_SLURM_MAX_CPUS:-256}"
     if [[ -v WorkFlow_SLURM_SACCT ]]; then
       printf 'WorkFlow_SLURM_SACCT=%s\n' "$WorkFlow_SLURM_SACCT"
@@ -170,6 +175,20 @@ write_control_plane_config() {
         "WorkFlow_DASK_TLS_CERT=$tls_cert" \
         "WorkFlow_DASK_TLS_KEY=$tls_key"
     fi
+    # Preserve explicitly supplied site settings beyond the defaults above.
+    for variable_name in "${CONTROL_PLANE_ENVIRONMENT[@]}"; do
+      case "$variable_name" in
+        WorkFlow_DASK_SCHEDULER_HOST|WorkFlow_DASK_SCHEDULER_PORT|WorkFlow_DASK_DASHBOARD_ADDRESS|WorkFlow_DASK_DASHBOARD_TOKEN_EXPIRATION_SECONDS|WorkFlow_DASHBOARD_HOST|WorkFlow_DASK_ALLOW_INSECURE_CLUSTER|WorkFlow_SLURM_EXCLUDED_PARTITIONS|WorkFlow_SLURM_MAX_CPUS|WorkFlow_SLURM_SACCT|WorkFlow_DASK_TLS_CA|WorkFlow_DASK_TLS_CERT|WorkFlow_DASK_TLS_KEY) continue ;;
+      esac
+      if [[ -v "$variable_name" ]]; then
+        value="${!variable_name}"
+        if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+          echo "$variable_name must not contain newlines." >&2
+          exit 2
+        fi
+        printf '%s=%s\n' "$variable_name" "$value"
+      fi
+    done
   } > "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
   echo "WorkFlow control-plane config created."

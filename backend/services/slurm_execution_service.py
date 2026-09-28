@@ -61,7 +61,7 @@ from services.executor import (
     validate_graph_types,
 )
 from services.dask_service import dask_service
-from services.slurm_jobqueue_cluster import build_planned_slurm_worker_spec
+from services.slurm_jobqueue_cluster import SlurmJobSiteConfig, build_planned_slurm_worker_spec
 from services.recovery_service import (
     discover_terminal_outputs,
     inspect_recovery_directory,
@@ -367,7 +367,7 @@ def slurm_policy_from_environment(
     allowed_raw = str(env.get("WorkFlow_SLURM_ALLOWED_PARTITIONS", ""))
     allowed = tuple(item.strip() for item in allowed_raw.split(",") if item.strip())
     excluded_raw = str(
-        env.get("WorkFlow_SLURM_EXCLUDED_PARTITIONS", "mn,control")
+        env.get("WorkFlow_SLURM_EXCLUDED_PARTITIONS", "")
     )
     excluded = tuple(
         item.strip() for item in excluded_raw.split(",") if item.strip()
@@ -422,6 +422,7 @@ class SlurmRuntimeConfig:
     nanny_port_range: str = "21000:21999"
     worker_start_timeout_seconds: float = 600.0
     queue_start_timeout_seconds: float = 0.0
+    job_site_config: SlurmJobSiteConfig = SlurmJobSiteConfig()
 
     def __post_init__(self) -> None:
         worker = tuple(int(item) for item in self.worker_port_range.split(":"))
@@ -539,6 +540,7 @@ class SlurmRuntimeConfig:
                 env, "WorkFlow_DASK_CLUSTER_START_TIMEOUT_SECONDS", 600.0
             ),
             queue_start_timeout_seconds=_queue_wait_seconds(env),
+            job_site_config=SlurmJobSiteConfig.from_environment(env),
         )
 
 
@@ -2791,6 +2793,7 @@ class SlurmExecutionService:
                     security=client.security,
                     worker_port_range=config.worker_port_range,
                     nanny_port_range=config.nanny_port_range,
+                    site_config=config.job_site_config,
                 ))
 
             # DaskService is the sole runtime owner from this point onward.
@@ -2948,7 +2951,8 @@ class SlurmExecutionService:
                     sbatch_executable=config.sbatch_executable, scancel_executable=config.scancel_executable,
                     scheduler_host=config.scheduler_host, scheduler_port=config.scheduler_port,
                     protocol=protocol, security=dask_service.client.security,
-                    worker_port_range=config.worker_port_range, nanny_port_range=config.nanny_port_range)
+                    worker_port_range=config.worker_port_range, nanny_port_range=config.nanny_port_range,
+                    site_config=config.job_site_config)
             await asyncio.to_thread(dask_service.start_slurm_adaptive,
                                     allocation_plan.pools, planned_specs, elastic_spec,
                                     submission_token_prefix)

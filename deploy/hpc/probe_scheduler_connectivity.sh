@@ -21,7 +21,8 @@ HOST="${WorkFlow_DASK_SCHEDULER_HOST:-}"
 PORT="${WorkFlow_DASK_SCHEDULER_PORT:-8786}"
 PARTITION="${WorkFlow_SLURM_PARTITION:-}"
 SINFO_COMMAND="${WorkFlow_SLURM_SINFO:-sinfo}"
-EXCLUDED_PARTITIONS=",${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-mn,control},"
+SRUN_COMMAND="${WorkFlow_SLURM_SRUN:-srun}"
+EXCLUDED_PARTITIONS=",${WorkFlow_SLURM_EXCLUDED_PARTITIONS:-},"
 PROBE_TIME="${WORKFLOW_CONNECTIVITY_PROBE_TIME:-00:10:00}"
 SERVER_TIMEOUT="${WORKFLOW_CONNECTIVITY_PROBE_TIMEOUT_SECONDS:-1800}"
 
@@ -33,7 +34,7 @@ if [[ ! -x "$PYTHON" || ! -f "$PROBE" ]]; then
   echo "Install WorkFlow before running the connectivity probe." >&2
   exit 1
 fi
-if ! command -v srun >/dev/null 2>&1; then
+if ! command -v "$SRUN_COMMAND" >/dev/null 2>&1; then
   echo "srun is unavailable; run this probe on an approved Slurm submit host." >&2
   exit 1
 fi
@@ -99,7 +100,11 @@ fi
 
 # This is a diagnostic allocation, not a production workflow.  No Worker,
 # Scheduler or Driver is started on the compute node.
-srun \
+site_args=()
+[[ -z "${WorkFlow_SLURM_ACCOUNT:-}" ]] || site_args+=(--account="$WorkFlow_SLURM_ACCOUNT")
+[[ -z "${WorkFlow_SLURM_QOS:-}" ]] || site_args+=(--qos="$WorkFlow_SLURM_QOS")
+[[ -z "${WorkFlow_SLURM_RESERVATION:-}" ]] || site_args+=(--reservation="$WorkFlow_SLURM_RESERVATION")
+"$SRUN_COMMAND" "${site_args[@]}" \
   --partition="$PARTITION" \
   --nodes=1 \
   --ntasks=1 \

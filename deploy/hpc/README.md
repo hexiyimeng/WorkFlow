@@ -32,7 +32,7 @@ CPU Worker 声明 `resources={"CPU": cores_per_worker}`，CPU task 要求 `{"CPU
 
 提交前通过 `sinfo` / `scontrol show node` 校验分区、硬件总容量与站点限制。已被其他作业占用的资源可以排队，Planner 不再要求当前空闲，也不输出 `--nodelist`。排除节点仍通过 `--exclude` 传给 Slurm。节点数按资源组件保守计数，页面不把规划结果当作实际分配节点。
 
-没有显式设置 `WorkFlow_SLURM_PARTITION` 或 `WorkFlow_SLURM_ALLOWED_PARTITIONS` 时，Planner 会考虑 `sinfo` 发现的所有分区，默认排除管理分区 `mn` 和 `control`。一个资源组件属于一个 partition，实际节点由 Slurm 选择。节点 GPU 能力只由 GRES/TRES 决定，因此 `compute`、`tao` 等非 `gpu` 命名的分区同样可以承载 GPU Worker。
+没有显式设置 `WorkFlow_SLURM_PARTITION` 或 `WorkFlow_SLURM_ALLOWED_PARTITIONS` 时，Planner 会考虑 `sinfo` 发现的所有分区，不按名称推断用途。管理分区应通过 `WorkFlow_SLURM_EXCLUDED_PARTITIONS` 显式排除。节点 GPU 数量由 GRES/TRES 决定，因此非 `gpu` 命名的分区同样可以承载 GPU Worker。
 
 首次提交将各类 `minimum_jobs` 组合为一个 heterogeneous job，由 Slurm 联合分配。提交前读取 `sbatch --version`：Slurm 17.11–19.05 使用 `#SBATCH packjob` / `srun --pack-group`，20.02 及以后使用 `#SBATCH hetjob` / `srun --het-group`。这只是同一机制在不同版本中的命令名称。获批后逐组件启动 Worker，最低各类 Worker 注册并通过身份验证后执行 Graph。只有一个组件时使用普通单 Job。集群必须支持 heterogeneous jobs，并使用 `sched/backfill`；联合申请不能保证立即获批，组件的放置限制仍由站点 Slurm 决定。
 
@@ -76,7 +76,7 @@ export WorkFlow_DASK_TLS_KEY=/absolute/private/dask-service.key
 
 启动脚本会拒绝缺项、相对路径、symlink 或不可读文件。证书文件“已配置”不等于 mTLS 已验收；必须在实际 deployment 中确认 Scheduler 地址为 `tls://`，并完成 Worker 注册和计算测试。
 
-当前目标集群尚未提供并实测 mTLS 证书。只在管理员确认的可信隔离内网和严格 ACL 下进行临时验收时，才可显式使用：
+只在管理员确认的可信隔离内网和严格 ACL 下进行临时验收、尚未配置 mTLS 时，才可显式使用：
 
 ```bash
 export WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1
@@ -116,7 +116,7 @@ export WorkFlow_SLURM_GPUS_PER_NODE=8
 export WorkFlow_SLURM_MEMORY_GIB_PER_NODE=512
 
 # 必填：必须从 compute node 可解析、可达，不能写 localhost。
-export WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example
+export WorkFlow_DASK_SCHEDULER_HOST=service.cluster.example
 export WorkFlow_DASK_SCHEDULER_PORT=8786
 export WorkFlow_DASK_WORKER_PORT_RANGE=20000:20999
 export WorkFlow_DASK_NANNY_PORT_RANGE=21000:21999
@@ -145,12 +145,12 @@ WorkFlow_SLURM_MAX_MEMORY_GIB
 ```bash
 cd "$HOME/apps/WorkFlow"
 WorkFlow_SLURM_SACCT='' \
-WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example \
+WorkFlow_DASK_SCHEDULER_HOST=service.cluster.example \
 WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1 \
   bash deploy/hpc/control_plane.sh restart
 ```
 
-上例 `ALLOW_INSECURE_CLUSTER=1` 只适合目标集群当前无证书的受控验收；生产应替换为 TLS 三文件。`control_plane.sh` 对 tmux 环境使用显式 allowlist，并会先 unset 所有受管变量，因此操作者取消某个变量后，旧 tmux server 不会偷偷恢复它。
+上例 `ALLOW_INSECURE_CLUSTER=1` 只适合无证书的受控验收；生产应替换为 TLS 三文件。`control_plane.sh` 对 tmux 环境使用显式 allowlist。已有 `control-plane.env` 时以文件为准，修改站点参数应编辑该文件；旧 tmux server 中残留的受管变量会被清除。
 
 检查：
 
@@ -169,7 +169,7 @@ bash deploy/hpc/control_plane.sh logs
 ```bash
 cd "$HOME/apps/WorkFlow"
 WorkFlow_SLURM_PARTITION=compute \
-WorkFlow_DASK_SCHEDULER_HOST=mn02.cluster.example \
+WorkFlow_DASK_SCHEDULER_HOST=service.cluster.example \
 WorkFlow_DASK_SCHEDULER_PORT=8786 \
   bash deploy/hpc/probe_scheduler_connectivity.sh
 ```
@@ -192,12 +192,12 @@ Window resume/restart 仍由 Recovery 界面显式发起，并使用 recovery �
 
 ## 外部访问页面
 
-先连接管理员提供的 OpenVPN，然后在 Windows checkout 中运行：
+确保可以通过 SSH 访问运行后端的服务节点（是否需要 VPN 由站点决定），然后在 Windows checkout 中运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
   -User YOUR_CLUSTER_USER `
-  -ClusterHost 10.200.201.2
+  -ClusterHost service.cluster.example
 ```
 
 打开 `http://127.0.0.1:18000/`。脚本使用已有 SSH 认证，不生成、读取或保存密码/私钥。不要把 Uvicorn 改成监听公网 `0.0.0.0`；多人生产访问应由管理员在 service node 前部署带 TLS 和身份认证的反向代理。
@@ -206,7 +206,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
 
 ### 最低资源与 Adaptive 实测
 
-已完成的真实集群结果见 [2026-09-20 实测记录](validation/slurm-adaptive-2026-09-20.md)，包含扩缩容通过与 GPU 扩容排队两种情况及验证边界。
+站点实测记录保存在本地 `deploy/hpc/validation/` 或共享 runtime，不提交到仓库。新集群必须重新执行以下验收，其他集群的测试结果不代表本站点通过。
 
 在共享 checkout 已同步到当前版本、Python 环境与后端一致、没有正在执行的工作流时，使用后端相同的 `WorkFlow_*` 环境变量运行：
 
@@ -241,3 +241,16 @@ backend/.venv/bin/python deploy/hpc/adaptive_smoke.py --gpu --run
 - 取消和服务进程异常后的 orphan allocation 回收。
 
 没有真实获得两个 CN 并运行上述任务时，不得声称“多节点已通过”。
+
+## 更换 Slurm 集群
+
+安装默认跟踪 `master`。仓库保留安装、控制服务、SSH 隧道、网络探测和 Adaptive smoke 工具；站点报告、日志、真实 `.env` 和模型文件保存在本地，不随代码上传。HDF5 转换工具是可选辅助工具，运行前必须设置 `WORKFLOW_H5_DATA_NAME`、`WORKFLOW_H5_SOURCE_ROOT`、`WORKFLOW_H5_REFERENCE_ROOT`。
+
+1. 将 checkout、Python 环境、runtime 和输入输出放在计算节点可见的共享路径。`$HOME` 只是默认路径；非共享 home 必须设置 `WORKFLOW_ROOT` 和 `WORKFLOW_RUNTIME_DIR`。
+2. 复制 `deploy/hpc/control-plane.env.example` 到 `$WORKFLOW_RUNTIME_DIR/config/control-plane.env`，按本站点修改。此配置采用原始 `NAME=VALUE` 格式，不写 `export`、引号或 shell 变量引用。account/QoS/reservation 必须对所选分区有效；当前配置是整个工作流共用一组值，不能自动解决不同分区要求不同 account/QoS 的情况。
+3. 配置 Scheduler 内网地址、开放端口、TLS、可访问分区和资源上限。默认上限是应用限制，不代表硬件容量；换集群后需要按管理员策略调整。发现一个分区不代表账号具有使用权限。
+4. 如果站点依赖 environment modules、非标准 Slurm 安装目录或动态库，配置 `WorkFlow_SLURM_WORKER_SETUP=/shared/path/worker-setup.sh`。这是管理员维护的 Bash 脚本，必须在所有计算节点可读，可在其中 `source /etc/profile.d/modules.sh`、`module load ...` 和设置 `SLURM_CONF`/`LD_LIBRARY_PATH`。脚本在基础 Job 的批处理 shell 和每个 Worker shell 中加载；应可重复执行、无交互，并在所用节点上均有效。提交端启动服务之前也需要加载自己的 Slurm 环境。`WorkFlow_SLURM_SRUN` 可指定计算节点上的绝对 srun 路径。
+5. 当前运行模式要求 Slurm 支持 heterogeneous jobs，并使用支持该机制的调度配置（`sched/backfill`）。Worker 需要 NVIDIA GPU、正确配置的 GPU GRES 和 `CUDA_VISIBLE_DEVICES`；当前采用一进程一卡。PyTorch/CUDA wheel、驱动和 GPU 架构必须匹配，当前锁定的 CUDA 12.6 环境不是所有硬件平台的通用保证。只允许已验证兼容的 GPU 分区，必要时配置 `WorkFlow_SLURM_EXCLUDED_NODES`。
+6. 先执行网络 probe 和 `adaptive_smoke.py --gpu`，再用 `--run` 申请真实资源。最后运行 CPSAM 实际任务、Window Resume 和取消测试。smoke 中的 CUDA 小运算不能替代模型测试。
+
+官方机制说明：[Slurm heterogeneous jobs](https://slurm.schedmd.com/heterogeneous_jobs.html)、[Dask-jobqueue SLURMCluster 参数](https://jobqueue.dask.org/en/latest/generated/dask_jobqueue.SLURMCluster.html)。

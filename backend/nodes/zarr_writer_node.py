@@ -318,13 +318,13 @@ def _validate_existing_store(
     chunks: tuple[int, ...],
     dtype: np.dtype,
 ) -> None:
-    """Open a resumed target without mutating it and verify its array contract."""
+    """Open a reusable target without mutating it and verify its array contract."""
     import zarr
 
     path = Path(output_path)
     if not path.exists():
         raise FileNotFoundError(
-            f"Cannot resume ZarrWriter because the output store does not exist: {path}"
+            f"Cannot reuse ZarrWriter output because the store does not exist: {path}"
         )
 
     if store_kind == "array":
@@ -332,11 +332,12 @@ def _validate_existing_store(
             target = zarr.open(str(path), mode="r+")
         except Exception as exc:
             raise ValueError(
-                f"Cannot resume ZarrWriter because {path} is not a readable Zarr array."
+                f"Cannot reuse ZarrWriter output because {path} is not a readable "
+                "Zarr array."
             ) from exc
         if not all(hasattr(target, field) for field in ("shape", "chunks", "dtype")):
             raise ValueError(
-                f"Cannot resume ZarrWriter: expected an array store at {path}, "
+                f"Cannot reuse ZarrWriter output: expected an array store at {path}, "
                 f"but found {type(target).__name__}."
             )
     elif store_kind == "ome_zarr":
@@ -344,18 +345,20 @@ def _validate_existing_store(
             group = zarr.open_group(str(path), mode="r+")
         except Exception as exc:
             raise ValueError(
-                f"Cannot resume ZarrWriter because {path} is not a readable Zarr group."
+                f"Cannot reuse ZarrWriter output because {path} is not a readable "
+                "Zarr group."
             ) from exc
         try:
             target = group[dataset_path]
         except (KeyError, TypeError) as exc:
             raise ValueError(
-                f"Cannot resume ZarrWriter because dataset path {dataset_path!r} "
+                f"Cannot reuse ZarrWriter output because dataset path {dataset_path!r} "
                 f"does not exist in {path}."
             ) from exc
         if not all(hasattr(target, field) for field in ("shape", "chunks", "dtype")):
             raise ValueError(
-                f"Cannot resume ZarrWriter: {dataset_path!r} in {path} is not a Zarr array."
+                f"Cannot reuse ZarrWriter output: {dataset_path!r} in {path} is not "
+                "a Zarr array."
             )
     else:
         raise ValueError(f"store_kind must be 'array' or 'ome_zarr', got {store_kind!r}.")
@@ -375,7 +378,8 @@ def _validate_existing_store(
         mismatches.append(f"dtype={actual_dtype}, expected={expected_dtype}")
     if mismatches:
         raise ValueError(
-            f"Cannot resume ZarrWriter because the existing target at {path} is incompatible: "
+            f"Cannot reuse ZarrWriter output because the existing target at {path} "
+            "is incompatible: "
             + "; ".join(mismatches)
         )
 
@@ -412,7 +416,25 @@ def _prepare_store(
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         if not overwrite:
-            raise FileExistsError(f"ZarrWriter output already exists: {path}")
+            _validate_existing_store(
+                output_path=output_path,
+                store_kind=store_kind,
+                dataset_path=dataset_path,
+                shape=shape,
+                chunks=chunks,
+                dtype=dtype,
+            )
+            # A new run can recompute labels with different segmentation
+            # parameters. Only Recovery Resume may reuse a previous stitch plan.
+            label_stitch_plan_path(path).unlink(missing_ok=True)
+            root = zarr.open(str(path), mode="r+")
+            if "workflow_label_stitching" in root.attrs:
+                del root.attrs["workflow_label_stitching"]
+            logger.info(
+                "[ZarrWriter] Reusing compatible output store without clearing it: %s",
+                path,
+            )
+            return
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path)
         else:
@@ -595,7 +617,7 @@ class ZarrWriter(BaseMapBlocksNode):
                 "axes": ("STRING", {"default": "", "multiline": False}),
                 "voxel_size": ("STRING", {"default": "", "multiline": False}),
                 "compressor_name": (["default", "zstd", "blosc", "lz4", "none"], {"default": "default"}),
-                "overwrite": ("BOOLEAN", {"default": True}),
+                "overwrite": ("BOOLEAN", {"default": False}),
                 "write_metadata": ("BOOLEAN", {"default": True}),
                 "stitch_labels": ("BOOLEAN", {"default": True}),
                 "stitch_min_contact_voxels": ("INT", {"default": 1, "min": 1, "max": 1000000}),
@@ -656,7 +678,7 @@ class ZarrWriter(BaseMapBlocksNode):
             axes=axes,
             voxel_size=voxel_size,
             compressor_name=str(params.get("compressor_name") or "default"),
-            overwrite=bool(params.get("overwrite", True)),
+            overwrite=bool(params.get("overwrite", False)),
             write_metadata=bool(params.get("write_metadata", True)),
             is_resuming=bool(runtime.get("is_resuming", False)),
         )

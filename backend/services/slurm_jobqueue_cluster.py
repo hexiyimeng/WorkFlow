@@ -35,6 +35,44 @@ _SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}\Z")
 _SAFE_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 
 
+@dataclass(frozen=True, slots=True)
+class SlurmJobSiteConfig:
+    """Operator settings shared by baseline components and elastic jobs."""
+
+    account: str = ""
+    qos: str = ""
+    reservation: str = ""
+    srun: str = "srun"
+    setup_script: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("account", "qos", "reservation"):
+            value = getattr(self, name)
+            if value and re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None:
+                raise ValueError(f"Slurm site {name} must be a single safe name.")
+        if not self.srun or any(c in self.srun for c in "\r\n\0"):
+            raise ValueError("WorkFlow_SLURM_SRUN must be an executable name or path.")
+        if self.setup_script:
+            path = Path(self.setup_script)
+            if (any(c in self.setup_script for c in "\r\n\0")
+                    or not path.is_absolute() or not path.is_file()):
+                raise ValueError(
+                    "WorkFlow_SLURM_WORKER_SETUP must be an existing absolute "
+                    "shell script accessible on every compute node."
+                )
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str] | None = None):
+        env = os.environ if environment is None else environment
+        return cls(
+            account=env.get("WorkFlow_SLURM_ACCOUNT", "").strip(),
+            qos=env.get("WorkFlow_SLURM_QOS", "").strip(),
+            reservation=env.get("WorkFlow_SLURM_RESERVATION", "").strip(),
+            srun=env.get("WorkFlow_SLURM_SRUN", "srun").strip() or "srun",
+            setup_script=env.get("WorkFlow_SLURM_WORKER_SETUP", "").strip(),
+        )
+
+
 def detect_heterogeneous_directive(submit_command: str) -> str:
     """Slurm renamed packjob/pack-group to hetjob/het-group in 20.02."""
     output = subprocess.run(shlex.split(submit_command) + ["--version"],
@@ -141,12 +179,16 @@ class PlannedSLURMJob(SLURMJob):
         submit_command: str | None = None,
         cancel_command: str | None = None,
         journal_directory: str | None = None,
+        step_command: str = "srun",
+        site_setup_script: str = "",
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.allocation_id = allocation_id
         self.submission_token = submission_token
         self.journal_directory = journal_directory
+        self.step_command = step_command
+        self.site_setup_script = site_setup_script
         if submit_command:
             self.submit_command = submit_command
         if cancel_command:
@@ -208,6 +250,10 @@ class BaselineSLURMJob(PlannedSLURMJob):
             for index, job in enumerate(self.components))
         lines = [self.shebang, headers, "set -euo pipefail", "pids=()",
                  "trap 'kill \"${pids[@]}\" 2>/dev/null || true; wait || true' EXIT TERM INT"]
+        # The batch shell also needs site modules/config to launch srun. Worker
+        # shells source the same file on their own nodes through the prologue.
+        setup_scripts = dict.fromkeys(job.site_setup_script for job in self.components)
+        lines.extend(f"source {shlex.quote(path)}" for path in setup_scripts if path)
         for index, job in enumerate(self.components):
             body = "\n".join([*job._job_script_prologue, "exec " + job._command_template])
             group_name = "pack-group" if self.heterogeneous_directive == "packjob" else "het-group"
@@ -215,7 +261,7 @@ class BaselineSLURMJob(PlannedSLURMJob):
             gres = next((directive for directive in job.job_extra_directives
                          if directive.startswith("--gres=")), "--gres=none")
             lines.append(
-                f"srun{group} --nodes=1 --ntasks=1 --cpus-per-task={job.worker_cores} "
+                f"{shlex.quote(job.step_command)}{group} --nodes=1 --ntasks=1 --cpus-per-task={job.worker_cores} "
                 f"--mem={math.ceil(job.worker_memory / 1024**2)}M {gres} --export=ALL "
                 f"/bin/bash -c {shlex.quote(body)} &"
             )
@@ -362,6 +408,7 @@ def build_planned_slurm_worker_spec(
     security: object,
     worker_port_range: str,
     nanny_port_range: str,
+    site_config: SlurmJobSiteConfig | None = None,
 ) -> PlannedSlurmWorkerSpec:
     """Translate one planner job into a standard SLURMJob Worker command."""
 
@@ -369,6 +416,7 @@ def build_planned_slurm_worker_spec(
     runtime = _absolute_directory(runtime_directory, name="runtime_directory")
     logs = _absolute_directory(run_directory, name="run_directory")
     python = _absolute_executable(python_executable, name="python_executable")
+    site = site_config if site_config is not None else SlurmJobSiteConfig.from_environment()
     if _SAFE_HOST_RE.fullmatch(scheduler_host) is None:
         raise ValueError("scheduler_host must be a safe IPv4 address or host name.")
     if type(scheduler_port) is not int or not 1 <= scheduler_port <= 65535:
@@ -390,6 +438,10 @@ def build_planned_slurm_worker_spec(
     ]
     if job.excluded_nodes:
         directives.append("--exclude=" + ",".join(job.excluded_nodes))
+    for option in ("qos", "reservation"):
+        value = getattr(site, option)
+        if value:
+            directives.append(f"--{option}={value}")
     if job.gpu:
         directives.append(f"--gres=gpu:{job.gpu}")
 
@@ -412,6 +464,7 @@ def build_planned_slurm_worker_spec(
         "set -euo pipefail",
         "umask 077",
         f"export PATH={shlex.quote(str(python.parent))}:/usr/local/bin:/usr/bin:/bin",
+        *([f"source {shlex.quote(site.setup_script)}"] if site.setup_script else []),
         f"export PYTHONPATH={shlex.quote(str(backend))}",
         "export PYTHONUNBUFFERED=1",
         # ``--export=NONE`` intentionally isolates compute jobs from the login
@@ -465,6 +518,9 @@ def build_planned_slurm_worker_spec(
         "submission_token": submission_token,
         "submit_command": sbatch_executable,
         "cancel_command": scancel_executable,
+        "step_command": site.srun,
+        "site_setup_script": site.setup_script,
+        "account": site.account or None,
         "queue": job.partition,
         "cores": job.cpu,
         "memory": f"{job.memory_gib}GiB",

@@ -339,7 +339,9 @@ def test_planner_uses_multiple_discovered_partitions_but_excludes_management() -
         partitions=("gpu", "compute", "mn", "control", "tao"),
         default_partition="compute",
     )
-    policy = slurm_policy_from_environment({})
+    policy = slurm_policy_from_environment({
+        "WorkFlow_SLURM_EXCLUDED_PARTITIONS": "mn,control",
+    })
     assert policy.max_cpus == 256
     partitions = policy.resolve_partitions(inventory.partition_names)
     assert partitions == ("gpu", "compute", "tao")
