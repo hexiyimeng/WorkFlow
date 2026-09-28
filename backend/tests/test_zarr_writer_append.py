@@ -36,6 +36,11 @@ def test_zarr_writer_defaults_to_preserving_existing_store() -> None:
     assert overwrite_config[1]["default"] is False
 
 
+def test_zarr_writer_does_not_expose_manual_axes_override() -> None:
+    assert "axes" not in ZarrWriter.INPUT_TYPES()["optional"]
+    assert ZarrWriter.ARRAY_AXES_BY_NDIM["array"][3] == ("Z", "Y", "X")
+
+
 def test_existing_store_is_preserved_and_new_block_uses_its_position(tmp_path) -> None:
     output_path = tmp_path / "result.zarr"
     _prepare(output_path)

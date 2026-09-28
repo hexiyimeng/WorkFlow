@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from nodes.cellpose_node import Cellpose, cellpose_block
+from nodes.cellpose_node import Cellpose, cellpose_block, validate_cellpose_model
 
 
 class _FakeModel:
@@ -33,6 +34,24 @@ def test_cellpose_defaults_to_cpsam() -> None:
 
     assert model_input[0][0] == "cpsam"
     assert model_input[1]["default"] == "cpsam"
+
+
+def test_unresolved_cpsam_does_not_fall_back_to_cellpose_cache(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(
+        FileNotFoundError,
+        match="Automatic Cellpose model downloads are disabled",
+    ):
+        validate_cellpose_model("cpsam", "cpsam")
+
+
+def test_any_resolved_cellpose_model_file_is_accepted(tmp_path) -> None:
+    model = tmp_path / "custom-cellpose-model"
+    model.write_bytes(b"model")
+
+    validate_cellpose_model(str(model), "custom-cellpose-model")
 
 
 def test_legacy_cyto3_workflow_uses_cpsam_and_native_patch_size() -> None:

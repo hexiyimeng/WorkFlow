@@ -81,6 +81,7 @@ def test_smoke_driver_checks_worker_types_and_cleans_up(monkeypatch, tmp_path, w
     assert module.main() == 0
     assert os.environ["WorkFlow_SLURM_RUNTIME_DIR"] == str(tmp_path)
     assert os.environ["WorkFlow_MODELS_DIR"] == str(tmp_path / "models")
+    assert "CELLPOSE_LOCAL_MODELS_PATH" not in os.environ
     report = json.loads(next((tmp_path / "test-runs").glob("*/result.json")).read_text())
     assert report["status"] == "PASS" and report["cleanupConfirmed"]
     assert {phase["profile"] for phase in report["phases"]} == (

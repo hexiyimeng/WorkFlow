@@ -85,9 +85,6 @@ def main():
     ).expanduser().resolve()
     os.environ.setdefault("WorkFlow_SLURM_RUNTIME_DIR", str(runtime))
     os.environ.setdefault("WorkFlow_MODELS_DIR", str(runtime / "models"))
-    os.environ.setdefault(
-        "CELLPOSE_LOCAL_MODELS_PATH", str(runtime / "models" / "cellpose")
-    )
 
     import dask
     import distributed

@@ -80,6 +80,8 @@ def test_site_options_reach_baseline_and_elastic_scripts(tmp_path):
         assert script.count("#SBATCH --qos=normal") == count
         assert script.count("#SBATCH --reservation=experiment") == count
         assert script.count("#SBATCH -p batch") == count
+        assert script.count("export WorkFlow_MODELS_DIR=") == count
+        assert "CELLPOSE_LOCAL_MODELS_PATH" not in script
         assert "SITE_READY" not in script
     source_line = f"source {shlex.quote(str(setup))}"
     assert source_line in elastic

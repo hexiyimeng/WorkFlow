@@ -240,7 +240,6 @@ export WorkFlow_SLURM_CPUS_PER_NODE="$SLURM_CPUS_PER_NODE"
 export WorkFlow_SLURM_GPUS_PER_NODE="$SLURM_GPUS_PER_NODE"
 export WorkFlow_SLURM_MEMORY_GIB_PER_NODE="$SLURM_MEMORY_GIB_PER_NODE"
 export WorkFlow_MODELS_DIR="$WORKFLOW_RUNTIME_DIR/models"
-export CELLPOSE_LOCAL_MODELS_PATH="$WORKFLOW_RUNTIME_DIR/models/cellpose"
 export WorkFlow_CUDA_MODE="disabled"
 export CUDA_VISIBLE_DEVICES=""
 # The on-demand SLURMCluster Scheduler lives inside this long-running process.

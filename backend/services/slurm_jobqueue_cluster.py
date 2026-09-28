@@ -483,7 +483,6 @@ def build_planned_slurm_worker_spec(
         f"export OPENBLAS_NUM_THREADS={threads_per_worker}",
         f"export NUMEXPR_NUM_THREADS={threads_per_worker}",
         f"export WorkFlow_MODELS_DIR={shlex.quote(str(runtime / 'models'))}",
-        f"export CELLPOSE_LOCAL_MODELS_PATH={shlex.quote(str(runtime / 'models' / 'cellpose'))}",
         f"WORKFLOW_FALLBACK_SCRATCH={shlex.quote(str(fallback_scratch))}",
         'export WORKFLOW_DASK_LOCAL_DIRECTORY="${SLURM_TMPDIR:-$WORKFLOW_FALLBACK_SCRATCH}"',
         "mkdir -p \"$WORKFLOW_DASK_LOCAL_DIRECTORY\"",

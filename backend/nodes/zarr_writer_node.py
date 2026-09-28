@@ -614,7 +614,6 @@ class ZarrWriter(BaseMapBlocksNode):
             "optional": {
                 "store_kind": (["array", "ome_zarr"], {"default": "array"}),
                 "dataset_path": ("STRING", {"default": "0", "multiline": False}),
-                "axes": ("STRING", {"default": "", "multiline": False}),
                 "voxel_size": ("STRING", {"default": "", "multiline": False}),
                 "compressor_name": (["default", "zstd", "blosc", "lz4", "none"], {"default": "default"}),
                 "overwrite": ("BOOLEAN", {"default": False}),

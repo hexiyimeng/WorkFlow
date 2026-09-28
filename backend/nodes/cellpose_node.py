@@ -75,14 +75,13 @@ def create_cellpose_model(model_ref: str, device: str):
 
 
 def validate_cellpose_model(model_ref: str, requested_name: str) -> None:
-    if str(model_ref) == "cpsam" and str(requested_name) == "cpsam":
-        return
-    if not Path(model_ref).exists():
+    if not Path(model_ref).is_file():
         configured_directory = get_provider_model_dir("cellpose")
         raise FileNotFoundError(
             f"Cellpose model {requested_name!r} is not installed in the "
             f"configured Cellpose model directory {configured_directory}. "
-            "Configure the shared model root with WorkFlow_MODELS_DIR when needed."
+            "Install the model there or configure the shared model root with "
+            "WorkFlow_MODELS_DIR. Automatic Cellpose model downloads are disabled."
         )
 
 
