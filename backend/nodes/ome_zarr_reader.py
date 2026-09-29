@@ -64,7 +64,11 @@ def _normalize_axes(value: Any, ndim: int) -> tuple[str, ...]:
 
 
 def _resolve_group_array(group, requested_path: str | None, multiscale_index: int, scale_level: int):
-    multiscales = group.attrs.get("multiscales", []) or []
+    attrs = dict(group.attrs or {})
+    # NGFF <= 0.4 stores multiscales at the top level of the group attrs;
+    # NGFF 0.5 (zarr v3) namespaces it under an "ome" attribute.
+    ome_namespace = attrs.get("ome") if isinstance(attrs.get("ome"), dict) else {}
+    multiscales = attrs.get("multiscales") or ome_namespace.get("multiscales") or []
     selected_multiscale = None
     array_path = requested_path
 

@@ -133,8 +133,13 @@ def _chunk_slices(
     yield from recurse(0, [], [])
 
 
-def _compressor() -> Blosc:
+def _compressor():
     return Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+
+
+def _open_partial_group(partial: Path):
+    # Keep the converter on zarr v2 output; zarr 3 defaults new groups to v3.
+    return zarr.open_group(str(partial), mode="a", zarr_format=2)
 
 
 def _copy_chunks(
@@ -230,7 +235,7 @@ def convert_image(
             block_id=block_id,
             signature=signature,
         )
-        root = zarr.open_group(str(partial), mode="a")
+        root = _open_partial_group(partial)
         root.attrs.update({
             "workflowConversionKind": "image",
             "workflowConversionStatus": "converting",
@@ -244,12 +249,12 @@ def convert_image(
         )
         for channel_index, channel_name in enumerate(CHANNEL_NAMES):
             channel_group = root.require_group(f"channels/{channel_name}")
-            target = channel_group.require_dataset(
+            target = channel_group.require_array(
                 "0",
                 shape=spatial_shape,
                 chunks=spatial_chunks,
                 dtype=source.dtype,
-                compressor=_compressor(),
+                compressors=[_compressor()],
                 fill_value=0,
                 overwrite=False,
             )
@@ -309,7 +314,7 @@ def convert_reference(
             block_id=block_id,
             signature=signature,
         )
-        root = zarr.open_group(str(partial), mode="a")
+        root = _open_partial_group(partial)
         root.attrs.update({
             "workflowConversionKind": "reference",
             "workflowConversionStatus": "converting",
@@ -330,12 +335,12 @@ def convert_reference(
         mask_chunks = tuple(
             min(size, chunk) for size, chunk in zip(mask_shape, SPATIAL_CHUNKS)
         )
-        target_masks = root.require_dataset(
+        target_masks = root.require_array(
             "0",
             shape=mask_shape,
             chunks=mask_chunks,
             dtype=masks.dtype,
-            compressor=_compressor(),
+            compressors=[_compressor()],
             fill_value=0,
             overwrite=False,
         )
@@ -355,12 +360,12 @@ def convert_reference(
             if cells.ndim == 1
             else (row_chunk, max(1, cells_shape[1]))
         )
-        target_cells = root.require_dataset(
+        target_cells = root.require_array(
             "cells",
             shape=cells_shape,
             chunks=cells_chunks,
             dtype=cells.dtype,
-            compressor=_compressor(),
+            compressors=[_compressor()],
             fill_value=0,
             overwrite=False,
         )

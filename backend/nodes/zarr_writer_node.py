@@ -253,17 +253,35 @@ def _write_with_storage_chunk_locks(
             raise first_release_error
 
 
-def _prepare_compressor(name: str):
+def _prepare_compressor(name: str, zarr_format: int):
+    """Return the compressor for ``zarr_format``.
+
+    Zarr v2 stores only accept numcodecs codec instances; zarr v3 stores
+    use the native ``zarr.codecs`` classes so the written chunks stay
+    standard-spec and readable by generic v3 tooling.
+    """
     compressor_name = str(name or "default").strip().lower()
     if compressor_name in {"default", "zstd"}:
+        if zarr_format == 3:
+            from zarr.codecs import ZstdCodec
+
+            return [ZstdCodec(level=3)]
         import numcodecs
 
         return numcodecs.Zstd(level=3)
     if compressor_name == "blosc":
+        if zarr_format == 3:
+            from zarr.codecs import BloscCodec
+
+            return [BloscCodec(cname="zstd", clevel=3, shuffle="shuffle")]
         import numcodecs
 
         return numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.SHUFFLE)
     if compressor_name == "lz4":
+        if zarr_format == 3:
+            from zarr.codecs import BloscCodec
+
+            return [BloscCodec(cname="lz4", clevel=3, shuffle="shuffle")]
         import numcodecs
 
         return numcodecs.LZ4(acceleration=1)
@@ -272,27 +290,60 @@ def _prepare_compressor(name: str):
     raise ValueError(f"Unsupported compressor_name={name!r}.")
 
 
-def _create_zarr_array(container, name: str | None, *, shape, chunks, dtype, compressor):
-    kwargs = {
+def _array_creation_kwargs(
+    *,
+    shape,
+    chunks,
+    dtype,
+    compressor,
+    zarr_format: int,
+) -> dict[str, Any]:
+    """Shared zarr array creation kwargs; v2 takes ``compressor``, v3 ``compressors``."""
+    kwargs: dict[str, Any] = {
         "shape": tuple(int(x) for x in shape),
         "chunks": tuple(int(x) for x in chunks),
         "dtype": np.dtype(dtype),
         "overwrite": True,
     }
-    if compressor is not None:
+    if zarr_format == 3:
+        kwargs["compressors"] = compressor
+    else:
         kwargs["compressor"] = compressor
-    try:
-        if name is None:
-            return container.create(**kwargs)
-        return container.create_dataset(name, **kwargs)
-    except TypeError:
-        kwargs.pop("compressor", None)
-        if name is None:
-            return container.create(**kwargs)
-        return container.create_dataset(name, **kwargs)
+    return kwargs
 
 
-def _create_nested_dataset(group, dataset_path: str, *, shape, chunks, dtype, compressor):
+def _create_zarr_array(
+    container,
+    name: str | None,
+    *,
+    shape,
+    chunks,
+    dtype,
+    compressor,
+    zarr_format: int,
+):
+    kwargs = _array_creation_kwargs(
+        shape=shape,
+        chunks=chunks,
+        dtype=dtype,
+        compressor=compressor,
+        zarr_format=zarr_format,
+    )
+    if name is None:
+        raise ValueError("zarr_format 3 group stores require a dataset name.")
+    return container.create_array(name, **kwargs)
+
+
+def _create_nested_dataset(
+    group,
+    dataset_path: str,
+    *,
+    shape,
+    chunks,
+    dtype,
+    compressor,
+    zarr_format: int,
+):
     parts = [part for part in dataset_path.split("/") if part]
     if not parts:
         raise ValueError("dataset_path cannot be empty.")
@@ -306,6 +357,7 @@ def _create_nested_dataset(group, dataset_path: str, *, shape, chunks, dtype, co
         chunks=chunks,
         dtype=dtype,
         compressor=compressor,
+        zarr_format=zarr_format,
     )
 
 
@@ -317,6 +369,7 @@ def _validate_existing_store(
     shape: tuple[int, ...],
     chunks: tuple[int, ...],
     dtype: np.dtype,
+    zarr_format: int,
 ) -> None:
     """Open a resumed target without mutating it and verify its array contract."""
     import zarr
@@ -363,6 +416,13 @@ def _validate_existing_store(
     expected_shape = tuple(int(x) for x in shape)
     expected_chunks = tuple(int(x) for x in chunks)
     expected_dtype = np.dtype(dtype)
+    actual_format = int(getattr(target.metadata, "zarr_format", 0) or 0)
+    if actual_format != int(zarr_format):
+        raise ValueError(
+            "Cannot resume ZarrWriter because the existing target at "
+            f"{output_path} uses zarr_format={actual_format} but "
+            f"zarr_format={zarr_format} was requested."
+        )
     actual_shape = tuple(int(x) for x in target.shape)
     actual_chunks = tuple(int(x) for x in target.chunks)
     actual_dtype = np.dtype(target.dtype)
@@ -380,6 +440,39 @@ def _validate_existing_store(
         )
 
 
+def _write_ome_multiscales_metadata(
+    group,
+    *,
+    dataset_path: str,
+    axes: tuple[str, ...],
+    voxel_size: tuple[float, ...],
+    name: str,
+    zarr_format: int,
+) -> None:
+    """Write NGFF multiscales metadata via the ome-zarr library.
+
+    Zarr v3 stores use NGFF 0.5 (metadata namespaced under the group's
+    ``ome`` attribute); zarr v2 stores use NGFF 0.4.  Axis types are
+    inferred from the axis names by ome-zarr (x/y/z -> space, c ->
+    channel, t -> time).
+    """
+    from ome_zarr.format import FormatV04, FormatV05
+    from ome_zarr.writer import write_multiscales_metadata
+
+    write_multiscales_metadata(
+        group,
+        datasets=[{
+            "path": dataset_path,
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [float(v) for v in voxel_size]}
+            ],
+        }],
+        fmt=(FormatV05() if int(zarr_format) == 3 else FormatV04()),
+        axes=[str(axis).lower() for axis in axes],
+        name=name,
+    )
+
+
 def _prepare_store(
     *,
     output_path: str,
@@ -393,6 +486,7 @@ def _prepare_store(
     compressor_name: str,
     overwrite: bool,
     write_metadata: bool,
+    zarr_format: int = 3,
     is_resuming: bool = False,
 ) -> None:
     import zarr
@@ -406,6 +500,7 @@ def _prepare_store(
             shape=shape,
             chunks=chunks,
             dtype=dtype,
+            zarr_format=zarr_format,
         )
         return
 
@@ -418,7 +513,7 @@ def _prepare_store(
         else:
             path.unlink()
 
-    compressor = _prepare_compressor(compressor_name)
+    compressor = _prepare_compressor(compressor_name, zarr_format)
     created_at = (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
@@ -426,18 +521,23 @@ def _prepare_store(
         .replace("+00:00", "Z")
     )
     if store_kind == "array":
-        arr = zarr.open(
+        arr = zarr.create_array(
             str(path),
-            mode="w",
-            shape=shape,
-            chunks=chunks,
-            dtype=dtype,
-            compressor=compressor,
+            name=None,
+            zarr_format=zarr_format,
+            **_array_creation_kwargs(
+                shape=shape,
+                chunks=chunks,
+                dtype=dtype,
+                compressor=compressor,
+                zarr_format=zarr_format,
+            ),
         )
         if write_metadata:
             arr.attrs["workflow_writer"] = {
                 "node": "ZarrWriter",
                 "store_kind": store_kind,
+                "zarr_format": int(zarr_format),
                 "shape": shape,
                 "chunks": chunks,
                 "dtype": str(dtype),
@@ -450,7 +550,7 @@ def _prepare_store(
     if store_kind != "ome_zarr":
         raise ValueError(f"store_kind must be 'array' or 'ome_zarr', got {store_kind!r}.")
 
-    group = zarr.open_group(str(path), mode="w")
+    group = zarr.open_group(str(path), mode="w", zarr_format=zarr_format)
     arr = _create_nested_dataset(
         group,
         dataset_path,
@@ -458,20 +558,21 @@ def _prepare_store(
         chunks=chunks,
         dtype=dtype,
         compressor=compressor,
+        zarr_format=zarr_format,
     )
     if write_metadata:
-        group.attrs["multiscales"] = [{
-            "version": "0.4",
-            "name": path.stem,
-            "datasets": [{
-                "path": dataset_path,
-                "coordinateTransformations": [{"type": "scale", "scale": list(voxel_size)}],
-            }],
-            "axes": [{"name": str(axis).lower()} for axis in axes],
-        }]
+        _write_ome_multiscales_metadata(
+            group,
+            dataset_path=dataset_path,
+            axes=axes,
+            voxel_size=voxel_size,
+            name=path.stem,
+            zarr_format=zarr_format,
+        )
         arr.attrs["workflow_writer"] = {
             "node": "ZarrWriter",
             "store_kind": store_kind,
+            "zarr_format": int(zarr_format),
             "shape": shape,
             "chunks": chunks,
             "dtype": str(dtype),
@@ -591,6 +692,7 @@ class ZarrWriter(BaseMapBlocksNode):
             },
             "optional": {
                 "store_kind": (["array", "ome_zarr"], {"default": "array"}),
+                "zarr_format": (["3", "2"], {"default": "3"}),
                 "dataset_path": ("STRING", {"default": "0", "multiline": False}),
                 "axes": ("STRING", {"default": "", "multiline": False}),
                 "voxel_size": ("STRING", {"default": "", "multiline": False}),
@@ -618,6 +720,14 @@ class ZarrWriter(BaseMapBlocksNode):
         runtime = runtime or {}
         output_path = _normalize_output_path(params.get("output_path", ""))
         store_kind = str(params.get("store_kind") or "array").strip().lower()
+        try:
+            zarr_format = int(str(params.get("zarr_format") or "3").strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"zarr_format must be '2' or '3', got {params.get('zarr_format')!r}."
+            ) from exc
+        if zarr_format not in (2, 3):
+            raise ValueError(f"zarr_format must be '2' or '3', got {zarr_format}.")
         dataset_path = _normalize_dataset_path(params.get("dataset_path", "0"))
         axes = tuple(
             str(axis).upper()
@@ -658,11 +768,13 @@ class ZarrWriter(BaseMapBlocksNode):
             compressor_name=str(params.get("compressor_name") or "default"),
             overwrite=bool(params.get("overwrite", True)),
             write_metadata=bool(params.get("write_metadata", True)),
+            zarr_format=zarr_format,
             is_resuming=bool(runtime.get("is_resuming", False)),
         )
         return {
             "output_path": output_path,
             "store_kind": store_kind,
+            "zarr_format": zarr_format,
             "dataset_path": dataset_path,
             "input_shape": input_shape,
             "input_chunks": input_chunks,
