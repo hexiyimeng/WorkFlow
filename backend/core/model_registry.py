@@ -26,6 +26,16 @@ class ModelRegistry:
     def __init__(self, models_root: Path | None = None):
         env_root = os.getenv("WorkFlow_MODELS_DIR")
         self.models_root = normalize_path(models_root or env_root or DEFAULT_MODELS_ROOT).resolve()
+        self.extra_roots: dict[str, list[Path]] = {}
+
+    def register_search_root(self, provider: str, directory) -> None:
+        """Add a node-local directory searched after the provider model dir."""
+
+        provider = self._normalize_provider(provider)
+        path = normalize_path(directory).resolve()
+        roots = self.extra_roots.setdefault(provider, [])
+        if path not in roots:
+            roots.append(path)
 
     def provider_dir(self, provider: str, *, create: bool = False) -> Path:
         provider = self._normalize_provider(provider)
@@ -91,6 +101,10 @@ class ModelRegistry:
         resolved = self._resolve_in_directory(directory, name)
         if resolved:
             return resolved
+        for extra_root in self.extra_roots.get(provider, ()):
+            resolved = self._resolve_in_directory(extra_root, name)
+            if resolved:
+                return resolved
         return None
 
     def _resolve_in_directory(self, directory: Path, name: str) -> str | None:
@@ -143,6 +157,12 @@ class ModelRegistry:
 
 
 model_registry = ModelRegistry()
+
+
+def register_model_search_root(provider: str, directory) -> None:
+    """Register an extra node-local directory searched for provider models."""
+
+    model_registry.register_search_root(provider, directory)
 
 
 def get_models_root() -> str:

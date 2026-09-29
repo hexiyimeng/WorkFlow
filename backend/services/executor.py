@@ -20,6 +20,7 @@ from core.invocation_builder import (
     prepare_node_inputs,
 )
 from core.config import config
+from core.execution_paths import normalize_execution_path
 from core.worker_profiles import dask_annotation_kwargs
 from core.resource_planner import parse_required_worker_resources
 from core.platform import reclaim_process_memory, rewrite_dashboard_url
@@ -184,6 +185,7 @@ def _resolve_connected_input_types(node_inputs: dict, graph: dict | None = None)
 
 
 def validate_graph_types(graph: dict):
+    validate_output_path_uniqueness(graph)
     for target_id, target_data in graph.items():
         target_type_name = target_data.get("type")
         target_cls = NODE_CLASS_MAPPINGS.get(target_type_name)
@@ -272,6 +274,61 @@ def find_execution_roots(graph: dict) -> list[str]:
             and node_id not in referenced_as_source
         )
     ]
+
+
+def validate_output_path_uniqueness(graph: dict):
+    """Reject OUTPUT nodes whose target paths coincide or nest.
+
+    Terminal writers delete and recreate their output during graph build, and
+    node preprocess hooks run concurrently, so two writers sharing (or
+    nesting inside) one path race each other's rmtree/create calls and
+    corrupt or delete both outputs.
+    """
+
+    entries: list[tuple[str, str, str]] = []
+    for node_id, node_data in graph.items():
+        if not isinstance(node_data, dict):
+            continue
+        node_type = node_data.get("type")
+        node_cls = NODE_CLASS_MAPPINGS.get(node_type)
+        if node_cls is None or not getattr(node_cls, "OUTPUT_NODE", False):
+            continue
+        path_input = getattr(node_cls, "OUTPUT_PATH_INPUT", None)
+        if not isinstance(path_input, str) or not path_input.strip():
+            continue
+        inputs = node_data.get("inputs") or {}
+        value = inputs.get(path_input)
+        # Non-literal or empty paths are validated later by the node itself.
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = normalize_execution_path(
+            value,
+            name=f"OUTPUT node {node_id!r} input {path_input!r}",
+        )
+        entries.append((node_id, str(node_type), normalized))
+
+    for left in range(len(entries)):
+        for right in range(left + 1, len(entries)):
+            left_id, left_type, left_path = entries[left]
+            right_id, right_type, right_path = entries[right]
+            if left_path == right_path:
+                raise ValueError(
+                    "Output path conflict: "
+                    f"{left_type}({left_id}) and {right_type}({right_id}) both "
+                    f"write to {left_path}. Terminal writers reset their output "
+                    "at graph build; give each OUTPUT node its own path."
+                )
+            if (
+                left_path.startswith(right_path + "/")
+                or right_path.startswith(left_path + "/")
+            ):
+                raise ValueError(
+                    "Output path conflict: the output paths of "
+                    f"{left_type}({left_id}) and {right_type}({right_id}) nest "
+                    f"inside each other ({left_path} vs {right_path}). Terminal "
+                    "writers reset their output at graph build, which would "
+                    "delete the nested output of the other node."
+                )
 
 
 # =============================================================================

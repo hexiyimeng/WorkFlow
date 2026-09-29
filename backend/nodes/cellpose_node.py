@@ -27,13 +27,25 @@ logger = logging.getLogger("WorkFlow.Cellpose")
 CELLPOSE_TRAINING_DIAMETER = 30.0
 INCOMPATIBLE_CPSAM_MODEL_NAMES = {
     "cyto3",
-    "cpsam_v2",
-    "cpdino",
-    "cpdino-vitb",
 }
 
 
-def create_cellpose_model(model_ref: str, device: str):
+def cellpose_major_version() -> int:
+    """Installed Cellpose major version; unknown versions assume v4+."""
+
+    try:
+        from importlib.metadata import version
+
+        return int(str(version("cellpose")).split(".")[0])
+    except Exception:
+        return 4
+
+
+def create_cellpose_model(
+    model_ref: str,
+    device: str,
+    diam_mean: float | None = None,
+):
     """Create a worker-local Cellpose model without importing torch at plugin load."""
 
     if device != "cuda:0":
@@ -71,7 +83,25 @@ def create_cellpose_model(model_ref: str, device: str):
 
     kwargs["pretrained_model"] = str(model_ref)
 
-    return models.CellposeModel(**kwargs)
+    is_legacy_diameter_model = bool(diam_mean) and float(diam_mean) > 0
+    if is_legacy_diameter_model and cellpose_major_version() < 4:
+        # Legacy (CP3) custom models such as the one used by
+        # scripts/segmentation.py are diameter-calibrated and run as a
+        # single network.  CP4 removed net_avg and ignores diam_mean.
+        kwargs["diam_mean"] = float(diam_mean)
+        kwargs["net_avg"] = False
+
+    try:
+        return models.CellposeModel(**kwargs)
+    except ValueError as exc:
+        if is_legacy_diameter_model and "CP3" in str(exc):
+            raise RuntimeError(
+                f"Cellpose model {model_ref!r} is a Cellpose 3 model, but the "
+                "installed Cellpose v4 runtime cannot execute CP3 models. "
+                "Select a CPSAM-compatible model, or run this workflow on a "
+                "Cellpose 3 environment."
+            ) from exc
+        raise
 
 
 def validate_cellpose_model(model_ref: str, requested_name: str) -> None:
@@ -97,6 +127,7 @@ def cellpose_block(
     gpu_batch_size: int = 8,
     do_3d: str = "auto",
     normalize: bool = True,
+    diam_mean: float = 0.0,
     ctx=None,
 ) -> np.ndarray:
     if ctx is None:
@@ -171,13 +202,36 @@ def cellpose_block(
             work_image = primary
             has_channels = False
 
-    model = ctx.model(
-        provider="cellpose",
-        name=model_name,
-        factory=create_cellpose_model,
-        clear_cuda=True,
-        validate=validate_cellpose_model,
-    )
+    diam_mean = float(diam_mean or 0.0)
+    if diam_mean > 0:
+        # Legacy diameter-calibrated models (scripts/segmentation.py used
+        # diam_mean=15) need the value at model construction time.  Keep them
+        # in a cache namespace keyed by diam_mean so they never alias the
+        # default factory cache.
+        from core.model_registry import resolve_model_path
+
+        resolved_name = resolve_model_path("cellpose", model_name) or model_name
+        validate_cellpose_model(resolved_name, model_name)
+
+        def _legacy_factory():
+            return create_cellpose_model(
+                resolved_name, ctx.device, diam_mean=diam_mean
+            )
+
+        model = ctx.cached(
+            namespace="model:cellpose",
+            key=("cellpose", resolved_name, ctx.device, diam_mean),
+            factory=_legacy_factory,
+            clear_cuda=True,
+        )
+    else:
+        model = ctx.model(
+            provider="cellpose",
+            name=model_name,
+            factory=create_cellpose_model,
+            clear_cuda=True,
+            validate=validate_cellpose_model,
+        )
 
     output = np.zeros(
         work_image.shape[:-1] if has_channels else work_image.shape,
