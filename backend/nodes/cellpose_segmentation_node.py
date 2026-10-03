@@ -40,7 +40,6 @@ register_model_search_root("cellpose", SEG_MODELS_DIR)
 # Legacy Cellpose 3 model used by scripts/segmentation.py
 # (pretrained_model='../models/199082').
 SEG_SCRIPT_MODEL_NAME = "199082"
-SEG_SCRIPT_MODEL_DIAM_MEAN = 15.0
 
 
 def list_seg_models() -> list[str]:
@@ -239,10 +238,10 @@ class CellposeSegmentation(BaseMapOverlapNode):
                     model_names,
                     {"default": default_model},
                 ),
-                # scripts/segmentation.py builds this model with diam_mean=15.
-                # Ignored by Cellpose v4 runtimes; leave 0 to keep the
-                # library default for CPSAM models.
-                "diam_mean": ("FLOAT", {"default": SEG_SCRIPT_MODEL_DIAM_MEAN, "min": 0.0, "max": 500.0}),
+                # -1 reads the diam_mean saved in the model checkpoint; a
+                # positive value overrides it (legacy CP3 diameter-calibrated
+                # models). Ignored by Cellpose v4 runtimes.
+                "diam_mean": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 500.0}),
                 "diameter": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 500.0}),
                 "flow_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0}),
                 "cellprob_threshold": ("FLOAT", {"default": 0.0, "min": -6.0, "max": 6.0}),

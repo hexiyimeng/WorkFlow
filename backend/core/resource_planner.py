@@ -202,6 +202,7 @@ def plan_workflow_resources(
     partition: str | None = None,
     partitions: Sequence[str] | None = None,
     excluded_nodes: Sequence[str] = (),
+    profile_partitions: Mapping[str, str] | None = None,
 ) -> SlurmAllocationPlan:
     if not workflow.required_worker_profiles:
         raise ResourcePlanningError("The workflow has no Worker Profile requirements.")
@@ -231,6 +232,13 @@ def plan_workflow_resources(
         raise ResourcePlanningError("No Slurm partition is eligible for this workflow.")
     if len(set(selected_partitions)) != len(selected_partitions):
         raise ResourcePlanningError("Eligible Slurm partitions must be unique.")
+    for profile_name, pinned_partition in (profile_partitions or {}).items():
+        if pinned_partition not in selected_partitions:
+            raise ResourcePlanningError(
+                f"Worker Profile {profile_name!r} is pinned to partition "
+                f"{pinned_partition!r}, which is not among the eligible "
+                "partition(s): " + ", ".join(selected_partitions) + "."
+            )
 
     eligible_nodes = sorted(
         inventory.for_partitions(
@@ -278,8 +286,12 @@ def plan_workflow_resources(
     jobs: list[SlurmJobRequirement] = []
     node_jobs: dict[str, list[SlurmJobRequirement]] = {}
     for profile, pool, scale_index, cpu, memory_gib, gpu in units:
+        pinned_partition = (profile_partitions or {}).get(profile.name)
+        considered_partitions = (
+            (pinned_partition,) if pinned_partition is not None else selected_partitions
+        )
         compatible_partitions = tuple(
-            partition_name for partition_name in selected_partitions
+            partition_name for partition_name in considered_partitions
             if any(
                 partition_name in node.partitions
                 and cpu <= node.cpu_total

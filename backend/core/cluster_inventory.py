@@ -322,6 +322,11 @@ def parse_scontrol_show_node(output: str) -> ClusterInventory:
             item for item in partitions_text.split(",")
             if item and item.lower() not in {"(null)", "n/a"}
         )
+        # Controller-side remnant nodes can lack Partitions entirely (e.g.
+        # DOWN+NOT_RESPONDING); they are unschedulable and absent from sinfo,
+        # so drop them here just as the sinfo merge in load() would.
+        if not partitions:
+            continue
         cpu_total = _positive_or_zero(
             fields.get("CPUTot", fields.get("CPUs", 0)),
             name=f"{name}.CPUTot",

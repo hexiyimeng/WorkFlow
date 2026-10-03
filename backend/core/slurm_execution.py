@@ -188,6 +188,8 @@ class SlurmPolicy:
     allowed_partitions: tuple[str, ...] = ()
     excluded_partitions: tuple[str, ...] = ()
     excluded_nodes: tuple[str, ...] = ()
+    gpu_directive: str = "gres"
+    profile_partitions: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         partition = self.partition
@@ -240,6 +242,33 @@ class SlurmPolicy:
                 + ", ".join(sorted(overlap))
                 + "."
             )
+
+        if self.gpu_directive not in ("gres", "gpus"):
+            raise ValueError("gpu_directive must be 'gres' or 'gpus'.")
+        if not isinstance(self.profile_partitions, tuple):
+            raise ValueError("profile_partitions must be a tuple of pairs.")
+        pinned_profiles: set[str] = set()
+        for index, pair in enumerate(self.profile_partitions):
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise ValueError(
+                    f"profile_partitions[{index}] must be a (profile, partition) pair."
+                )
+            profile_name, partition_name = pair
+            if not isinstance(profile_name, str) or not profile_name.strip():
+                raise ValueError(f"profile_partitions[{index}] has an invalid profile.")
+            _validate_partition(partition_name, name=f"profile_partitions[{index}]")
+            if profile_name in pinned_profiles:
+                raise ValueError("profile_partitions must not repeat a profile.")
+            pinned_profiles.add(profile_name)
+            if partition_name in self.excluded_partitions:
+                raise ValueError(
+                    f"profile_partitions pins excluded partition {partition_name!r}."
+                )
+            if allowed and partition_name not in allowed:
+                raise ValueError(
+                    f"profile_partitions pins partition {partition_name!r} "
+                    "outside allowed_partitions."
+                )
 
     def resolve_partitions(self, discovered: Iterable[str]) -> tuple[str, ...]:
         """Apply operator overrides to partitions discovered from ``sinfo``."""

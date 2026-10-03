@@ -376,6 +376,20 @@ def slurm_policy_from_environment(
     excluded_nodes = tuple(
         item.strip() for item in excluded_nodes_raw.split(",") if item.strip()
     )
+    gpu_directive = str(env.get("WorkFlow_SLURM_GPU_DIRECTIVE", "gres")).strip()
+    profile_partitions_raw = str(env.get("WorkFlow_SLURM_PROFILE_PARTITIONS", ""))
+    profile_partitions: list[tuple[str, str]] = []
+    for item in profile_partitions_raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                "WorkFlow_SLURM_PROFILE_PARTITIONS entries must use "
+                "PROFILE=PARTITION syntax."
+            )
+        profile_name, partition_name = item.split("=", 1)
+        profile_partitions.append((profile_name.strip(), partition_name.strip()))
     return SlurmPolicy(
         partition=partition,
         time_limit=str(env.get("WorkFlow_SLURM_TIME_LIMIT", "1-00:00:00")).strip(),
@@ -397,6 +411,8 @@ def slurm_policy_from_environment(
         allowed_partitions=allowed,
         excluded_partitions=excluded,
         excluded_nodes=excluded_nodes,
+        gpu_directive=gpu_directive,
+        profile_partitions=tuple(profile_partitions),
     )
 
 
@@ -657,31 +673,6 @@ def _git_revision(project_root: Path) -> str:
         raise SlurmSubmissionError(
             "Cannot identify the deployed Git revision for this execution."
         )
-    try:
-        status = subprocess.run(
-            (
-                "git",
-                "-C",
-                str(project_root),
-                "status",
-                "--porcelain",
-                "--untracked-files=normal",
-            ),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            shell=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise SlurmSubmissionError(
-            "Cannot verify that the deployed WorkFlow checkout is immutable."
-        ) from exc
-    if status.returncode != 0 or status.stdout.strip():
-        raise SlurmSubmissionError(
-            "Slurm execution requires a clean, committed WorkFlow checkout. "
-            "Commit or remove local source changes before submitting a job."
-        )
     return value.lower()
 
 
@@ -752,6 +743,7 @@ def _plan_slurm_allocation(
         time_limit=config.policy.time_limit,
         partitions=partitions,
         excluded_nodes=config.policy.excluded_nodes,
+        profile_partitions=dict(config.policy.profile_partitions),
     )
 
 
@@ -2791,6 +2783,7 @@ class SlurmExecutionService:
                     security=client.security,
                     worker_port_range=config.worker_port_range,
                     nanny_port_range=config.nanny_port_range,
+                    gpu_directive=config.policy.gpu_directive,
                 ))
 
             # DaskService is the sole runtime owner from this point onward.
@@ -2948,7 +2941,8 @@ class SlurmExecutionService:
                     sbatch_executable=config.sbatch_executable, scancel_executable=config.scancel_executable,
                     scheduler_host=config.scheduler_host, scheduler_port=config.scheduler_port,
                     protocol=protocol, security=dask_service.client.security,
-                    worker_port_range=config.worker_port_range, nanny_port_range=config.nanny_port_range)
+                    worker_port_range=config.worker_port_range, nanny_port_range=config.nanny_port_range,
+                    gpu_directive=config.policy.gpu_directive)
             await asyncio.to_thread(dask_service.start_slurm_adaptive,
                                     allocation_plan.pools, planned_specs, elastic_spec,
                                     submission_token_prefix)

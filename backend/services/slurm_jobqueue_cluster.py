@@ -213,7 +213,7 @@ class BaselineSLURMJob(PlannedSLURMJob):
             group_name = "pack-group" if self.heterogeneous_directive == "packjob" else "het-group"
             group = f" --{group_name}={index}" if len(self.components) > 1 else ""
             gres = next((directive for directive in job.job_extra_directives
-                         if directive.startswith("--gres=")), "--gres=none")
+                         if directive.startswith(("--gres=", "--gpus="))), "--gres=none")
             lines.append(
                 f"srun{group} --nodes=1 --ntasks=1 --cpus-per-task={job.worker_cores} "
                 f"--mem={math.ceil(job.worker_memory / 1024**2)}M {gres} --export=ALL "
@@ -362,6 +362,7 @@ def build_planned_slurm_worker_spec(
     security: object,
     worker_port_range: str,
     nanny_port_range: str,
+    gpu_directive: str = "gres",
 ) -> PlannedSlurmWorkerSpec:
     """Translate one planner job into a standard SLURMJob Worker command."""
 
@@ -390,8 +391,13 @@ def build_planned_slurm_worker_spec(
     ]
     if job.excluded_nodes:
         directives.append("--exclude=" + ",".join(job.excluded_nodes))
+    if gpu_directive not in ("gres", "gpus"):
+        raise ValueError("gpu_directive must be 'gres' or 'gpus'.")
     if job.gpu:
-        directives.append(f"--gres=gpu:{job.gpu}")
+        # Sites with a job-submit plugin may mandate the newer --gpus=N form.
+        directives.append(
+            f"--gpus={job.gpu}" if gpu_directive == "gpus" else f"--gres=gpu:{job.gpu}"
+        )
 
     threads_per_worker = job.cpu // job.processes
     if threads_per_worker <= 0 or threads_per_worker * job.processes != job.cpu:

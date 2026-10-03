@@ -83,6 +83,12 @@ def create_cellpose_model(
 
     kwargs["pretrained_model"] = str(model_ref)
 
+    if Path(model_ref).is_file():
+        # Vendored dino_vits student patch: process-level, idempotent, and must
+        # run in the Worker process before CellposeModel construction.
+        from services.student_model import patch_cellpose_student
+        patch_cellpose_student()
+
     is_legacy_diameter_model = bool(diam_mean) and float(diam_mean) > 0
     if is_legacy_diameter_model and cellpose_major_version() < 4:
         # Legacy (CP3) custom models such as the one used by
@@ -114,6 +120,30 @@ def validate_cellpose_model(model_ref: str, requested_name: str) -> None:
             f"configured Cellpose model directory {configured_directory}. "
             "Configure the shared model root with WorkFlow_MODELS_DIR when needed."
         )
+
+
+def read_model_diam_mean(model_ref: str) -> float:
+    """Return the diam_mean saved in a Cellpose checkpoint; 0.0 when absent."""
+
+    try:
+        import torch
+    except ImportError:
+        return 0.0
+    for weights_only in (True, False):
+        try:
+            state = torch.load(
+                model_ref, map_location="cpu", mmap=True,
+                weights_only=weights_only,
+            )
+            break
+        except Exception:
+            continue
+    else:
+        return 0.0
+    try:
+        return float(state.get("diam_mean") or 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
 
 
 def cellpose_block(
@@ -203,6 +233,13 @@ def cellpose_block(
             has_channels = False
 
     diam_mean = float(diam_mean or 0.0)
+    if diam_mean < 0:
+        # Negative diam_mean reads the value saved in the model checkpoint.
+        from core.model_registry import resolve_model_path
+
+        diam_mean = read_model_diam_mean(
+            resolve_model_path("cellpose", model_name) or model_name
+        )
     if diam_mean > 0:
         # Legacy diameter-calibrated models (scripts/segmentation.py used
         # diam_mean=15) need the value at model construction time.  Keep them

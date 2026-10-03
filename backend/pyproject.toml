@@ -26,6 +26,7 @@ dependencies = [
     "torchvision>=0.26.0",
     "uvicorn[standard]>=0.20.0",
     "zarr>=3.0.0,<4",
+    "dinov3",
 ]
 
 [dependency-groups]
@@ -37,6 +38,7 @@ dev = [
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }
 torchvision = { index = "pytorch-cu126" }
+dinov3 = { url = "https://github.com/facebookresearch/dinov3/archive/6876159a11b4df116f30f667f8c9888617df0751.tar.gz" }
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

@@ -136,6 +136,16 @@ WorkFlow_SLURM_MAX_GPUS
 WorkFlow_SLURM_MAX_MEMORY_GIB
 ```
 
+站点提交插件适配（默认不需要）：
+
+```bash
+# GPU 申请指令形式：默认 gres 生成 --gres=gpu:N；站点插件强制 --gpus=N 时设为 gpus。
+WorkFlow_SLURM_GPU_DIRECTIVE=gpus
+
+# 站点禁止多分区联合申请时，把某类 Worker Profile 固定到单一分区（逗号分隔的 PROFILE=PARTITION）。
+WorkFlow_SLURM_PROFILE_PARTITIONS=CPU=cpu,GPU=gpu
+```
+
 全局 `MAX_CPUS/MAX_GPUS/MAX_MEMORY_GIB` 限制整个 execution；per-node 变量是额外的站点安全上限。Worker 启动命令完全由 `dask_jobqueue.SLURMJob` 根据 `cores` 和 `processes` 生成：`nthreads = cores / processes`。项目不再维护独立的 Worker sbatch/launcher，也不再允许单独配置与 CPU/Worker 矛盾的 Threads/Worker。
 
 ## 启动控制面

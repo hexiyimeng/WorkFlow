@@ -197,7 +197,7 @@ def main():
                 scancel_executable=config.scancel_executable, scheduler_host=config.scheduler_host,
                 scheduler_port=config.scheduler_port, protocol=cluster.scheduler_address.split(":", 1)[0],
                 security=cluster.security, worker_port_range=config.worker_port_range,
-                nanny_port_range=config.nanny_port_range)
+                nanny_port_range=config.nanny_port_range, gpu_directive=config.policy.gpu_directive)
 
         specs = tuple(spec_factory(job.profile, job.allocation_id, token_prefix + ":baseline")
                       for job in plan.jobs)

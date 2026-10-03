@@ -1096,3 +1096,140 @@ def test_window_concurrency_defaults_to_one() -> None:
         resource_plan=object(),
         cluster_summary=object(),
     ) == 1
+
+
+def _dual_profile_allocation(profile_partitions=None):
+    workflow = build_workflow_resource_plan(
+        {
+            "reader": {"type": "Cpu", "inputs": {}},
+            "gpu": {"type": "Gpu", "inputs": {}},
+        },
+        ["reader", "gpu"],
+        node_mappings={"Cpu": CpuNode, "Gpu": GpuNode},
+    )
+    profiles = [
+        WorkerProfile(
+            name="CPU",
+            physical_resources=PhysicalResources(cpu=4, memory_gib=4, gpu=0),
+            logical_resources={"CPU": 4},
+            threads=4,
+        ),
+        WorkerProfile(
+            name="GPU",
+            physical_resources=PhysicalResources(cpu=4, memory_gib=8, gpu=1),
+            logical_resources={"GPU": 1},
+            threads=4,
+        ),
+    ]
+    pools = [
+        WorkerPool(profile="CPU", processes=1, minimum_jobs=1, maximum_jobs=2),
+        WorkerPool(profile="GPU", processes=1, minimum_jobs=1, maximum_jobs=2),
+    ]
+    inventory = parse_scontrol_show_node(
+        "NodeName=c001 CPUTot=64 RealMemory=500000 Gres=(null) "
+        "State=IDLE Partitions=cpu\n"
+        "NodeName=g001 CPUTot=64 RealMemory=1000000 Gres=gpu:4 "
+        "State=IDLE Partitions=gpu\n"
+    )
+    return plan_workflow_resources(
+        workflow,
+        profiles,
+        pools,
+        inventory,
+        partitions=("cpu", "gpu"),
+        time_limit="01:00:00",
+        profile_partitions=profile_partitions,
+    )
+
+
+def test_planner_pins_partitions_per_worker_profile() -> None:
+    allocation = _dual_profile_allocation({"CPU": "cpu", "GPU": "gpu"})
+    partitions = {job.profile: job.partition for job in allocation.jobs}
+    assert partitions == {"CPU": "cpu", "GPU": "gpu"}
+
+
+def test_planner_without_pins_keeps_all_compatible_partitions() -> None:
+    allocation = _dual_profile_allocation()
+    partitions = {job.profile: job.partition for job in allocation.jobs}
+    assert partitions == {"CPU": "cpu,gpu", "GPU": "gpu"}
+
+
+def test_planner_rejects_pin_outside_eligible_partitions() -> None:
+    with pytest.raises(ResourcePlanningError, match="pinned to partition"):
+        _dual_profile_allocation({"GPU": "tao"})
+
+
+def test_planner_rejects_pin_without_fitting_nodes() -> None:
+    with pytest.raises(ResourcePlanningError, match="No eligible Slurm partition"):
+        _dual_profile_allocation({"GPU": "cpu"})
+
+
+def test_slurm_policy_parses_gpu_directive_and_profile_partitions() -> None:
+    policy = slurm_policy_from_environment({
+        "WorkFlow_SLURM_GPU_DIRECTIVE": "gpus",
+        "WorkFlow_SLURM_PROFILE_PARTITIONS": "CPU=cpu, GPU=gpu",
+    })
+    assert policy.gpu_directive == "gpus"
+    assert policy.profile_partitions == (("CPU", "cpu"), ("GPU", "gpu"))
+
+    with pytest.raises(ValueError, match="gpu_directive"):
+        slurm_policy_from_environment({"WorkFlow_SLURM_GPU_DIRECTIVE": "bogus"})
+    with pytest.raises(ValueError, match="PROFILE=PARTITION"):
+        slurm_policy_from_environment({"WorkFlow_SLURM_PROFILE_PARTITIONS": "CPU"})
+    with pytest.raises(ValueError, match="outside allowed_partitions"):
+        slurm_policy_from_environment({
+            "WorkFlow_SLURM_ALLOWED_PARTITIONS": "cpu",
+            "WorkFlow_SLURM_PROFILE_PARTITIONS": "GPU=gpu",
+        })
+
+
+def test_planned_slurm_job_gpus_directive(tmp_path: Path) -> None:
+    workflow = build_workflow_resource_plan(
+        {"gpu": {"type": "Gpu", "inputs": {}}},
+        ["gpu"],
+        node_mappings={"Gpu": GpuNode},
+    )
+    profile = WorkerProfile(
+        name="GPU",
+        physical_resources=PhysicalResources(cpu=4, memory_gib=32, gpu=1),
+        logical_resources={"GPU": 1},
+        threads=4,
+    )
+    allocation = plan_workflow_resources(
+        workflow,
+        [profile],
+        [WorkerPool(profile="GPU", processes=1, minimum_jobs=1, maximum_jobs=1)],
+        parse_scontrol_show_node(
+            "NodeName=t001 CPUTot=40 RealMemory=385349 "
+            "Gres=gpu:2 State=IDLE Partitions=tao\n"
+        ),
+        partition="tao",
+        time_limit="01:00:00",
+    )
+    spec = build_planned_slurm_worker_spec(
+        allocation,
+        allocation.jobs[0],
+        execution_id="12345678-1234-1234-1234-123456789abc",
+        submission_token="wf:abcdef:1",
+        project_root=tmp_path,
+        runtime_directory=tmp_path,
+        run_directory=tmp_path,
+        python_executable=Path(sys.executable),
+        sbatch_executable="/usr/bin/sbatch",
+        scancel_executable="/usr/bin/scancel",
+        scheduler_host="mn02",
+        scheduler_port=8786,
+        protocol="tcp://",
+        security=Security(),
+        worker_port_range="20000:20100",
+        nanny_port_range="20101:20200",
+        gpu_directive="gpus",
+    )
+    script = PlannedSLURMJob(
+        "tcp://mn02:8786",
+        name=spec.allocation_id,
+        **spec.options,
+    ).job_script()
+
+    assert "#SBATCH --gpus=1" in script
+    assert "--gres=gpu" not in script

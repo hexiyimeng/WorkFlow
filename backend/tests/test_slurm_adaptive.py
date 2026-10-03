@@ -87,6 +87,33 @@ def test_hetjob_submits_once_and_tracks_all_worker_names(monkeypatch, tmp_path):
         c.close(timeout=10)
 
 
+def test_hetjob_srun_propagates_gpus_directive(monkeypatch, tmp_path):
+    scripts = []
+
+    async def submit(self, filename):
+        scripts.append(Path(filename).read_text())
+        return "Submitted batch job 70101"
+
+    async def cancel(job_id, command):
+        pass
+
+    monkeypatch.setattr(PlannedSLURMJob, "_submit_job", submit)
+    monkeypatch.setattr(PlannedSLURMJob, "_close_job", staticmethod(cancel))
+    gpu_spec = spec("GPU-1", "GPU")
+    gpu_spec.options["job_extra_directives"] = ["--comment=wf:test:baseline", "--gpus=1"]
+    c = cluster()
+    try:
+        c.configure_journal(tmp_path)
+        c.submit_baseline((spec("CPU-1", processes=2), gpu_spec))
+        script = scripts[0]
+        assert "#SBATCH --gpus=1" in script
+        assert "--cpus-per-task=8 --mem=8192M --gres=none" in script
+        assert "--cpus-per-task=4 --mem=4096M --gpus=1" in script
+        c.stop_planned_jobs()
+    finally:
+        c.close(timeout=10)
+
+
 def test_incremental_submission_and_whole_multiworker_job_removal(monkeypatch, tmp_path):
     submitted = []
     cancelled = []
