@@ -3,6 +3,27 @@ import { useFlow } from '../../hooks/useFlowContext';
 import { Pill } from '../ui/Pill';
 import { IconButton } from '../ui/IconButton';
 import { Button } from '../ui/Button';
+import type { LogEntry } from '../../types';
+
+function LogMessage({ log }: { log: LogEntry }) {
+  return (
+    <div className="text-[11px] flex-1 min-w-0 whitespace-pre-wrap break-words"
+      style={{ color: log.type === 'error' ? 'var(--color-danger)' : 'var(--color-console-text)' }}>
+      {log.message}
+      {log.details && (
+        <details className="mt-1 mb-2">
+          <summary className="cursor-pointer text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+            Error details
+          </summary>
+          <pre className="mt-2 max-h-72 overflow-auto rounded border p-3 whitespace-pre-wrap break-words select-text"
+            style={{ borderColor: 'var(--color-console-border)', color: 'var(--color-console-text)' }}>
+            {log.details}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
 
 function shortId(id: string | null): string {
   return id ? id.slice(0, 8) : '—';
@@ -43,6 +64,7 @@ export default function BottomPanel() {
   const endRef = useRef<HTMLDivElement>(null);
   const [height, setHeight] = useState(220);
   const isDragging = useRef(false);
+  const lastShownErrorRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (isConsoleOpen) endRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -75,6 +97,13 @@ export default function BottomPanel() {
   const phase = executionState.phase;
   const execId = executionState.executionId;
   const errorLogs = useMemo(() => logs.filter(l => l.type === 'error'), [logs]);
+  const latestErrorId = errorLogs.at(-1)?.id;
+  useEffect(() => {
+    if (latestErrorId && latestErrorId !== lastShownErrorRef.current) {
+      lastShownErrorRef.current = latestErrorId;
+      if (!isConsoleOpen) toggleConsole();
+    }
+  }, [latestErrorId, isConsoleOpen, toggleConsole]);
   const windowProgress = executionState.windowProgress;
   const showWindowProgress = windowProgress !== null && (isExecuting || isCancelling);
   const activeWindowWidth = windowProgress && windowProgress.totalWindows > 0
@@ -276,9 +305,7 @@ export default function BottomPanel() {
                     <span style={{ color: LOG_COLORS[log.type] ?? 'var(--color-console-info)' }} className="text-[12px] shrink-0 w-3 flex items-center justify-center">
                       {LOG_ICONS[log.type] ?? '›'}
                     </span>
-                    <span className="text-[11px] flex-1 break-all" style={{ color: 'var(--color-console-text)' }}>
-                      {log.message}
-                    </span>
+                    <LogMessage log={log} />
                   </div>
                 ))
               )
@@ -298,9 +325,7 @@ export default function BottomPanel() {
                       {formatTime(log.timestamp)}
                     </span>
                     <span className="text-[12px] shrink-0 w-3 flex items-center justify-center" style={{ color: 'var(--color-danger)' }}>✕</span>
-                    <span className="text-[11px] flex-1 break-all" style={{ color: 'var(--color-danger)' }}>
-                      {log.message}
-                    </span>
+                    <LogMessage log={log} />
                   </div>
                 ))
               )

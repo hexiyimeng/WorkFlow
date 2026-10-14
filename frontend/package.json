@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "node --experimental-strip-types src/utils/inputVisibility.test.ts && node --experimental-strip-types src/utils/executionConfig.test.ts && node --experimental-strip-types src/utils/workerResources.test.ts && node --experimental-strip-types src/utils/windowProgress.test.ts && node --experimental-strip-types src/utils/recovery.test.ts && node --experimental-strip-types src/utils/executionRuntime.test.ts && node --experimental-strip-types src/utils/workflowExecutionSettings.test.ts && node --experimental-strip-types src/utils/workflowPersistence.test.ts && node --experimental-strip-types src/utils/executionExperience.test.ts && node --experimental-strip-types src/utils/executionUiContract.test.ts && npm run test:components",
-    "test:components": "esbuild src/components/execution/executionComponents.test.tsx --bundle --platform=node --format=cjs --jsx=automatic --outfile=node_modules/.tmp/executionComponents.test.cjs && node node_modules/.tmp/executionComponents.test.cjs",
+    "test:components": "esbuild src/components/execution/executionComponents.test.tsx --bundle --platform=node --format=cjs --jsx=automatic --outfile=node_modules/.tmp/executionComponents.test.cjs && node node_modules/.tmp/executionComponents.test.cjs && npm run test:interactions && node --experimental-strip-types src/utils/executionDiagnostics.test.ts",
+    "test:interactions": "esbuild src/components/execution/executionInteractions.test.tsx --bundle --packages=external --platform=node --format=cjs --jsx=automatic --outfile=node_modules/.tmp/executionInteractions.test.cjs && node node_modules/.tmp/executionInteractions.test.cjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@tailwindcss/postcss": "^4.1.18",
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
@@ -34,6 +36,7 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
     "globals": "^16.5.0",
+    "jsdom": "^30.1.2",
     "postcss": "^8.5.6",
     "tailwindcss": "^3.4.17",
     "typescript": "~5.9.3",

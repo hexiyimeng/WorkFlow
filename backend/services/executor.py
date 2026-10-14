@@ -20,6 +20,7 @@ from core.invocation_builder import (
     prepare_node_inputs,
 )
 from core.config import config
+from core.execution_diagnostics import exception_diagnostics, scheduler_failure_context
 from core.execution_paths import normalize_execution_path
 from core.worker_profiles import dask_annotation_kwargs
 from core.resource_planner import parse_required_worker_resources
@@ -700,6 +701,20 @@ async def _wait_for_window_futures(futures: list) -> None:
     )
 
 
+async def _collect_failed_task_context(client, futures: list) -> dict:
+    keys = [future.key for future in futures if getattr(future, "status", None) == "error"]
+    if not keys or not callable(getattr(client, "run_on_scheduler", None)):
+        return {}
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(client.run_on_scheduler, scheduler_failure_context, keys=keys),
+            timeout=3.0,
+        )
+    except Exception:
+        logger.debug("Could not retrieve failed Dask task context", exc_info=True)
+        return {}
+
+
 async def _cancel_in_flight_windows(
     client,
     in_flight: dict[asyncio.Task, InFlightWindow],
@@ -866,6 +881,7 @@ async def _execute_pending_windows(
                     raise
                 except Exception as exc:
                     if first_error is None:
+                        exc._workflow_window = entry.window.index + 1
                         first_error = exc
                 else:
                     # Failed entries remain tracked until the outer cleanup
@@ -884,7 +900,11 @@ async def _execute_pending_windows(
                 and await submit_next_window()
             ):
                 pass
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            # Capture the failed upstream task before cleanup releases its
+            # Futures and the Scheduler forgets the task annotations.
+            exc._workflow_dask_context = await _collect_failed_task_context(client, tracked_futures)
         await _cancel_in_flight_windows(
             client,
             in_flight,
@@ -1168,6 +1188,11 @@ async def _build_lazy_execution_roots(
             return results[node_id]
 
         except Exception as exc:
+            originating_node = getattr(exc, "_workflow_node_id", None)
+            if originating_node and originating_node != node_id:
+                await report(node_id, None, f"Blocked by failed upstream node [{originating_node}]", "failed")
+                raise
+            exc._workflow_node_id = node_id
             error_context = {
                 "node_id": node_id,
                 "node_type": class_name,
@@ -1195,7 +1220,7 @@ async def _build_lazy_execution_roots(
             await report(
                 node_id,
                 None,
-                f"Error: {error_context['error_type']}",
+                f"{error_context['error_type']}: {str(exc)[:16000]}",
                 "failed",
             )
             raise
@@ -1477,6 +1502,8 @@ async def execute_graph(
     resource_plan: WorkflowResourcePlan | None = None
     cluster_summary = None
     external_cleanup_completed = False
+    diagnostic_stage = "Execution setup"
+    diagnostic_node_id = None
 
     async def run_external_cleanup_barrier() -> None:
         nonlocal external_cleanup_completed
@@ -1635,6 +1662,7 @@ async def execute_graph(
         # Profile requirements are not Worker counts. Slurm execution has
         # already provisioned the browser-configured Pools; a local backend
         # builds the same Pool topology directly from the supplied Profiles.
+        diagnostic_stage = "Worker startup"
         if dask_service.uses_external_workers():
             client = dask_service.require_active_client()
         else:
@@ -1738,6 +1766,7 @@ async def execute_graph(
             broadcast_message = {
                 "type": "progress",
                 "taskId": node_id,
+                "nodeType": getattr(node_cls, "DISPLAY_NAME", node_data.get("type")) if node_data else "Node",
                 "executionId": execution_id,
                 "progressType": progress_type,
                 "progress": progress,
@@ -1781,6 +1810,7 @@ async def execute_graph(
         is_resuming = False
         expected_output_shape: tuple[int, ...] | None = None
 
+        diagnostic_stage = "Execution preflight"
         if selected_config.mode == "window":
             terminal_outputs = discover_terminal_outputs(
                 graph,
@@ -1959,6 +1989,7 @@ async def execute_graph(
         )
         state_manager.add_log("GraphBuilding...", "info", execution_id=execution_id)
         logger.info("[Execution %s] Building lazy Dask graph...", execution_id)
+        diagnostic_stage = "Graph building"
         await _build_lazy_execution_roots(
             graph,
             execution_roots,
@@ -1970,6 +2001,7 @@ async def execute_graph(
             node_instances=node_instances,
         )
         logger.info("[Execution %s] Lazy Dask graph built.", execution_id)
+        diagnostic_stage = "Dask task execution"
 
         if selected_config.mode == "full_graph":
             output_sinks = _collect_output_sinks(results, execution_roots)
@@ -2157,7 +2189,9 @@ async def execute_graph(
                 execution_roots.index(candidate),
             ),
         )
+        diagnostic_stage = "Output finalization"
         for node_id in postprocess_roots:
+            diagnostic_node_id = node_id
             instance = node_instances.get(node_id)
             postprocess = getattr(instance, "postprocess", None)
             if callable(postprocess):
@@ -2183,12 +2217,14 @@ async def execute_graph(
                 if post_value is not None:
                     results[node_id] = post_value
 
+        diagnostic_node_id = None
         for node_id in execution_roots:
             await progress_callback(node_id, 100, "Done", "done")
 
         # A service-node Driver must prove its remote Worker allocation gone
         # and close the Scheduler while it still owns active.lock. Only then
         # may a successful recovery record become externally available.
+        diagnostic_stage = "Resource cleanup"
         await run_external_cleanup_barrier()
 
         # Recovery history remains durable after success. No await is allowed
@@ -2308,6 +2344,14 @@ async def execute_graph(
                 execution_id=execution_id,
             )
         else:
+            diagnostics = exception_diagnostics(exc, diagnostic_stage)
+            if client and sink_futures and diagnostic_stage == "Dask task execution":
+                diagnostics.update(await _collect_failed_task_context(client, sink_futures))
+            if diagnostic_node_id:
+                diagnostics["taskId"] = diagnostic_node_id
+            failed_node = (graph if isinstance(graph, dict) else {}).get(diagnostics.get("taskId"))
+            if failed_node:
+                diagnostics["nodeType"] = failed_node.get("type")
             try:
                 persist_recovery_status("failed")
             except Exception as status_exc:
@@ -2325,7 +2369,8 @@ async def execute_graph(
                 "type": "execution_finished",
                 "executionId": execution_id,
                 "status": "failed",
-                "message": str(exc),
+                "message": str(exc)[:16000],
+                **diagnostics,
             })
             state_manager.add_log(
                 f"Global Error: {str(exc)}",

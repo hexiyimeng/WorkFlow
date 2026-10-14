@@ -64,51 +64,66 @@ const STATUS_LABEL: Record<NodeStatus, string> = {
 // 1. ValuePopup — string editor popup
 // ==========================================
 interface ValuePopupProps {
+  name: string;
   initialValue: string;
   onSave: (value: string) => void;
   onClose: () => void;
   anchorRect: DOMRect | null;
 }
 
-const ValuePopup = ({ initialValue, onSave, onClose, anchorRect }: ValuePopupProps) => {
+export const ValuePopup = ({ name, initialValue, onSave, onClose, anchorRect }: ValuePopupProps) => {
   const [val, setVal] = useState(initialValue);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => { inputRef.current?.focus(); inputRef.current?.select(); }, []);
 
   const style: CSSProperties = useMemo(() => {
-    if (!anchorRect) return { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' };
-    let top = anchorRect.bottom + 6;
-    let left = anchorRect.left + anchorRect.width / 2 - 160;
-    if (left < 10) left = 10;
-    if (left + 320 > window.innerWidth) left = window.innerWidth - 330;
-    if (top + 50 > window.innerHeight) top = anchorRect.top - 55;
+    if (!anchorRect) return { position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)' };
+    const width = Math.min(720, window.innerWidth - 24);
+    let top = anchorRect.bottom + 8;
+    const left = Math.max(12, Math.min(
+      anchorRect.left + anchorRect.width / 2 - width / 2,
+      window.innerWidth - width - 12,
+    ));
+    if (top + 220 > window.innerHeight) top = Math.max(12, anchorRect.top - 220);
     return { top, left, position: 'fixed' as const };
   }, [anchorRect]);
 
   return createPortal(
     <div className="fixed inset-0 z-[9999]" onClick={onClose}>
       <div
-        className="bg-[var(--color-bg-surface)] border border-[var(--color-border-default)] rounded-[var(--radius-lg)] shadow-[var(--shadow-floating)] px-3 py-2.5 flex items-center gap-3 w-[320px]"
+        role="dialog"
+        aria-label={`Edit ${name}`}
+        className="bg-[var(--color-bg-surface)] border border-[var(--color-border-default)] rounded-[var(--radius-lg)] shadow-[var(--shadow-floating)] p-4 space-y-3 w-[min(720px,calc(100vw-24px))] max-h-[calc(100vh-24px)] overflow-auto"
         style={style}
         onClick={e => e.stopPropagation()}
       >
-        <span className="text-[10px] text-[var(--color-text-muted)] font-semibold uppercase tracking-wider shrink-0">Value</span>
-        <input
+        <label htmlFor="node-value-editor" className="block text-[12px] text-[var(--color-text-secondary)] font-semibold">{name}</label>
+        <textarea
+          id="node-value-editor"
           ref={inputRef}
-          className="flex-1 bg-[var(--color-bg-field)] text-[var(--color-text-primary)] text-[11px] font-mono px-2.5 py-1.5 rounded-[var(--radius-md)] border border-[var(--color-border-default)] focus:border-[var(--color-border-focus)] outline-none transition-colors placeholder-[var(--color-text-muted)]"
+          rows={4}
+          wrap="soft"
+          className="w-full min-h-[100px] resize-y bg-[var(--color-bg-field)] text-[var(--color-text-primary)] text-[13px] leading-6 font-mono px-3 py-2 rounded-[var(--radius-md)] border border-[var(--color-border-default)] focus:border-[var(--color-border-focus)] outline-none [overflow-wrap:anywhere]"
           value={val}
           onChange={e => setVal(e.target.value)}
           onKeyDown={e => {
+            if (e.nativeEvent.isComposing) return;
             if (e.key === 'Enter') { e.preventDefault(); onSave(val); }
             if (e.key === 'Escape') onClose();
           }}
         />
-        <button
-          onClick={() => onSave(val)}
-          className="shrink-0 px-2.5 py-1.5 text-[10px] font-bold text-white bg-[var(--color-accent)] hover:bg-[var(--color-accent-hover)] rounded-[var(--radius-md)] transition-colors duration-[var(--motion-fast)]"
-        >
-          OK
-        </button>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-[10px] text-[var(--color-text-muted)]">Enter to save · Esc to cancel</span>
+          <div className="flex gap-2">
+            <button onClick={onClose} className="px-3 py-1.5 text-[11px] text-[var(--color-text-secondary)]">Cancel</button>
+            <button
+              onClick={() => onSave(val)}
+              className="shrink-0 px-2.5 py-1.5 text-[10px] font-bold text-white bg-[var(--color-accent)] hover:bg-[var(--color-accent-hover)] rounded-[var(--radius-md)] transition-colors duration-[var(--motion-fast)]"
+            >
+              OK
+            </button>
+          </div>
+        </div>
       </div>
     </div>, document.body
   );
@@ -190,12 +205,13 @@ const ControlWidget = ({ name, config, value, onChange, disabled = false }: Cont
           <span className={[
             'text-[11px] font-mono text-right truncate max-w-[60%]',
             displayStr ? 'text-[var(--color-text-primary)]' : 'text-[var(--color-text-muted)] italic',
-          ].join(' ')}>
+          ].join(' ')} title={displayStr}>
             {displayStr || '—'}
           </span>
         </div>
         {showPopup && !disabled && (
           <ValuePopup
+            name={name}
             initialValue={String(value ?? '')}
             anchorRect={anchorRect}
             onSave={v => { onChange(name, v); setShowPopup(false); }}

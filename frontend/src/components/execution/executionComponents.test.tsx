@@ -61,6 +61,7 @@ const executionSettingsMarkup = renderToStaticMarkup(
   </FlowContext.Provider>,
 );
 assert(executionSettingsMarkup.includes('Execution Settings'), 'settings drawer must render');
+assert(!executionSettingsMarkup.includes('Save Worker Resources'), 'worker drafts share Save Settings');
 assert(executionSettingsMarkup.includes('Window Shape'), 'Window settings must render');
 assert(
   executionSettingsMarkup.includes('value="64"')

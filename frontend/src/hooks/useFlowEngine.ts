@@ -1,5 +1,6 @@
 ﻿import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
 import type { Node, Edge } from '@xyflow/react';
+import { executionDiagnostic } from '../utils/executionDiagnostics';
 import type {
   NodeData,
   WSMessage,
@@ -209,7 +210,7 @@ export const useFlowEngine = (
   edges: Edge[],
   setNodes: React.Dispatch<React.SetStateAction<Node<NodeData>[]>>,
   setEdges: React.Dispatch<React.SetStateAction<Edge[]>>,
-  addLog: (msg: string, type?: LogEntry['type']) => void
+  addLog: (msg: string, type?: LogEntry['type'], details?: string) => void
 ) => {
   // --- Connection state ---
   const [websocketStatus, setWebsocketStatus] = useState<WebSocketStatus>('disconnected');
@@ -235,6 +236,7 @@ export const useFlowEngine = (
   const reconnectAttemptRef = useRef(0);
   const lastReconnectWarningAtRef = useRef(0);
   const finishedRef = useRef(false);
+  const loggedNodeStatesRef = useRef(new Set<string>());
   const restoredExecutionRef = useRef(false); // tracks if current session was restored via subscribe
   const reconciliationSnapshotReceivedRef = useRef(false);
   const isSubmittingRunRef = useRef(false); // prevents double-submit
@@ -574,6 +576,7 @@ export const useFlowEngine = (
         // execution_finished: authoritative terminal event
         if (msgType === 'error') {
           const msgText = msg.message || '';
+          const diagnostic = executionDiagnostic(msg);
           const hasStatus = isTerminalStatus(msg.status);
           if (
             restoredExecutionRef.current
@@ -592,8 +595,9 @@ export const useFlowEngine = (
               setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
               dispatchExecution({ type: 'FINISH', status, message: msg.message });
               addLog(
-                msgText || `Execution ${status}`,
+                diagnostic.message,
                 status === 'interrupted' || status === 'cancelled' ? 'warning' : 'error',
+                diagnostic.details,
               );
             }
             return;
@@ -607,7 +611,7 @@ export const useFlowEngine = (
           setWebsocketStatus('connected');
           sessionStorage.removeItem('WorkFlow_execution_id');
           dispatchExecution({ type: 'RESET' });
-          addLog(msgText || 'Unknown Error', 'error');
+          addLog(diagnostic.message, 'error', diagnostic.details);
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
           resetRuntimeNodeState(setNodes);
           return;
@@ -616,6 +620,7 @@ export const useFlowEngine = (
         // execution_started
         if (msgType === 'execution_started') {
           if (!msg.executionId) return;
+          loggedNodeStatesRef.current.clear();
           finishedRef.current = false;
           windowProgressProtocolRef.current = createWindowProgressProtocolState(
             msg.executionId,
@@ -774,8 +779,15 @@ export const useFlowEngine = (
             dispatchExecution({ type: 'SET_PHASE', phase: 'running' });
           }
 
-          if (msg.message?.toLowerCase().includes('error')) {
-            addLog(`[${msg.taskId}] ${msg.message}`, 'error');
+          const nodeStateKey = `${msg.executionId}:${msg.taskId}:${msg.runState}`;
+          if (!loggedNodeStatesRef.current.has(nodeStateKey) && msg.message !== 'Initializing...') {
+            loggedNodeStatesRef.current.add(nodeStateKey);
+            if (msg.runState === 'failed') {
+              const diagnostic = executionDiagnostic(msg);
+              addLog(diagnostic.message, 'error', diagnostic.details);
+            } else if (['ready', 'running', 'done'].includes(msg.runState ?? '')) {
+              addLog(`${msg.nodeType || 'Node'} [${msg.taskId}]: ${msg.message || msg.runState}`, 'info');
+            }
           }
           return;
         }
@@ -808,10 +820,15 @@ export const useFlowEngine = (
 
           const logType: LogEntry['type'] = status === 'succeeded'
             ? 'success'
-            : status === 'interrupted'
+            : status === 'interrupted' || status === 'cancelled'
               ? 'warning'
               : 'error';
-          addLog(msg.message || `Execution ${status}`, logType);
+          if (status === 'failed') {
+            const diagnostic = executionDiagnostic(msg);
+            addLog(diagnostic.message, logType, diagnostic.details);
+          } else {
+            addLog(msg.message || `Execution ${status}`, logType);
+          }
           return;
         }
 

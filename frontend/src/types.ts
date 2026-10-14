@@ -423,6 +423,11 @@ export type WSMessageType =
 export interface WSMessage {
   type: WSMessageType;
   message?: string;
+  errorType?: string;
+  traceback?: string;
+  nodeType?: string;
+  stage?: string;
+  taskKey?: string;
   taskId?: string;
   executionId?: string;
   jobId?: string;
@@ -484,4 +489,5 @@ export interface LogEntry {
   timestamp: number;
   type: 'info' | 'success' | 'error' | 'warning';
   message: string;
+  details?: string;
 }

@@ -104,7 +104,7 @@ export interface FlowContextType {
   stopFlow: () => void;
   reloadNodes: () => Promise<void>;
   clearLogs: () => void;
-  addLog: (message: string, level?: 'info' | 'warning' | 'error' | 'success') => void;
+  addLog: (message: string, level?: 'info' | 'warning' | 'error' | 'success', details?: string) => void;
 
   // === Undo/Redo ===
   undo: () => void;

@@ -54,8 +54,8 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logBufferRef = useRef<LogEntry[]>([]);
 
-  const addLog = useCallback((message: string, type: 'info' | 'success' | 'error' | 'warning' = 'info') => {
-    logBufferRef.current.push({ id: Date.now().toString() + Math.random(), timestamp: Date.now(), type, message });
+  const addLog = useCallback((message: string, type: 'info' | 'success' | 'error' | 'warning' = 'info', details?: string) => {
+    logBufferRef.current.push({ id: Date.now().toString() + Math.random(), timestamp: Date.now(), type, message, details });
   }, []);
 
   const clearLogs = useCallback(() => {
@@ -69,7 +69,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (logBufferRef.current.length > 0) {
         const newLogs = [...logBufferRef.current];
         logBufferRef.current = [];
-        setLogs(prev => [...prev, ...newLogs].slice(-100));
+        setLogs(prev => [...prev, ...newLogs].slice(-300));
       }
     }, 100);
     return () => clearInterval(tick);
