@@ -15,6 +15,7 @@ from core.worker_profiles import (
     resolve_worker_profile,
     worker_logical_resources,
 )
+from core.task_failures import report_block_failure
 from core.invocation_builder import declared_type_and_meta, get_node_input_defs, validate_dask_array_input
 from core.node_invocation import NodeInvocation, NodeRuntime
 from core.type_system import dtype_name_to_numpy, is_dask_array_type, parse_port_type
@@ -1167,13 +1168,19 @@ class ProcessBlockBinder:
                 block_info=block_info,
                 runtime=runtime_dict,
             )
-            return self.call_process_block(
-                node,
-                named_blocks,
-                primary_name,
-                params,
-                ctx,
-            )
+            try:
+                return self.call_process_block(
+                    node,
+                    named_blocks,
+                    primary_name,
+                    params,
+                    ctx,
+                )
+            except Exception as exc:
+                report_block_failure(
+                    type(node).__name__, runtime.node_id, exc,
+                )
+                raise
 
         wrapped._is_dask_array_map_wrapped = True
         wrapped.__name__ = (

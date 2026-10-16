@@ -250,9 +250,7 @@ class PlannedSLURMCluster(SLURMCluster):
             self.worker_spec[spec.allocation_id] = entry
         await self._correct_state()
 
-    def submit_baseline(self, specs: Sequence[PlannedSlurmWorkerSpec]):
-        if self.worker_spec or not specs:
-            raise ValueError("Baseline must be the first nonempty resource submission.")
+    def _baseline_entry(self, specs: Sequence[PlannedSlurmWorkerSpec]) -> dict:
         first = specs[0]
         options = dict(first.options)
         options["component_specs"] = tuple(specs)
@@ -262,7 +260,6 @@ class PlannedSLURMCluster(SLURMCluster):
         directory = getattr(self, "journal_directory", None)
         if directory:
             options["journal_directory"] = str(directory)
-        baseline_key = "baseline"
         suffixes = []
         for spec in specs:
             processes = int(spec.options["processes"])
@@ -270,11 +267,31 @@ class PlannedSLURMCluster(SLURMCluster):
                 [f"-{spec.allocation_id}"] if processes == 1 else
                 [f"-{spec.allocation_id}-{process}" for process in range(processes)]
             )
-        self.worker_spec[baseline_key] = {
-            "cls": BaselineSLURMJob, "options": options, "group": suffixes,
-        }
+        return {"cls": BaselineSLURMJob, "options": options, "group": suffixes}
+
+    def submit_baseline(self, specs: Sequence[PlannedSlurmWorkerSpec]):
+        if self.worker_spec or not specs:
+            raise ValueError("Baseline must be the first nonempty resource submission.")
+        self.worker_spec["baseline"] = self._baseline_entry(specs)
         self.sync(self._correct_state)
         return self.submitted_job_records()
+
+    async def resubmit_baseline(self, key: str, specs: Sequence[PlannedSlurmWorkerSpec]):
+        """Submit a replacement baseline hetjob under a new worker_spec key."""
+
+        if not specs:
+            raise ValueError("Replacement baseline requires component specs.")
+        if key in self.worker_spec:
+            raise ValueError(f"Baseline recovery key already in use: {key!r}")
+        self.worker_spec[key] = self._baseline_entry(specs)
+        await self._correct_state()
+        return self.submitted_job_records()
+
+    async def retire_baseline_entry(self, key: str) -> None:
+        """Close the baseline hetjob registered under ``key``."""
+
+        if self.worker_spec.pop(key, None) is not None:
+            await self._correct_state()
 
     def submitted_job_records(self) -> tuple[SubmittedSlurmJob, ...]:
         candidates = list(self.workers.values())

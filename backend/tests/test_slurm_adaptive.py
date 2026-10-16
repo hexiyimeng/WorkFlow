@@ -16,7 +16,7 @@ from core.worker_pool import WorkerPool
 from core.worker_profiles import PhysicalResources, WorkerProfile
 from core.workflow_resources import build_workflow_resource_plan
 from services.slurm_adaptive import ProfileAdaptive, profile_target_jobs
-from services.slurm_execution_service import SlurmExecutionService, _queue_wait_seconds
+from services.slurm_execution_service import SlurmExecutionService, SlurmSubmissionError, _queue_wait_seconds
 from services.slurm_jobqueue_cluster import (
     BaselineSLURMJob, PlannedSLURMCluster, PlannedSLURMJob, PlannedSlurmWorkerSpec,
 )
@@ -487,3 +487,217 @@ def test_normal_driver_cleanup_does_not_trigger_allocation_failure(monkeypatch, 
     asyncio.run(service._execute_with_adaptive_monitor(
         config, [], tmp_path, {}, "run", None, external_cleanup_barrier=cleanup))
     assert closing
+
+
+def test_baseline_resubmit_recovers_from_bad_node(monkeypatch, tmp_path):
+    """Resubmitted baseline hetjob replaces a baseline lost to a bad node."""
+    import dask
+    from distributed import Client, Worker
+    from services.slurm_adaptive import start_profile_adaptives
+
+    allocations, cancelled = {}, []
+
+    async def submit(self, filename):
+        job_id = str(72000 + len(allocations))
+        members = self.components if isinstance(self, BaselineSLURMJob) else [self]
+        allocations[job_id] = []
+        for member in members:
+            profile = "GPU" if "GPU=1" in member._command_template else "CPU"
+            w = await Worker(self.scheduler, name=member.name, nthreads=4,
+                             resources={profile: 1 if profile == "GPU" else 4},
+                             memory_limit=0, dashboard_address=None)
+            allocations[job_id].append(w)
+        return f"Submitted batch job {job_id}"
+
+    async def cancel(job_id, command):
+        cancelled.append(job_id)
+        for w in allocations[job_id]:
+            await w.close()
+
+    monkeypatch.setattr(PlannedSLURMJob, "_submit_job", submit)
+    monkeypatch.setattr(PlannedSLURMJob, "_close_job", staticmethod(cancel))
+    c = cluster()
+    client = Client(c)
+    try:
+        c.configure_journal(tmp_path)
+        specs = (spec("CPU-1"), spec("GPU-1", "GPU"))
+        c.submit_baseline(specs)
+        client.wait_for_workers(2, timeout=10)
+        pools = [WorkerPool("CPU", 1, 1), WorkerPool("GPU", 1, 1)]
+
+        async def start():
+            start_profile_adaptives(
+                c, pools, specs,
+                lambda profile, name, token: spec(name, profile, token=token),
+                "wf:integration")
+        c.sync(start)
+
+        retry_specs = (spec("CPU-1-r1"), spec("GPU-1-r1", "GPU"))
+        records = c.sync(c.resubmit_baseline, "baseline-r1", retry_specs)
+        assert any(r.allocation_id == "CPU-1-r1" for r in records)
+        client.wait_for_workers(4, timeout=10)
+
+        async def swap():
+            for adaptive in c.profile_adaptives:
+                profile = adaptive.pool.profile
+                adaptive.replace_baseline([(f"baseline-r1-{profile}-1-r1",)])
+        c.sync(swap)
+        c.sync(c.retire_baseline_entry, "baseline")
+        assert "72000" in cancelled
+        assert set(c.worker_spec) == {"baseline-r1"}
+
+        def work(x):
+            return x + 1
+        with dask.annotate(resources={"GPU": 1}):
+            results = [dask.delayed(work, pure=False)(i) for i in range(6)]
+        assert client.gather(client.compute(results)) == list(range(1, 7))
+
+        async def names():
+            return {w.name for w in c.scheduler.workers.values()}
+        assert c.sync(names) == {"baseline-r1-CPU-1-r1", "baseline-r1-GPU-1-r1"}
+    finally:
+        c.stop_profile_adaptives()
+        client.close()
+        c.close(timeout=10)
+
+
+def test_monitor_hooks_are_not_forwarded_to_execute_graph(monkeypatch, tmp_path):
+    import services.slurm_execution_service as module
+    service = SlurmExecutionService()
+    seen = {}
+
+    class Cluster:
+        profile_adaptives = []
+        worker_spec = {}
+        @staticmethod
+        def sync(function, *args):
+            return asyncio.run(function(*args))
+        @staticmethod
+        def submitted_job_records():
+            return ()
+
+    monkeypatch.setattr(module.dask_service, "cluster", Cluster())
+
+    async def cleanup():
+        await asyncio.sleep(0)
+
+    async def driver(*args, **kwargs):
+        seen.update(kwargs)
+        await kwargs["external_cleanup_barrier"]()
+
+    async def alive(**kwargs):
+        return None
+
+    monkeypatch.setattr(module, "execute_graph_on_service_node", driver)
+    monkeypatch.setattr(service, "_assert_worker_allocations_alive", alive)
+
+    async def hook(hosts):
+        return None
+
+    config = NS(poll_interval_seconds=0.001, worker_start_timeout_seconds=1)
+    asyncio.run(service._execute_with_adaptive_monitor(
+        config, [], tmp_path, {}, "run", None,
+        external_cleanup_barrier=cleanup,
+        on_new_bad_nodes=hook,
+        baseline_recovery={"attempts": 0, "pending_names": set()},
+    ))
+    assert "on_new_bad_nodes" not in seen
+    assert "baseline_recovery" not in seen
+    assert "external_cleanup_barrier" in seen
+
+
+def _monitor_harness(monkeypatch, service):
+    import services.slurm_execution_service as module
+
+    class Cluster:
+        profile_adaptives = []
+        worker_spec = {}
+        @staticmethod
+        def sync(function, *args):
+            return asyncio.run(function(*args))
+        @staticmethod
+        def submitted_job_records():
+            return ()
+
+    monkeypatch.setattr(module.dask_service, "cluster", Cluster())
+
+    async def cleanup():
+        await asyncio.sleep(0.02)
+
+    async def driver(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        await kwargs["external_cleanup_barrier"]()
+
+    monkeypatch.setattr(module, "execute_graph_on_service_node", driver)
+    return cleanup
+
+
+def test_baseline_death_triggers_recovery_hook(monkeypatch, tmp_path):
+    service = SlurmExecutionService()
+    cleanup = _monitor_harness(monkeypatch, service)
+    calls = []
+
+    async def alive(**kwargs):
+        raise SlurmSubmissionError("baseline gone")
+
+    async def recover(reason):
+        calls.append(reason)
+
+    monkeypatch.setattr(service, "_assert_worker_allocations_alive", alive)
+    config = NS(poll_interval_seconds=0.001, worker_start_timeout_seconds=1,
+                result_grace_seconds=1)
+    asyncio.run(service._execute_with_adaptive_monitor(
+        config, [], tmp_path, {}, "run", None,
+        external_cleanup_barrier=cleanup,
+        baseline_recover_fn=recover,
+        baseline_recovery={"attempts": 0, "pending_names": set()},
+    ))
+    assert calls and set(calls) == {"failure"}
+
+
+def test_baseline_renewal_fires_before_time_limit(monkeypatch, tmp_path):
+    service = SlurmExecutionService()
+    cleanup = _monitor_harness(monkeypatch, service)
+    calls = []
+
+    async def alive(**kwargs):
+        return None
+
+    async def recover(reason):
+        calls.append(reason)
+        if reason == "renewal":
+            raise SlurmSubmissionError("stop after first renewal")
+
+    monkeypatch.setattr(service, "_assert_worker_allocations_alive", alive)
+    config = NS(poll_interval_seconds=0.001, worker_start_timeout_seconds=1,
+                result_grace_seconds=1)
+    with pytest.raises(SlurmSubmissionError, match="stop after first renewal"):
+        asyncio.run(service._execute_with_adaptive_monitor(
+            config, [], tmp_path, {}, "run", None,
+            external_cleanup_barrier=cleanup,
+            baseline_recover_fn=recover,
+            baseline_recovery={"attempts": 0, "pending_names": set()},
+            baseline_renewal={"limit_seconds": 0.03, "margin_seconds": 0,
+                              "recover_grace_seconds": 1, "margin_multiplier": 1},
+        ))
+    assert "renewal" in calls
+
+
+def test_release_one_elastic_job_cancels_newest():
+    import asyncio
+    from services.slurm_execution_service import _release_one_elastic_job
+
+    released = []
+
+    class Adaptive:
+        def __init__(self):
+            self.elastic_names = {"CPU-elastic-1": ("w1",), "CPU-elastic-2": ("w2",)}
+        async def allocation_ended(self, allocation_id):
+            released.append(allocation_id)
+
+    class Cluster:
+        profile_adaptives = [Adaptive()]
+
+    result = asyncio.run(_release_one_elastic_job(Cluster()))
+    assert result == "CPU-elastic-2"
+    assert released == ["CPU-elastic-2"]

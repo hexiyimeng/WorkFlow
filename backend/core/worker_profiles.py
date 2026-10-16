@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 import re
 from typing import Any, Mapping, Sequence
 
@@ -247,12 +248,21 @@ def worker_logical_resources(worker: Any) -> dict[str, float]:
     }
 
 
+def task_retries() -> int:
+    raw = os.getenv("WorkFlow_TASK_RETRIES", "3").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 3
+
+
 def dask_annotation_kwargs(node_cls: type, node_id: str | None) -> dict[str, object]:
     profile = resolve_worker_profile(node_cls)
     return {
         "brainflow_node_id": node_id,
         "required_worker_profile": profile,
         "resources": {profile: 1.0},
+        "retries": task_retries(),
     }
 
 
@@ -268,5 +278,6 @@ __all__ = [
     "parse_memory_gib",
     "parse_worker_profiles",
     "resolve_worker_profile",
+    "task_retries",
     "worker_logical_resources",
 ]

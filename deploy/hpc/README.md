@@ -146,6 +146,30 @@ WorkFlow_SLURM_GPU_DIRECTIVE=gpus
 WorkFlow_SLURM_PROFILE_PARTITIONS=CPU=cpu,GPU=gpu
 ```
 
+任务容错（计算节点故障）：
+
+```bash
+# 每个块任务失败后的自动重试次数（默认 2，即最多尝试 3 次）。
+WorkFlow_TASK_RETRIES=2
+# 同一主机出现多少次失败后将该节点标记为坏节点并加入 --exclude（默认 2）。
+WorkFlow_NODE_FAILURE_THRESHOLD=2
+```
+
+失败按签名分类处置：瞬时故障直接重试；单节点重复失败记录坏节点并在后续扩容 Job 中排除；
+同一签名跨多台主机出现判定为确定性问题（代码/数据）提前终止；基础设施模式错误跨主机爆发
+判定为系统性故障并给出告警。
+
+坏节点处置细节：
+
+- 标记坏节点后立即退役其上的弹性 Job（Adaptive 自动补位）；若坏节点承载基线 Worker，
+  会以排除坏节点的 spec 重新提交基线 hetjob 并切换（恢复次数上限 3 次）。
+- 坏节点持久化在 `$HOME/workflow-runtime/state/bad-nodes.json`（TTL 48 小时），
+  后续执行的计划阶段即排除；误标时可删除该文件后重启控制平面。
+- 基线 hetjob 时限续期：基线存活达到 `WorkFlow_SLURM_TIME_LIMIT - margin` 时自动重提交并切换
+  （`WorkFlow_SLURM_BASELINE_RENEW_MARGIN_SECONDS`，默认 7200）；基线意外消失时自动恢复，
+  恢复期间按 `WorkFlow_SLURM_BASELINE_RECOVER_GRACE_SECONDS`（默认 3600）等待新基线注册；
+  续期 hetjob 因配额（GrpTRES）排队时自动释放最新弹性 Job 腾配额。
+
 全局 `MAX_CPUS/MAX_GPUS/MAX_MEMORY_GIB` 限制整个 execution；per-node 变量是额外的站点安全上限。Worker 启动命令完全由 `dask_jobqueue.SLURMJob` 根据 `cores` 和 `processes` 生成：`nthreads = cores / processes`。项目不再维护独立的 Worker sbatch/launcher，也不再允许单独配置与 CPU/Worker 矛盾的 Threads/Worker。
 
 ## 启动控制面

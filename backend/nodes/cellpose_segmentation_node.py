@@ -9,6 +9,9 @@ to a writer - the untrimmed blocks tile a larger-than-image array.
 
 from __future__ import annotations
 
+import inspect
+import logging
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -40,6 +43,89 @@ register_model_search_root("cellpose", SEG_MODELS_DIR)
 # Legacy Cellpose 3 model used by scripts/segmentation.py
 # (pretrained_model='../models/199082').
 SEG_SCRIPT_MODEL_NAME = "199082"
+
+logger = logging.getLogger("WorkFlow.CellposeSegmentation")
+
+_CELLPOSE_BLOCK_PARAMETERS = frozenset(inspect.signature(cellpose_block).parameters)
+
+
+def _is_block_dim(view: np.ndarray, threshold: float, device: str) -> bool:
+    """True when fewer than 1% of the voxels reach ``threshold``.
+
+    Equivalent to the nearest-rank 99th percentile being below ``threshold``,
+    computed as a single compare-and-reduce pass on ``device``.
+    """
+
+    import torch
+
+    array = np.ascontiguousarray(view)
+    try:
+        tensor = torch.from_numpy(array)
+    except TypeError:
+        tensor = torch.from_numpy(array.astype(np.float32, copy=False))
+    flat = tensor.to(device=device, dtype=torch.float32).reshape(-1)
+    count = int(flat.numel())
+    if count == 0:
+        return False
+    required = max(1, math.ceil(0.99 * count))
+    dim_voxels = int((flat < float(threshold)).sum().item())
+    return dim_voxels >= required
+
+
+def cellpose_segmentation_block(
+    image: np.ndarray,
+    primary_channel: int = 0,
+    brightness_threshold: float = 0.0,
+    ctx=None,
+    **kwargs,
+) -> np.ndarray:
+    """Skip Cellpose inference for blocks whose primary channel is dark."""
+
+    if ctx is None:
+        raise RuntimeError("cellpose_segmentation block requires a BlockContext.")
+    threshold = float(brightness_threshold or 0.0)
+    if threshold > 0.0:
+        resources = ctx.resources or {}
+        axes_by_name = resources.get("axes_by_name") or {}
+        axes = resources.get("axes") or axes_by_name.get(ctx.primary_input_name)
+        if not axes:
+            raise ValueError(
+                "cellpose_segmentation requires axes in BlockContext.resources. "
+                "Declare ARRAY_AXES_BY_NDIM or provide the explicit axes input."
+            )
+        axes = tuple(str(axis).upper() for axis in axes)
+        channel_axis = axes.index("C") if "C" in axes else None
+        if channel_axis is None:
+            view = image
+            output_shape = tuple(int(size) for size in image.shape)
+        else:
+            channel_count = int(image.shape[channel_axis])
+            primary_channel = int(primary_channel)
+            if primary_channel < 0 or primary_channel >= channel_count:
+                raise ValueError(
+                    f"primary_channel={primary_channel} is out of bounds "
+                    f"for channel count {channel_count}."
+                )
+            view = np.take(image, primary_channel, axis=channel_axis)
+            output_shape = tuple(
+                int(size)
+                for index, size in enumerate(image.shape)
+                if index != channel_axis
+            )
+        if _is_block_dim(view, threshold, ctx.device):
+            logger.info(
+                "[cellpose_segmentation] block %s skipped: fewer than 1%% of "
+                "primary-channel voxels reach brightness_threshold=%s",
+                (ctx.block_locations[0] if ctx.block_locations else "unknown"),
+                threshold,
+            )
+            return np.zeros(output_shape, dtype=np.uint32)
+    forward = {
+        key: value
+        for key, value in kwargs.items()
+        if key in _CELLPOSE_BLOCK_PARAMETERS
+    }
+    return cellpose_block(image, primary_channel=primary_channel, ctx=ctx, **forward)
 
 
 def list_seg_models() -> list[str]:
@@ -77,7 +163,9 @@ class CellposeSegmentation(BaseMapOverlapNode):
     """Cellpose segmentation whose output blocks keep their halo (untrimmed).
 
     Feed the mask output to process_segmentation, which merges the
-    overlapping labelings and trims back to the original chunking.
+    overlapping labelings and trims back to the original chunking.  Blocks
+    whose primary channel stays below brightness_threshold (fewer than 1%
+    of voxels reach it) skip GPU inference and emit an all-zero mask.
     """
 
     CATEGORY = "WorkFlow/Segmentation"
@@ -86,7 +174,7 @@ class CellposeSegmentation(BaseMapOverlapNode):
 
     MAP_INPUTS = ["image"]
     PRIMARY_INPUT = "image"
-    PROCESS_BLOCK = cellpose_block
+    PROCESS_BLOCK = cellpose_segmentation_block
     ARRAY_AXES_BY_NDIM = {
         "image": {
             2: ("Y", "X"),
@@ -245,6 +333,9 @@ class CellposeSegmentation(BaseMapOverlapNode):
                 "diameter": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 500.0}),
                 "flow_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0}),
                 "cellprob_threshold": ("FLOAT", {"default": 0.0, "min": -6.0, "max": 6.0}),
+                # Blocks whose primary channel has fewer than 1% of voxels at
+                # or above this raw intensity skip inference; 0 disables.
+                "brightness_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 65535.0}),
                 "gpu_batch_size": ("INT", {"default": 2, "min": 1, "max": 256}),
                 "do_3d": (["auto", "true", "false"], {"default": "true"}),
                 "normalize": ("BOOLEAN", {"default": True}),

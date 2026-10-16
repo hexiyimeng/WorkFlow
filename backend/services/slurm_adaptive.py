@@ -208,6 +208,14 @@ class ProfileAdaptive(Adaptive):
         await self.cluster._correct_state()
         self.retry_after = time.monotonic() + 60
 
+    def replace_baseline(self, names_by_index: Sequence[Sequence[str]]) -> None:
+        """Swap baseline bookkeeping to a freshly submitted baseline hetjob."""
+
+        self.baseline_names = {
+            f"baseline:{self.pool.profile}:{index}": tuple(names)
+            for index, names in enumerate(names_by_index)
+        }
+
 
 def start_profile_adaptives(cluster, pools, baseline_specs, spec_factory, token_prefix):
     """Run on the owning Cluster's IOLoop."""

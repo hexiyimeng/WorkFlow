@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import time
@@ -29,6 +30,7 @@ import uuid
 from core.slurm_execution import (
     SlurmPolicy,
     SlurmResourceRequest,
+    _slurm_time_seconds,
     parse_scontrol_job_record,
     resolve_execution_directory,
     validate_execution_id,
@@ -42,6 +44,14 @@ from core.resource_planner import (
     plan_workflow_resources,
 )
 from core.state_manager import ExecutionStatus, state_manager
+from core.task_failures import (
+    BAD_NODES_FILENAME,
+    FAILURE_EVENT_TOPIC,
+    TaskFailureTracker,
+    load_bad_nodes,
+    node_failure_threshold,
+    record_bad_node,
+)
 from core.window_execution import (
     ExecutionConfig,
     ExecutionLayout,
@@ -652,6 +662,132 @@ def _resource_request_from_mapping(value: object) -> SlurmResourceRequest:
     ):
         raise ValueError("Slurm job resource totals are inconsistent.")
     return request
+
+
+def _elastic_job_with_bad_nodes(template: SlurmJobRequirement, name: str,
+                                bad_nodes: set[str]) -> SlurmJobRequirement:
+    return replace(
+        template,
+        allocation_id=name,
+        excluded_nodes=tuple(sorted({*template.excluded_nodes, *bad_nodes})),
+    )
+
+
+def _drain_workflow_failure_events(events, tracker, cursor):
+    """Fold newly reported block failures into the tracker.
+
+    Returns ``{"fatal": verdict|None, "notices": [...], "new_bad_nodes": set}``
+    where fatal marks deterministic/systemic verdicts that should stop the
+    execution.
+    """
+
+    start = cursor.get("index", 0)
+    items = list(events)[start:]
+    cursor["index"] = start + len(items)
+    before = set(tracker.bad_nodes)
+    fatal = None
+    notices: list[str] = []
+    for _, payload in items:
+        if not isinstance(payload, Mapping):
+            continue
+        verdict = tracker.observe(
+            host=str(payload.get("host") or "unknown"),
+            signature=str(payload.get("signature") or "unknown"),
+            infra=bool(payload.get("infra")),
+            summary=str(payload.get("summary") or ""),
+        )
+        if verdict.category == TaskFailureTracker.NODE:
+            notices.append(verdict.message)
+        elif verdict.category in (
+            TaskFailureTracker.DETERMINISTIC,
+            TaskFailureTracker.SYSTEMIC,
+        ):
+            fatal = verdict
+    return {
+        "fatal": fatal,
+        "notices": notices,
+        "new_bad_nodes": tracker.bad_nodes - before,
+    }
+
+
+async def _collect_failure_verdicts(cluster, tracker, cursor):
+    """Scheduler-IOLoop-side drain; must stay a coroutine for ``cluster.sync``."""
+
+    scheduler = getattr(cluster, "scheduler", None)
+    if scheduler is None:
+        return {"fatal": None, "notices": [], "new_bad_nodes": set()}
+    return _drain_workflow_failure_events(
+        scheduler.get_events(FAILURE_EVENT_TOPIC), tracker, cursor,
+    )
+
+
+async def _workers_registered(cluster, names):
+    live = {w.name for w in cluster.scheduler.workers.values()}
+    return set(names) <= live
+
+
+async def _bad_host_victims(cluster, ips):
+    live = {w.name: w for w in cluster.scheduler.workers.values()}
+
+    def on_bad_host(name):
+        worker = live.get(name)
+        return worker is not None and worker.host in ips
+
+    baseline_hit = False
+    elastic_allocs: list = []
+    for adaptive in cluster.profile_adaptives:
+        baseline_names = {
+            n for names in adaptive.baseline_names.values() for n in names
+        }
+        if any(on_bad_host(n) for n in baseline_names):
+            baseline_hit = True
+        for alloc_id, names in adaptive.elastic_names.items():
+            if any(on_bad_host(n) for n in names):
+                elastic_allocs.append((adaptive, alloc_id))
+    return baseline_hit, elastic_allocs
+
+
+async def _swap_adaptive_baselines(cluster, allocation_jobs, specs, key):
+    names_by_profile: dict[str, tuple[str, ...]] = {}
+    for template, spec in zip(allocation_jobs, specs):
+        processes = int(spec.options["processes"])
+        names_by_profile[template.profile] = (
+            (f"{key}-{spec.allocation_id}",)
+            if processes == 1
+            else tuple(
+                f"{key}-{spec.allocation_id}-{i}" for i in range(processes)
+            )
+        )
+    for adaptive in cluster.profile_adaptives:
+        names = names_by_profile.get(adaptive.pool.profile)
+        if names:
+            adaptive.replace_baseline([names])
+    return names_by_profile
+
+
+def _env_int_seconds(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+_GROUP_LIMIT_REASON_RE = re.compile(r"(?i)(assocgrp|qosgrp|grptres|grplimit)")
+
+
+async def _release_one_elastic_job(cluster):
+    """Cancel the newest elastic job to free GrpTRES quota for baseline renewal."""
+
+    for adaptive in reversed(cluster.profile_adaptives):
+        if not adaptive.elastic_names:
+            continue
+        allocation_id = next(reversed(adaptive.elastic_names))
+        await adaptive.allocation_ended(allocation_id)
+        return allocation_id
+    return None
 
 
 def _git_revision(project_root: Path) -> str:
@@ -2356,9 +2492,17 @@ class SlurmExecutionService:
             )
 
     async def _execute_with_adaptive_monitor(self, config, baseline_jobs, run_directory,
-                                             graph, execution_id, selected_config, **kwargs):
+                                             graph, execution_id, selected_config,
+                                             failure_tracker=None, **kwargs):
         """Watch allocation failures without imposing a timeout on elastic queues."""
         cluster = dask_service.cluster
+        if failure_tracker is None:
+            failure_tracker = TaskFailureTracker(threshold=node_failure_threshold())
+        failure_cursor: dict[str, int] = {}
+        bad_node_hook = kwargs.pop("on_new_bad_nodes", None)
+        recovery = kwargs.pop("baseline_recovery", None)
+        baseline_recover_fn = kwargs.pop("baseline_recover_fn", None)
+        renew = kwargs.pop("baseline_renewal", None)
         running_since = {}
         missing_since = {}
         ended = set()
@@ -2377,6 +2521,25 @@ class SlurmExecutionService:
                 try:
                     await self._assert_worker_allocations_alive(
                         config=config, submitted_jobs=baseline_jobs, run_directory=run_directory)
+                except SlurmSubmissionError as exc:
+                    if stopping.is_set():
+                        return
+                    if baseline_recover_fn is None or recovery is None:
+                        raise
+                    if recovery.get("pending_names"):
+                        # 已有替代 hetjob 在排队/注册：复用它，不重复提交以保留排队年龄
+                        state_manager.add_log(
+                            f"基线 Job 消失，等待已在排队的替代 hetjob（{exc}）",
+                            "warning", execution_id=execution_id)
+                    else:
+                        state_manager.add_log(
+                            f"基线 Job 消失，自动恢复中（{exc}）",
+                            "warning", execution_id=execution_id)
+                        if renew is not None:
+                            renew["margin_multiplier"] = min(
+                                4, renew.get("margin_multiplier", 1) * 2)
+                        recovery["baseline_start_mono"] = None
+                        await baseline_recover_fn("failure")
                 except Exception:
                     if stopping.is_set():
                         return
@@ -2388,13 +2551,80 @@ class SlurmExecutionService:
                                for item in cluster.profile_adaptives)
                 if await asyncio.to_thread(cluster.sync, baseline_registered):
                     missing_since.pop("baseline", None)
+                    if (recovery is not None
+                            and recovery.get("baseline_start_mono") is None
+                            and not recovery.get("pending_names")):
+                        recovery["baseline_start_mono"] = time.monotonic()
                 else:
                     missing_since.setdefault("baseline", time.monotonic())
-                    if time.monotonic() - missing_since["baseline"] > config.worker_start_timeout_seconds:
+                    deadline = config.worker_start_timeout_seconds
+                    if (renew is not None and recovery is not None
+                            and recovery.get("pending_names")):
+                        # 恢复期间允许排队等待新基线，而不是按普通注册超时判死
+                        deadline = max(deadline, renew["recover_grace_seconds"])
+                    if time.monotonic() - missing_since["baseline"] > deadline:
                         raise SlurmSubmissionError("Baseline workers did not recover before the registration deadline.")
                 for adaptive in cluster.profile_adaptives:
                     if adaptive.failure is not None:
                         raise SlurmSubmissionError(f"Adaptive submission failed: {adaptive.failure}")
+                drained = await asyncio.to_thread(
+                    cluster.sync,
+                    _collect_failure_verdicts,
+                    cluster,
+                    failure_tracker,
+                    failure_cursor,
+                )
+                for notice in drained["notices"]:
+                    state_manager.add_log(notice, "warning", execution_id=execution_id)
+                if drained["fatal"] is not None:
+                    raise SlurmSubmissionError(
+                        f"任务失败已判定为 {drained['fatal'].category}: "
+                        f"{drained['fatal'].message}"
+                    )
+                if drained["new_bad_nodes"] and bad_node_hook is not None:
+                    await bad_node_hook(drained["new_bad_nodes"])
+                if recovery and recovery["pending_names"]:
+                    if await asyncio.to_thread(
+                        cluster.sync,
+                        _workers_registered,
+                        cluster,
+                        recovery["pending_names"],
+                    ):
+                        state_manager.add_log(
+                            "基线 Worker 已在健康节点恢复注册", "success",
+                            execution_id=execution_id)
+                        recovery["pending_names"] = set()
+                        recovery["pending_job_id"] = None
+                        recovery["baseline_start_mono"] = time.monotonic()
+                    elif recovery.get("pending_job_id"):
+                        query_ok, row = await self._query_queue_state(
+                            config, recovery["pending_job_id"], None,
+                            recovery.get("pending_token"))
+                        if query_ok and (row is None or row[0] in _SLURM_TERMINAL_STATES):
+                            state_manager.add_log(
+                                "替代基线 hetjob 未注册即终止，将重新提交",
+                                "warning", execution_id=execution_id)
+                            recovery["pending_names"] = set()
+                            recovery["pending_job_id"] = None
+                        elif (row is not None and row[0] == "PENDING" and row[2]
+                                and _GROUP_LIMIT_REASON_RE.search(str(row[2]))):
+                            released = await asyncio.to_thread(
+                                cluster.sync, _release_one_elastic_job, cluster)
+                            if released:
+                                state_manager.add_log(
+                                    f"续期 hetjob 受配额限制排队，已释放弹性 Job {released} 腾出配额",
+                                    "warning", execution_id=execution_id)
+                if (renew is not None and baseline_recover_fn is not None
+                        and recovery is not None
+                        and recovery.get("baseline_start_mono") is not None
+                        and not recovery["pending_names"]):
+                    margin = renew["margin_seconds"] * renew.get("margin_multiplier", 1)
+                    elapsed = time.monotonic() - recovery["baseline_start_mono"]
+                    if elapsed > renew["limit_seconds"] - margin:
+                        state_manager.add_log(
+                            "基线 hetjob 接近 Slurm 时限，提前续期（重新提交基线）",
+                            "info", execution_id=execution_id)
+                        await baseline_recover_fn("renewal")
                 records = await asyncio.to_thread(cluster.submitted_job_records)
                 for record in records:
                     adaptive = next((item for item in cluster.profile_adaptives
@@ -2585,6 +2815,15 @@ class SlurmExecutionService:
                 ).control_directory
             )
         config = SlurmRuntimeConfig.from_environment()
+        bad_nodes_path = config.runtime_directory / "state" / BAD_NODES_FILENAME
+        persistent_bad_nodes = load_bad_nodes(bad_nodes_path)
+        if persistent_bad_nodes:
+            config = replace(config, policy=replace(
+                config.policy,
+                excluded_nodes=tuple(sorted(
+                    {*config.policy.excluded_nodes, *persistent_bad_nodes}
+                )),
+            ))
         allocation_plan = await asyncio.to_thread(
             _plan_slurm_allocation,
             plan,
@@ -2928,8 +3167,135 @@ class SlurmExecutionService:
                 "clusterManager": "dask_jobqueue.SLURMCluster",
             })
             template_jobs = {job.profile: job for job in allocation_plan.jobs}
+            failure_tracker = TaskFailureTracker(
+                threshold=node_failure_threshold(),
+                bad_nodes=set(persistent_bad_nodes),
+            )
+            baseline_recovery: dict = {"attempts": 0, "pending_names": set()}
+            baseline_renewal = {
+                "limit_seconds": _slurm_time_seconds(config.policy.time_limit),
+                "margin_seconds": _env_int_seconds(
+                    "WorkFlow_SLURM_BASELINE_RENEW_MARGIN_SECONDS", 7200),
+                "recover_grace_seconds": _env_int_seconds(
+                    "WorkFlow_SLURM_BASELINE_RECOVER_GRACE_SECONDS", 3600),
+                "margin_multiplier": 1,
+            }
+
+            async def _baseline_recover(reason: str = "failure") -> None:
+                """Resubmit the baseline hetjob away from bad nodes or before expiry."""
+
+                if baseline_recovery["pending_names"]:
+                    return
+                if reason == "renewal":
+                    baseline_recovery["renewals"] = (
+                        baseline_recovery.get("renewals", 0) + 1
+                    )
+                else:
+                    baseline_recovery["attempts"] += 1
+                    if baseline_recovery["attempts"] > 3:
+                        raise SlurmSubmissionError(
+                            "基线 Worker 因节点故障恢复次数超限。"
+                        )
+                retry_tag = f"r{baseline_recovery['attempts']}"
+                key = f"baseline-{retry_tag}"
+                specs = []
+                first_request = None
+                for template in allocation_plan.jobs:
+                    job = _elastic_job_with_bad_nodes(
+                        template,
+                        f"{template.allocation_id}-{retry_tag}",
+                        failure_tracker.bad_nodes,
+                    )
+                    request = _worker_job_request(allocation_plan, job)
+                    config.policy.validate_request(request)
+                    if first_request is None:
+                        first_request = (job, request)
+                    specs.append(build_planned_slurm_worker_spec(
+                        allocation_plan, job, execution_id=execution_id,
+                        submission_token=f"{submission_token_prefix}:baseline-{retry_tag}",
+                        project_root=config.project_root,
+                        runtime_directory=config.runtime_directory,
+                        run_directory=run_directory,
+                        python_executable=(
+                            config.project_root / "backend" / ".venv" / "bin" / "python"
+                        ),
+                        sbatch_executable=config.sbatch_executable,
+                        scancel_executable=config.scancel_executable,
+                        scheduler_host=config.scheduler_host,
+                        scheduler_port=config.scheduler_port,
+                        protocol=protocol,
+                        security=dask_service.client.security,
+                        worker_port_range=config.worker_port_range,
+                        nanny_port_range=config.nanny_port_range,
+                        gpu_directive=config.policy.gpu_directive,
+                    ))
+                cluster = dask_service.cluster
+                records = await asyncio.to_thread(
+                    cluster.sync, cluster.resubmit_baseline, key, specs)
+                records_by_alloc = {r.allocation_id: r for r in records}
+
+                names_by_profile = await asyncio.to_thread(
+                    cluster.sync,
+                    _swap_adaptive_baselines,
+                    cluster,
+                    allocation_plan.jobs,
+                    specs,
+                    key,
+                )
+                await asyncio.to_thread(
+                    cluster.sync, cluster.retire_baseline_entry, "baseline")
+                old_job_id = submitted_jobs[0][0] if submitted_jobs else None
+                new_record = records_by_alloc.get(specs[0].allocation_id)
+                submitted_jobs[:] = [
+                    item for item in submitted_jobs if item[0] != old_job_id
+                ]
+                if new_record is not None and first_request is not None:
+                    submitted_jobs.append((
+                        new_record.job_id,
+                        None,
+                        new_record.submission_token,
+                        first_request[1],
+                    ))
+                baseline_recovery["pending_names"] = {
+                    name for names in names_by_profile.values() for name in names
+                }
+                if new_record is not None:
+                    baseline_recovery["pending_job_id"] = new_record.job_id
+                    baseline_recovery["pending_token"] = new_record.submission_token
+                state_manager.add_log(
+                    f"基线 hetjob 已在排除故障节点后重新提交（第 "
+                    f"{baseline_recovery['attempts']} 次恢复）",
+                    "warning", execution_id=execution_id)
+
+            async def on_new_bad_nodes(hosts: set[str]) -> None:
+                for host in sorted(hosts):
+                    record_bad_node(
+                        bad_nodes_path, host, failure_tracker.summary_for(host))
+                    state_manager.add_log(
+                        f"节点 {host} 已标记为故障节点并加入排除列表",
+                        "warning", execution_id=execution_id)
+                cluster = dask_service.cluster
+                ips = set()
+                for host in hosts:
+                    try:
+                        ips.add(socket.gethostbyname(host))
+                    except OSError:
+                        pass
+                baseline_hit, elastic_allocs = await asyncio.to_thread(
+                    cluster.sync, _bad_host_victims, cluster, ips)
+                for adaptive, alloc_id in elastic_allocs:
+                    state_manager.add_log(
+                        f"弹性 Job {alloc_id} 位于故障节点，已回收并等待补位",
+                        "warning", execution_id=execution_id)
+                    await asyncio.to_thread(
+                        cluster.sync, adaptive.allocation_ended, alloc_id)
+                if baseline_hit:
+                    await _baseline_recover()
+
             def elastic_spec(profile, name, token):
-                job = replace(template_jobs[profile], allocation_id=name)
+                job = _elastic_job_with_bad_nodes(
+                    template_jobs[profile], name, failure_tracker.bad_nodes,
+                )
                 request = _worker_job_request(allocation_plan, job)
                 config.policy.validate_request(request)
                 job_requests[name] = request
@@ -2951,8 +3317,13 @@ class SlurmExecutionService:
                 authoritative_graph,
                 execution_id,
                 selected_config,
+                failure_tracker=failure_tracker,
                 release_active_execution=False,
                 external_cleanup_barrier=external_cleanup_barrier,
+                on_new_bad_nodes=on_new_bad_nodes,
+                baseline_recovery=baseline_recovery,
+                baseline_recover_fn=_baseline_recover,
+                baseline_renewal=baseline_renewal,
             )
         except BaseException as exc:
             final_error = exc

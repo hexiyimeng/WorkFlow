@@ -5,6 +5,7 @@ import pytest
 import zarr
 
 import nodes.ome_zarr_reader as reader_module
+from core.worker_profiles import task_retries
 from nodes.ome_zarr_reader import OMEZarrReader, _resolve_group_array
 
 
@@ -71,6 +72,7 @@ def test_reader_has_explicit_cpu_reader_materialization_layer(tmp_path) -> None:
         "brainflow_node_id": "reader",
         "required_worker_profile": "CPU",
         "resources": {"CPU": 1.0},
+        "retries": task_retries(),
     }
 
 

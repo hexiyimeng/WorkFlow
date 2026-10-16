@@ -827,6 +827,7 @@ async def _execute_pending_windows(
         submitted_count += 1
         return True
 
+    failed_windows: list[tuple[Window, BaseException]] = []
     try:
         while (
             len(in_flight) < max_in_flight_windows
@@ -839,7 +840,6 @@ async def _execute_pending_windows(
                 tuple(in_flight),
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            first_error: BaseException | None = None
             for waiter in done:
                 entry = in_flight[waiter]
                 try:
@@ -865,25 +865,36 @@ async def _execute_pending_windows(
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    if first_error is None:
-                        first_error = exc
-                else:
-                    # Failed entries remain tracked until the outer cleanup
-                    # cancels every Future belonging to that Window.  This is
-                    # required now that the waiter deliberately returns before
-                    # its sibling terminal Futures have completed.
-                    in_flight.pop(waiter)
-                    _release_futures(entry.futures)
-                    _remove_futures(tracked_futures, entry.futures)
-
-            if first_error is not None:
-                raise first_error
+                    # Soft failure: record the window as failed, keep every
+                    # other window running, and fail only after all windows
+                    # have been attempted.  Completed windows stay committed
+                    # in the recovery bitmap; resume fills the gaps.
+                    failed_windows.append((entry.window, exc))
+                    logger.warning(
+                        "Window %s failed (%s: %s); continuing with the "
+                        "remaining windows.",
+                        entry.window.index + 1,
+                        type(exc).__name__,
+                        exc,
+                    )
+                in_flight.pop(waiter)
+                _release_futures(entry.futures)
+                _remove_futures(tracked_futures, entry.futures)
 
             while (
                 len(in_flight) < max_in_flight_windows
                 and await submit_next_window()
             ):
                 pass
+        if failed_windows:
+            first_window, first_exc = failed_windows[0]
+            raise RuntimeError(
+                f"Window execution partially failed: "
+                f"{completed_count} window(s) completed, "
+                f"{len(failed_windows)} failed and can be resumed "
+                f"(first failure at Window {first_window.index + 1}: "
+                f"{type(first_exc).__name__}: {first_exc})."
+            )
     except BaseException:
         await _cancel_in_flight_windows(
             client,
