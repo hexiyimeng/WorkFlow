@@ -42,8 +42,11 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ===========================================
   const [nodes, setNodes, applyNodeChanges] = useNodesState<Node<NodeData>>([]);
   const [edges, setEdges, applyEdgeChanges] = useEdgesState<Edge>([]);
-  const [theme, setTheme] = useState<'light' | 'dark'>('light');
-  const [isConsoleOpen, setIsConsoleOpen] = useState(true);
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    try { return localStorage.getItem('WorkFlow_THEME') === 'dark' ? 'dark' : 'light'; }
+    catch { return 'light'; }
+  });
+  const [isConsoleOpen, setIsConsoleOpen] = useState(false);
   const [connectingType, setConnectingType] = useState<string | null>(null);
   const [isExecutionSettingsOpen, setIsExecutionSettingsOpen] = useState(false);
   const [executionSettingsValidation, setExecutionSettingsValidation] = useState<
@@ -76,7 +79,10 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   // Theme effect
-  useEffect(() => { document.documentElement.classList.toggle('dark', theme === 'dark'); }, [theme]);
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    try { localStorage.setItem('WorkFlow_THEME', theme); } catch { /* Browser storage may be unavailable. */ }
+  }, [theme]);
 
   const toggleTheme = useCallback(() => setTheme(t => t === 'light' ? 'dark' : 'light'), []);
   const toggleConsole = useCallback(() => setIsConsoleOpen(p => !p), []);

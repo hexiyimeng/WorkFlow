@@ -8,13 +8,13 @@ import RecoveryBrowserDialog from './components/execution/RecoveryBrowserDialog'
 
 export default function App() {
   return (
-    <div className="w-screen h-screen flex flex-col overflow-hidden font-sans transition-colors duration-300"
+    <div className="workspace w-screen h-screen flex flex-col overflow-hidden font-sans"
       style={{ backgroundColor: 'var(--color-bg-app)', color: 'var(--color-text-primary)' }}>
       <Header />
       <PluginDiagnosticsBanner />
-      <div className="flex-1 flex overflow-hidden relative">
+      <div className="workspace-body">
         <Sidebar />
-        <main className="flex-1 relative flex flex-col overflow-hidden">
+        <main className="workspace-main">
           <FlowEditor />
           <BottomPanel />
         </main>

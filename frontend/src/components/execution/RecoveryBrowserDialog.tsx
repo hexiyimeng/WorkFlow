@@ -214,7 +214,7 @@ export default function RecoveryBrowserDialog() {
       role="dialog"
       aria-modal="false"
       aria-labelledby="recovery-browser-title"
-      className="fixed bottom-0 right-0 top-12 z-[10020] flex w-full max-w-xl flex-col overflow-hidden border-l"
+      className="fixed bottom-0 right-0 top-[var(--workspace-header-height)] z-[10020] flex w-full max-w-xl flex-col overflow-hidden border-l"
       style={{
         backgroundColor: 'var(--color-bg-surface)',
         borderColor: 'var(--color-border-default)',

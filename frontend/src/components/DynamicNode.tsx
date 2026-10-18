@@ -76,7 +76,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
       <article className="workflow-node node-wrapper" data-node-id={id} data-status={status}
         data-selected={selected || undefined} data-invalid={_invalid || undefined}
         data-collapsed={collapsed || undefined} style={{ '--node-category': color } as CSSProperties}>
-        <header className="workflow-node__header" title={nodeSpec?.description || `${title} ? ${nodeSpec?.category || data.opType}`}
+        <header className="workflow-node__header" title={nodeSpec?.description || `${title} · ${nodeSpec?.category || data.opType}`}
           onDoubleClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
           <button type="button" className="workflow-node__collapse nodrag" aria-label={collapsed ? 'Expand node' : 'Collapse node'}
             aria-expanded={!collapsed} onDoubleClick={event => event.stopPropagation()}
@@ -92,7 +92,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
         {(inputs.length > 0 || outputs.length > 0) && (
           <div className="node-ports" aria-label="Node connections">
             <div className="node-ports__column">
-              {inputs.map(input => <div key={input.name} className="node-port" title={`${input.name} ? ${input.type}`}>
+              {inputs.map(input => <div key={input.name} className="node-port" title={`${input.name} · ${input.type}`}>
                 <Handle type="target" position={Position.Left} id={input.name}
                   aria-label={`Input ${input.name} (${input.type})`}
                   className="node-port__handle node-port__handle--input"
@@ -102,7 +102,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
               </div>)}
             </div>
             <div className="node-ports__column node-ports__column--outputs">
-              {outputs.map((output, index) => <div key={index} className="node-port" title={`${output.name} ? ${output.type}`}>
+              {outputs.map((output, index) => <div key={index} className="node-port" title={`${output.name} · ${output.type}`}>
                 <span className="node-port__name">{output.name}</span>
                 <Handle type="source" position={Position.Right} id={String(index)}
                   aria-label={`Output ${output.name} (${output.type})`}

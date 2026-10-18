@@ -29,9 +29,9 @@ assert(
   'normal settings and recovery must be mounted as separate interfaces',
 );
 
-const settingsButton = header.indexOf('<span>Execution Settings</span>');
-const recoveryButton = header.indexOf('>\n          Recovery\n        </Button>');
-const runButton = header.indexOf("{isPreflighting ? 'Checking...' : 'Run'}");
+const settingsButton = header.indexOf('onClick={openExecutionSettings}');
+const recoveryButton = header.indexOf('onClick={openRecoveryBrowser}');
+const runButton = header.indexOf('void runFlow()');
 assert(
   settingsButton >= 0 && recoveryButton > settingsButton && runButton > recoveryButton,
   'the header must present Execution Settings, Recovery, then Run',

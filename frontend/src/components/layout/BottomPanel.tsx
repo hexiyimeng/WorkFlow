@@ -1,339 +1,109 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowDownToLine, Check, ChevronDown, ChevronUp, CircleCheck, Copy, Search, Terminal, Trash2, X, AlertCircle } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
-import { Pill } from '../ui/Pill';
-import { IconButton } from '../ui/IconButton';
-import { Button } from '../ui/Button';
+import { usePanelResize } from '../../hooks/usePanelResize';
 import type { LogEntry } from '../../types';
 
+function formatTime(timestamp: string | number): string {
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? '--:--:--' : date.toLocaleTimeString([], { hour12: false });
+}
 function LogMessage({ log }: { log: LogEntry }) {
-  return (
-    <div className="text-[11px] flex-1 min-w-0 whitespace-pre-wrap break-words"
-      style={{ color: log.type === 'error' ? 'var(--color-danger)' : 'var(--color-console-text)' }}>
-      {log.message}
-      {log.details && (
-        <details className="mt-1 mb-2">
-          <summary className="cursor-pointer text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
-            Error details
-          </summary>
-          <pre className="mt-2 max-h-72 overflow-auto rounded border p-3 whitespace-pre-wrap break-words select-text"
-            style={{ borderColor: 'var(--color-console-border)', color: 'var(--color-console-text)' }}>
-            {log.details}
-          </pre>
-        </details>
-      )}
-    </div>
-  );
+  return <div className="output-log__message">{log.message}
+    {log.details && <details className="output-log__details"><summary>Error details</summary><pre>{log.details}</pre></details>}
+  </div>;
 }
-
-function shortId(id: string | null): string {
-  return id ? id.slice(0, 8) : '—';
-}
-function formatTime(ts: string | number): string {
-  if (!ts) return '--:--:--';
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return '--:--:--';
-  return d.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-const PHASE_LABELS: Record<string, string> = {
-  idle: 'Idle', graph_building: 'Building', submitted: 'Queued',
-  running: 'Running', cancelling: 'Stopping', succeeded: 'Done',
-  disconnected: 'Disconnected', interrupted: 'Interrupted',
-  failed: 'Failed', cancelled: 'Cancelled',
-};
-const PHASE_PILL: Record<string, 'idle' | 'info' | 'running' | 'success' | 'danger' | 'warning' | 'muted'> = {
-  idle: 'idle', graph_building: 'info', submitted: 'info',
-  running: 'running', cancelling: 'warning', succeeded: 'success',
-  disconnected: 'warning', interrupted: 'warning',
-  failed: 'danger', cancelled: 'warning',
-};
-
-type Tab = 'logs' | 'errors';
-
-const LOG_ICONS: Record<string, string> = { error: '✕', success: '✓', warning: '⚠', info: '›' };
-const LOG_COLORS: Record<string, string> = {
-  error: 'var(--color-danger)',
-  success: 'var(--color-success)',
-  warning: 'var(--color-warning)',
-  info: 'var(--color-console-info)',
-};
+const PHASE_LABELS: Record<string, string> = { idle: 'Ready', graph_building: 'Building graph', submitted: 'Queued', running: 'Running',
+  cancelling: 'Stopping', succeeded: 'Completed', disconnected: 'Disconnected', interrupted: 'Interrupted', failed: 'Failed', cancelled: 'Cancelled' };
+type Filter = 'all' | 'errors' | 'warnings';
 
 export default function BottomPanel() {
   const { logs, clearLogs, isConsoleOpen, toggleConsole, executionState, websocketStatus, isExecuting, isCancelling, stopFlow } = useFlow();
-  const [tab, setTab] = useState<Tab>('logs');
-  const endRef = useRef<HTMLDivElement>(null);
-  const [height, setHeight] = useState(220);
-  const isDragging = useRef(false);
+  const [filter, setFilter] = useState<Filter>('all');
+  const [query, setQuery] = useState('');
+  const [follow, setFollow] = useState(true);
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const bodyRef = useRef<HTMLDivElement>(null);
   const lastShownErrorRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (isConsoleOpen) endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs, isConsoleOpen]);
-
-  useEffect(() => {
-    if (
-      websocketStatus === 'reconnecting'
-      && executionState.phase === 'disconnected'
-      && !isConsoleOpen
-    ) toggleConsole();
-  }, [websocketStatus, executionState.phase, isConsoleOpen, toggleConsole]);
-
-  const startResizing = useCallback((e: React.MouseEvent) => {
-    e.preventDefault(); isDragging.current = true;
-    document.body.style.cursor = 'row-resize'; document.body.style.userSelect = 'none';
-  }, []);
-  const stopResizing = useCallback(() => {
-    isDragging.current = false; document.body.style.cursor = ''; document.body.style.userSelect = '';
-  }, []);
-  const resize = useCallback((e: MouseEvent) => {
-    if (isDragging.current) setHeight(Math.max(100, Math.min(window.innerHeight - e.clientY, window.innerHeight * 0.7)));
-  }, []);
-  useEffect(() => {
-    window.addEventListener('mousemove', resize);
-    window.addEventListener('mouseup', stopResizing);
-    return () => { window.removeEventListener('mousemove', resize); window.removeEventListener('mouseup', stopResizing); };
-  }, [resize, stopResizing]);
-
-  const phase = executionState.phase;
-  const execId = executionState.executionId;
-  const errorLogs = useMemo(() => logs.filter(l => l.type === 'error'), [logs]);
-  const latestErrorId = errorLogs.at(-1)?.id;
+  const { size, separatorProps } = usePanelResize('y', 240, 140, typeof window === 'undefined' ? 600 : Math.max(140, Math.floor(window.innerHeight * .65)), -1);
+  const errors = useMemo(() => logs.filter(log => log.type === 'error'), [logs]);
+  const warnings = useMemo(() => logs.filter(log => log.type === 'warning'), [logs]);
+  const visible = useMemo(() => {
+    const source = filter === 'errors' ? errors : filter === 'warnings' ? warnings : logs;
+    const search = query.trim().toLowerCase();
+    return search ? source.filter(log => `${log.message} ${log.details || ''}`.toLowerCase().includes(search)) : source;
+  }, [errors, warnings, logs, filter, query]);
+  const latestErrorId = errors.at(-1)?.id;
   useEffect(() => {
     if (latestErrorId && latestErrorId !== lastShownErrorRef.current) {
       lastShownErrorRef.current = latestErrorId;
       if (!isConsoleOpen) toggleConsole();
     }
   }, [latestErrorId, isConsoleOpen, toggleConsole]);
-  const windowProgress = executionState.windowProgress;
-  const showWindowProgress = windowProgress !== null && (isExecuting || isCancelling);
-  const activeWindowWidth = windowProgress && windowProgress.totalWindows > 0
-    ? Math.max(100 / windowProgress.totalWindows, 0.75)
-    : 0;
-  const hasActiveWindow = Boolean(
-    windowProgress
-    && windowProgress.windowStatus === 'running'
-    && windowProgress.totalWindows > 0
-  );
-  const activeWindowOffset = windowProgress && windowProgress.totalWindows > 0
-    ? (windowProgress.currentWindow - 1) * 100 / windowProgress.totalWindows
-    : 0;
+  useEffect(() => {
+    if (websocketStatus === 'reconnecting' && executionState.phase === 'disconnected' && !isConsoleOpen) toggleConsole();
+  }, [websocketStatus, executionState.phase, isConsoleOpen, toggleConsole]);
+  useEffect(() => {
+    if (follow && isConsoleOpen && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+  }, [visible, follow, isConsoleOpen]);
+  const windowProgress = executionState.windowProgress ?? null;
+  const phase = executionState.phase;
+  const message = phase === 'failed' ? executionState.lastError || 'Execution failed'
+    : phase === 'disconnected' ? 'Connection lost; checking execution status…'
+    : phase === 'running' ? 'Processing workflow' : '';
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(visible.map(log => `[${formatTime(log.timestamp)}] [${log.type.toUpperCase()}] ${log.message}${log.details ? `\n${log.details}` : ''}`).join('\n'));
+      setCopyState('copied');
+    } catch { setCopyState('failed'); }
+  };
 
-  const mainMessage = useMemo(() => {
-    if (phase === 'idle') return 'Ready';
-    if (phase === 'graph_building') return 'Building graph...';
-    if (phase === 'submitted') return 'Execution queued';
-    if (phase === 'running' && windowProgress) return windowProgress.message;
-    if (phase === 'running') return 'Workflow running';
-    if (phase === 'cancelling') return 'Stopping...';
-    if (phase === 'disconnected') return 'Backend connection lost; checking execution status...';
-    if (phase === 'interrupted') return 'Backend execution interrupted; Window runs can be resumed from Recovery';
-    if (phase === 'succeeded') return 'Completed successfully';
-    if (phase === 'failed') return executionState.lastError ? `Failed: ${executionState.lastError.slice(0, 80)}` : 'Execution failed';
-    if (phase === 'cancelled') return 'Execution cancelled';
-    return phase;
-  }, [phase, executionState.lastError, windowProgress]);
-
-  const wsVariant = websocketStatus === 'connected' ? 'success' : websocketStatus === 'reconnecting' ? 'warning' : 'danger';
-  const wsLabel = websocketStatus === 'connected' ? 'Connected' : websocketStatus === 'reconnecting' ? 'Reconnecting' : 'Offline';
-
-  return (
-    <div
-      className="absolute bottom-0 left-0 w-full z-40 flex flex-col"
-      style={{
-        height: isConsoleOpen ? height : 42,
-        backgroundColor: 'var(--color-console-bg)',
-        borderTop: '1px solid var(--color-console-border)',
-        transition: 'height 200ms ease',
-      }}
-    >
-      {/* Resize handle */}
-      {isConsoleOpen && (
-        <div
-          onMouseDown={startResizing}
-          className="absolute top-0 left-0 right-0 h-1.5 cursor-row-resize z-50 flex items-center justify-center"
-          style={{ top: 0 }}
-          onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'var(--color-accent-soft)')}
-          onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
-        >
-          <div className="w-10 h-0.5 rounded-full" style={{ backgroundColor: 'var(--color-border-default)' }} />
+  return <section className="output-panel" aria-label="Execution output" style={{ height: isConsoleOpen ? size : 38 }}>
+    {isConsoleOpen && <div {...separatorProps} aria-label="Resize output panel" className="output-resize-handle" />}
+    <div className="output-summary">
+      <button className="output-heading" onClick={toggleConsole} aria-expanded={isConsoleOpen} aria-label={isConsoleOpen ? 'Collapse output' : 'Expand output'}>
+        <Terminal size={14} /><span>Output</span><small>{logs.length}</small>{isConsoleOpen ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
+      </button>
+      <span className="output-connection" data-state={websocketStatus} title={websocketStatus === 'connected' ? 'Backend connected' : 'Backend disconnected'}><i />{websocketStatus === 'connected' ? 'Connected' : websocketStatus === 'reconnecting' ? 'Reconnecting' : 'Offline'}</span>
+      <span className="output-phase" data-phase={phase}>{PHASE_LABELS[phase] || phase}</span>
+      {windowProgress && (isExecuting || isCancelling) ? <div className="output-window-progress">
+        <span>{windowProgress.message}</span><strong>{windowProgress.completedWindows} / {windowProgress.totalWindows}<small>{windowProgress.progress.toFixed(1)}%</small></strong>
+        <div className="output-progress-track" role="progressbar" aria-label="Window execution progress" aria-valuemin={0} aria-valuemax={100}
+          aria-valuenow={windowProgress.progress} aria-valuetext={`${windowProgress.completedWindows} of ${windowProgress.totalWindows} Windows completed`}>
+          <div style={{ width: `${windowProgress.progress}%` }} />
+          {windowProgress.windowStatus === 'running' && windowProgress.totalWindows > 0 && <i style={{ left: `${(windowProgress.currentWindow - 1) * 100 / windowProgress.totalWindows}%`, width: `${Math.max(100 / windowProgress.totalWindows, .75)}%` }} />}
         </div>
-      )}
-
-      {/* ---- Collapsed / Summary bar ---- */}
-      <div
-        className="h-[42px] shrink-0 flex items-center px-3 gap-3 border-b cursor-pointer select-none"
-        style={{ borderColor: 'var(--color-console-border)' }}
-        onClick={toggleConsole}
-      >
-        {/* Collapse chevron */}
-        <div
-          className="w-4 h-4 flex items-center justify-center transition-transform duration-150"
-          style={{ transform: isConsoleOpen ? 'rotate(0deg)' : 'rotate(-90deg)', color: 'var(--color-text-muted)' }}
-        >
-          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M7 10l5 5 5-5z" />
-          </svg>
-        </div>
-
-        {/* WS status */}
-        <Pill variant={wsVariant} dot pulse={websocketStatus === 'reconnecting'} className="text-[9px]">
-          {wsLabel}
-        </Pill>
-
-        {/* Phase */}
-        <Pill variant={PHASE_PILL[phase] ?? 'muted'} dot pulse={phase === 'running' || phase === 'cancelling'} className="text-[9px]">
-          {PHASE_LABELS[phase] ?? phase}
-        </Pill>
-
-        {/* Execution ID */}
-        {execId && (
-          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0" style={{ backgroundColor: 'var(--color-bg-field)', color: 'var(--color-info)', border: '1px solid var(--color-info)/20' }}>
-            {shortId(execId)}
-          </span>
-        )}
-
-        {/* Message / Window progress */}
-        {showWindowProgress && windowProgress ? (
-          <div className="flex-1 min-w-[240px] max-w-[560px] flex flex-col gap-1">
-            <div className="flex items-center justify-between gap-3 text-[10px] font-mono">
-              <span className="truncate" style={{ color: 'var(--color-console-text)' }}>
-                {windowProgress.windowStatus === 'finalizing'
-                  ? `Finalizing · ${windowProgress.completedWindows} / ${windowProgress.totalWindows} Windows`
-                  : windowProgress.message}
-              </span>
-              <span className="shrink-0 tabular-nums" style={{ color: 'var(--color-accent)' }}>
-                {windowProgress.progress.toFixed(1)}%
-              </span>
-            </div>
-            <div
-              role="progressbar"
-              aria-label="Window execution progress"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={windowProgress.progress}
-              aria-valuetext={`${windowProgress.completedWindows} of ${windowProgress.totalWindows} Windows completed`}
-              className="relative h-1.5 rounded-full overflow-hidden"
-              style={{ backgroundColor: 'var(--color-bg-field)' }}
-            >
-              <div
-                className="absolute inset-y-0 left-0 rounded-full transition-[width] duration-300"
-                style={{
-                  width: `${windowProgress.progress}%`,
-                  backgroundColor: 'var(--color-accent)',
-                }}
-              />
-              {hasActiveWindow && (
-                <div
-                  className="absolute inset-y-0 rounded-full animate-pulse"
-                  style={{
-                    left: `${activeWindowOffset}%`,
-                    width: `${activeWindowWidth}%`,
-                    backgroundColor: 'var(--color-info)',
-                  }}
-                />
-              )}
-            </div>
-          </div>
-        ) : (
-          <span className="flex-1 truncate text-[11px] font-mono" style={{ color: 'var(--color-console-text)' }}>
-            {mainMessage}
-          </span>
-        )}
-
-        {/* Actions */}
-        <div className="flex items-center gap-1 shrink-0" onClick={e => e.stopPropagation()}>
-          {(isExecuting || isCancelling) && (
-            <Button
-              variant="danger"
-              size="xs"
-              onClick={stopFlow}
-              disabled={websocketStatus !== 'connected'}
-            >
-              ■ Stop
-            </Button>
-          )}
-          <IconButton size="xs" onClick={() => clearLogs()} title="Clear logs">
-            <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-            </svg>
-          </IconButton>
-        </div>
-      </div>
-
-      {/* ---- Expanded body ---- */}
-      {isConsoleOpen && (
-        <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Tab bar */}
-          <div className="flex items-center gap-0.5 px-3 pt-1.5 pb-1 border-b shrink-0" style={{ borderColor: 'var(--color-console-border)' }}>
-            {(['logs', 'errors'] as Tab[]).map(t => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className="px-3 py-1 rounded-[var(--radius-sm)] text-[10px] font-semibold uppercase tracking-wider transition-all"
-                style={{
-                  backgroundColor: tab === t ? 'var(--color-accent-soft)' : 'transparent',
-                  color: tab === t ? 'var(--color-accent)' : 'var(--color-text-muted)',
-                }}
-              >
-                {t}
-                {t === 'errors' && errorLogs.length > 0 && (
-                  <span className="ml-1 px-1 py-px rounded-full text-[9px]" style={{ backgroundColor: 'var(--color-danger-soft)', color: 'var(--color-danger)' }}>
-                    {errorLogs.length}
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
-
-          {/* Log list */}
-          <div className="flex-1 overflow-y-auto custom-scrollbar font-mono">
-            {tab === 'logs' && (
-              logs.length === 0 ? (
-                <div className="px-4 py-4 text-[11px] italic" style={{ color: 'var(--color-text-muted)' }}>
-                  {'>'} System ready. No logs yet.
-                </div>
-              ) : (
-                logs.map(log => (
-                  <div
-                    key={log.id}
-                    className="flex items-start gap-3 px-3 py-0.5 hover:bg-[var(--color-bg-field-hover)] border-l-2 transition-colors"
-                    style={{ borderColor: log.type === 'error' ? 'var(--color-danger)' : log.type === 'warning' ? 'var(--color-warning)' : 'transparent' }}
-                  >
-                    <span className="text-[10px] shrink-0 w-16 text-right pt-px" style={{ color: 'var(--color-text-muted)' }}>
-                      {formatTime(log.timestamp)}
-                    </span>
-                    <span style={{ color: LOG_COLORS[log.type] ?? 'var(--color-console-info)' }} className="text-[12px] shrink-0 w-3 flex items-center justify-center">
-                      {LOG_ICONS[log.type] ?? '›'}
-                    </span>
-                    <LogMessage log={log} />
-                  </div>
-                ))
-              )
-            )}
-            {tab === 'errors' && (
-              errorLogs.length === 0 ? (
-                <div className="px-4 py-4 text-[11px] italic" style={{ color: 'var(--color-text-muted)' }}>
-                  No errors. All good.
-                </div>
-              ) : (
-                errorLogs.map(log => (
-                  <div
-                    key={log.id}
-                    className="flex items-start gap-3 px-3 py-0.5 hover:bg-[var(--color-bg-field-hover)] border-l-2 border-[var(--color-danger)] transition-colors"
-                  >
-                    <span className="text-[10px] shrink-0 w-16 text-right pt-px" style={{ color: 'var(--color-text-muted)' }}>
-                      {formatTime(log.timestamp)}
-                    </span>
-                    <span className="text-[12px] shrink-0 w-3 flex items-center justify-center" style={{ color: 'var(--color-danger)' }}>✕</span>
-                    <LogMessage log={log} />
-                  </div>
-                ))
-              )
-            )}
-            <div ref={endRef} />
-          </div>
-        </div>
-      )}
+      </div> : <span className="output-summary-message" title={message}>{message}</span>}
+      {executionState.executionId && <code className="output-execution-id" title={`Execution: ${executionState.executionId}`}>{executionState.executionId.slice(0, 8)}</code>}
+      {(isExecuting || isCancelling) && <button className="output-stop" onClick={stopFlow} disabled={websocketStatus !== 'connected' || isCancelling}>{isCancelling ? 'Stopping…' : 'Stop'}</button>}
+      {!isConsoleOpen && errors.length > 0 && <button className="output-error-count" onClick={() => { setFilter('errors'); toggleConsole(); }}>{errors.length} errors</button>}
+      {isConsoleOpen && <button className="workspace-icon-button" title="Collapse output" aria-label="Close output" onClick={toggleConsole}><X size={14} /></button>}
     </div>
-  );
+    {isConsoleOpen && <>
+      <div className="output-toolbar">
+        <div className="output-tabs" role="tablist" aria-label="Output filters">
+          {(['all', 'errors', 'warnings'] as Filter[]).map(tab => <button role="tab" key={tab} aria-selected={filter === tab} onClick={() => { setFilter(tab); setCopyState('idle'); }}>
+            {tab === 'all' ? 'All events' : tab === 'errors' ? 'Errors' : 'Warnings'}<small>{tab === 'all' ? logs.length : tab === 'errors' ? errors.length : warnings.length}</small>
+          </button>)}
+        </div>
+        <div className="output-search"><Search size={12} /><input aria-label="Search output" placeholder="Filter output…" value={query} onChange={event => { setQuery(event.target.value); setCopyState('idle'); }} />
+          {query && <button aria-label="Clear output search" onClick={() => setQuery('')}><X size={12} /></button>}
+        </div>
+        <button className="workspace-icon-button" aria-label="Follow output" aria-pressed={follow} title={follow ? 'Auto-scroll enabled' : 'Resume auto-scroll'} onClick={() => setFollow(current => !current)}><ArrowDownToLine size={14} /></button>
+        <button className="workspace-icon-button" aria-label="Copy visible output" title={copyState === 'copied' ? 'Copied' : 'Copy visible output'} disabled={!visible.length} onClick={() => { void copy(); }}>{copyState === 'copied' ? <Check size={14} /> : <Copy size={14} />}</button>
+        <button className="workspace-icon-button" aria-label="Clear logs" title="Clear logs" disabled={!logs.length} onClick={() => { clearLogs(); setCopyState('idle'); }}><Trash2 size={14} /></button>
+        {copyState === 'failed' && <span role="status" className="output-copy-status">Copy unavailable; select the text to copy.</span>}
+        {copyState === 'copied' && <span role="status" className="sr-only">Output copied</span>}
+      </div>
+      <div ref={bodyRef} className="output-body custom-scrollbar" onScroll={event => {
+        const container = event.currentTarget;
+        setFollow(container.scrollHeight - container.scrollTop - container.clientHeight < 24);
+      }}>
+        {visible.length === 0 ? <div className="output-empty">{filter === 'errors' ? <CircleCheck size={22} /> : <Terminal size={22} />}<strong>{query ? 'No matching events' : filter === 'errors' ? 'No errors' : filter === 'warnings' ? 'No warnings' : 'Ready for execution'}</strong><span>{query ? 'Try another search term or filter.' : 'Execution messages and diagnostics will appear here.'}</span></div> :
+          visible.map(log => <div key={log.id} className="output-log" data-level={log.type}>
+            <time>{formatTime(log.timestamp)}</time><span className="output-log__level">{log.type === 'error' ? <AlertCircle size={12} /> : <span className="output-log__dot" />}{log.type}</span><LogMessage log={log} />
+          </div>)}
+      </div>
+    </>}
+  </section>;
 }
