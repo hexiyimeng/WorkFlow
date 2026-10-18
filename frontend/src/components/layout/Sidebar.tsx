@@ -28,7 +28,7 @@ export default function Sidebar() {
   const [open, setOpen] = useState(true);
   const [search, setSearch] = useState('');
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
-  const { size, separatorProps } = usePanelResize('x', 264, 220, 420);
+  const { size, separatorProps } = usePanelResize('x', 288, 240, 420);
   const entries = useMemo(() => Object.entries(nodeDefs).map(([type, node]) => ({ ...node, type })), [nodeDefs]);
   const groups = useMemo(() => {
     const result = new Map<string, LibraryNode[]>();
