@@ -1,626 +1,130 @@
-import { memo, useCallback, useMemo, useState, useRef, useEffect, useLayoutEffect } from 'react';
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { Handle, Position, NodeResizer, type NodeProps, type Node } from '@xyflow/react';
+import { memo, useCallback, useMemo, useState, useRef, useLayoutEffect, type CSSProperties } from 'react';
+import { Handle, Position, NodeResizer, useNodeConnections, useUpdateNodeInternals, type NodeProps, type Node } from '@xyflow/react';
+import { ChevronDown, Database, ScanLine, SlidersHorizontal, Save } from 'lucide-react';
 import type { NodeData } from '../types';
 import { useFlow } from '../hooks/useFlowContext';
-import { createPortal } from 'react-dom';
-import { Pill } from './ui/Pill';
 import { parsePortType, resolveNodeOutputTypes } from '../utils/portTypes';
 import { inputMeta, isInputVisible, valuesWithInputDefaults } from '../utils/inputVisibility';
+import { NodeParameter } from './nodes/NodeParameter';
 
-// === Handle type color registry ===
 const TYPE_COLORS: Record<string, string> = {
-  ZARR_HANDLE: '#fbbf24',
-  IMAGE: '#3b82f6',
-  INT: '#34d399',
-  FLOAT: '#f472b6',
-  STRING: '#94a3b8',
-  DATA_STREAM: '#a78bfa',
-  METADATA: '#fb7185',
-  DASK_ARRAY: '#22d3ee',
-  default: '#6b7280',
+  ZARR_HANDLE: '#d7ad66', IMAGE: '#78a9e2', INT: '#88bc9a', FLOAT: '#cea0cd',
+  STRING: '#a4afc0', DATA_STREAM: '#af9cdb', METADATA: '#d59ba0', DASK_ARRAY: '#68bfc4',
 };
-
 function getTypeColor(type: string): string {
-  const parsed = parsePortType(type);
-  return TYPE_COLORS[type] ?? TYPE_COLORS[parsed.container] ?? TYPE_COLORS.default;
+  return TYPE_COLORS[type] ?? TYPE_COLORS[parsePortType(type).container] ?? '#9aa5b5';
 }
-
-// Category → accent strip color
-const CATEGORY_COLORS: Record<string, string> = {
-  'WorkFlow/IO': '#22c55e',
-  'WorkFlow/Processing': '#3b82f6',
-  'WorkFlow/Segmentation': '#f59e0b',
-  'WorkFlow/Models': '#f59e0b',
-  'WorkFlow/Output': '#a78bfa',
-  'Image': '#3b82f6',
-  'Loader': '#22c55e',
-  'Output': '#a78bfa',
-  'Processing': '#f59e0b',
-  'Transform': '#06b6d4',
-  'Utils': '#94a3b8',
-};
-
-function getCategoryAccent(category?: string): string {
-  if (!category) return '#6b7280';
-  const top = category.split('/')[0];
-  return CATEGORY_COLORS[category] ?? CATEGORY_COLORS[top] ?? '#6b7280';
+function categoryStyle(category = '', output = false) {
+  if (output || /Output|Writer/.test(category)) return { color: '#a08bd5', Icon: Save };
+  if (/Segmentation|Models/.test(category)) return { color: '#c59b62', Icon: ScanLine };
+  if (/IO|Loader/.test(category)) return { color: '#6fa795', Icon: Database };
+  return { color: '#779ac3', Icon: SlidersHorizontal };
 }
-
-// === NodeStatus map ===
-type NodeStatus = 'idle' | 'ready' | 'submitted' | 'running' | 'done' | 'failed' | 'cancelled' | 'error';
-
-const STATUS_PILL_VARIANT: Record<NodeStatus, 'idle' | 'info' | 'running' | 'success' | 'danger' | 'warning' | 'muted'> = {
-  idle: 'idle', ready: 'info', submitted: 'info', running: 'running',
-  done: 'success', failed: 'danger', cancelled: 'warning', error: 'danger',
+const STATUS_LABELS: Record<string, string> = {
+  ready: 'Ready', submitted: 'Queued', running: 'Running', done: 'Completed',
+  failed: 'Failed', cancelled: 'Cancelled',
 };
 
-const STATUS_LABEL: Record<NodeStatus, string> = {
-  idle: '', ready: 'Ready', submitted: 'Queued', running: 'Running',
-  done: 'Done', failed: 'Failed', cancelled: 'Cancelled', error: 'Error',
-};
-
-// ==========================================
-// 1. ValuePopup — string editor popup
-// ==========================================
-interface ValuePopupProps {
-  name: string;
-  initialValue: string;
-  onSave: (value: string) => void;
-  onClose: () => void;
-  anchorRect: DOMRect | null;
-}
-
-export const ValuePopup = ({ name, initialValue, onSave, onClose, anchorRect }: ValuePopupProps) => {
-  const [val, setVal] = useState(initialValue);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => { inputRef.current?.focus(); inputRef.current?.select(); }, []);
-
-  const style: CSSProperties = useMemo(() => {
-    if (!anchorRect) return { position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)' };
-    const width = Math.min(720, window.innerWidth - 24);
-    let top = anchorRect.bottom + 8;
-    const left = Math.max(12, Math.min(
-      anchorRect.left + anchorRect.width / 2 - width / 2,
-      window.innerWidth - width - 12,
-    ));
-    if (top + 220 > window.innerHeight) top = Math.max(12, anchorRect.top - 220);
-    return { top, left, position: 'fixed' as const };
-  }, [anchorRect]);
-
-  return createPortal(
-    <div className="fixed inset-0 z-[9999]" onClick={onClose}>
-      <div
-        role="dialog"
-        aria-label={`Edit ${name}`}
-        className="bg-[var(--color-bg-surface)] border border-[var(--color-border-default)] rounded-[var(--radius-lg)] shadow-[var(--shadow-floating)] p-4 space-y-3 w-[min(720px,calc(100vw-24px))] max-h-[calc(100vh-24px)] overflow-auto"
-        style={style}
-        onClick={e => e.stopPropagation()}
-      >
-        <label htmlFor="node-value-editor" className="block text-[12px] text-[var(--color-text-secondary)] font-semibold">{name}</label>
-        <textarea
-          id="node-value-editor"
-          ref={inputRef}
-          rows={4}
-          wrap="soft"
-          className="w-full min-h-[100px] resize-y bg-[var(--color-bg-field)] text-[var(--color-text-primary)] text-[13px] leading-6 font-mono px-3 py-2 rounded-[var(--radius-md)] border border-[var(--color-border-default)] focus:border-[var(--color-border-focus)] outline-none [overflow-wrap:anywhere]"
-          value={val}
-          onChange={e => setVal(e.target.value)}
-          onKeyDown={e => {
-            if (e.nativeEvent.isComposing) return;
-            if (e.key === 'Enter') { e.preventDefault(); onSave(val); }
-            if (e.key === 'Escape') onClose();
-          }}
-        />
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-[10px] text-[var(--color-text-muted)]">Enter to save · Esc to cancel</span>
-          <div className="flex gap-2">
-            <button onClick={onClose} className="px-3 py-1.5 text-[11px] text-[var(--color-text-secondary)]">Cancel</button>
-            <button
-              onClick={() => onSave(val)}
-              className="shrink-0 px-2.5 py-1.5 text-[10px] font-bold text-white bg-[var(--color-accent)] hover:bg-[var(--color-accent-hover)] rounded-[var(--radius-md)] transition-colors duration-[var(--motion-fast)]"
-            >
-              OK
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>, document.body
-  );
-};
-
-// ==========================================
-// 2. ControlWidget
-// ==========================================
-interface ControlWidgetProps {
-  name: string;
-  config: [string | string[], Record<string, unknown>?];
-  value: unknown;
-  onChange: (name: string, value: unknown) => void;
-  disabled?: boolean;
-}
-
-const ControlWidget = ({ name, config, value, onChange, disabled = false }: ControlWidgetProps) => {
-  const [type, options] = config;
-  const [showPopup, setShowPopup] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null);
-  const stopProp = (e: ReactMouseEvent | ReactPointerEvent) => e.stopPropagation();
-  const stopPropKey = (e: ReactKeyboardEvent) => e.stopPropagation();
-
-  // --- Boolean ---
-  if (type === 'BOOLEAN') {
-    const boolVal = value === true || String(value).toLowerCase() === 'true';
-    return (
-      <div
-        className={[
-          'nodrag group flex items-center justify-between gap-2',
-          'bg-[var(--color-bg-field)] hover:bg-[var(--color-bg-field-hover)]',
-          'rounded-[var(--radius-sm)] px-2 h-6 mb-[2px]',
-          'border border-transparent hover:border-[var(--color-border-subtle)]',
-          'transition-all duration-[var(--motion-fast)] select-none',
-          disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
-        ].join(' ')}
-        onClick={disabled ? undefined : () => onChange(name, !boolVal)}
-        onDoubleClick={stopProp}
-      >
-        <span className="text-[11px] text-[var(--color-text-secondary)] font-medium truncate">{name}</span>
-        <div
-          className={[
-            'relative w-7 h-3.5 rounded-full transition-colors duration-200 shrink-0',
-            boolVal ? 'bg-[var(--color-accent)]' : 'bg-[var(--color-border-default)]',
-          ].join(' ')}
-        >
-          <div
-            className={[
-              'absolute top-[2px] left-[2px] w-2.5 h-2.5 bg-white rounded-full shadow-sm',
-              'transition-transform duration-200',
-              boolVal ? 'translate-x-3.5' : 'translate-x-0',
-            ].join(' ')}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  // --- String ---
-  if (type === 'STRING') {
-    const displayStr = value != null && String(value) !== '' ? String(value) : '';
-    return (
-      <>
-        <div
-          ref={containerRef}
-          className={[
-            'nodrag group flex items-center justify-between gap-2',
-            'bg-[var(--color-bg-field)] hover:bg-[var(--color-bg-field-hover)]',
-            'rounded-[var(--radius-sm)] px-2 h-6 mb-[2px]',
-            'border border-transparent hover:border-[var(--color-border-subtle)]',
-            'transition-all duration-[var(--motion-fast)] select-none',
-            disabled ? '' : 'cursor-pointer',
-          ].join(' ')}
-          onClick={disabled ? stopProp : () => { setAnchorRect(containerRef.current?.getBoundingClientRect() ?? null); setShowPopup(true); }}
-          onDoubleClick={stopProp}
-        >
-          <span className="text-[11px] text-[var(--color-text-secondary)] font-medium truncate">{name}</span>
-          <span className={[
-            'text-[11px] font-mono text-right truncate max-w-[60%]',
-            displayStr ? 'text-[var(--color-text-primary)]' : 'text-[var(--color-text-muted)] italic',
-          ].join(' ')} title={displayStr}>
-            {displayStr || '—'}
-          </span>
-        </div>
-        {showPopup && !disabled && (
-          <ValuePopup
-            name={name}
-            initialValue={String(value ?? '')}
-            anchorRect={anchorRect}
-            onSave={v => { onChange(name, v); setShowPopup(false); }}
-            onClose={() => setShowPopup(false)}
-          />
-        )}
-      </>
-    );
-  }
-
-  // --- Number (INT / FLOAT / LONG) ---
-  if (type === 'INT' || type === 'FLOAT' || type === 'LONG') {
-    const isFloat = type === 'FLOAT';
-    const step = Number(options?.step) || (isFloat ? 0.01 : 1);
-    const val = Number(value ?? options?.default ?? 0);
-    const min = options?.min as number | undefined;
-    const max = options?.max as number | undefined;
-
-    const stepVal = (direction: 1 | -1, shift: boolean) => {
-      const mult = shift ? 10 : 1;
-      let v = val + step * direction * mult;
-      if (isFloat) v = parseFloat(v.toFixed(5));
-      else v = Math.round(v);
-      if (min !== undefined) v = Math.max(v, min);
-      if (max !== undefined) v = Math.min(v, max);
-      onChange(name, v);
-    };
-
-    return (
-      <div
-        className={[
-          'nodrag flex items-center justify-between gap-2',
-          'bg-[var(--color-bg-field)] hover:bg-[var(--color-bg-field-hover)]',
-          'rounded-[var(--radius-sm)] px-2 h-6 mb-[2px]',
-          'border border-transparent hover:border-[var(--color-border-subtle)]',
-          'transition-all duration-[var(--motion-fast)] select-none',
-        ].join(' ')}
-        onDoubleClick={stopProp}
-      >
-        <span className="text-[11px] text-[var(--color-text-secondary)] font-medium truncate shrink-0">{name}</span>
-        <div className="flex items-center gap-0.5">
-          <button
-            className={[
-              'w-4 h-4 rounded flex items-center justify-center shrink-0',
-              'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-surface-3)]',
-              'transition-colors duration-[var(--motion-fast)]',
-              disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer',
-            ].join(' ')}
-            onClick={disabled ? undefined : (e) => { e.stopPropagation(); stepVal(-1, e.shiftKey); }}
-            disabled={disabled}
-          >
-            <svg className="w-2 h-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 12h14" />
-            </svg>
-          </button>
-          <input
-            type="number"
-            className={[
-              'w-full min-w-0 h-5 text-[11px] text-center font-mono text-[var(--color-text-primary)]',
-              'bg-[var(--color-bg-surface)] rounded-[var(--radius-sm)]',
-              'border border-[var(--color-border-subtle)]',
-              'focus:border-[var(--color-border-focus)] outline-none no-spinners',
-              'transition-colors duration-[var(--motion-fast)] px-1',
-            ].join(' ')}
-            value={val}
-            disabled={disabled}
-            onChange={e => {
-              let v = Number(e.target.value);
-              if (!isFloat) v = Math.round(v);
-              onChange(name, v);
-            }}
-            step={step}
-            onPointerDown={stopProp}
-            onKeyDown={stopPropKey}
-          />
-          <button
-            className={[
-              'w-4 h-4 rounded flex items-center justify-center shrink-0',
-              'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-surface-3)]',
-              'transition-colors duration-[var(--motion-fast)]',
-              disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer',
-            ].join(' ')}
-            onClick={disabled ? undefined : (e) => { e.stopPropagation(); stepVal(1, e.shiftKey); }}
-            disabled={disabled}
-          >
-            <svg className="w-2 h-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 5v14M5 12h14" />
-            </svg>
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // --- Dropdown (array type) ---
-  if (Array.isArray(type)) {
-    return (
-      <div
-        className={[
-          'nodrag flex items-center justify-between gap-2',
-          'bg-[var(--color-bg-field)] hover:bg-[var(--color-bg-field-hover)]',
-          'rounded-[var(--radius-sm)] px-2 h-6 mb-[2px]',
-          'border border-transparent hover:border-[var(--color-border-subtle)]',
-          'transition-all duration-[var(--motion-fast)] select-none',
-        ].join(' ')}
-        onDoubleClick={stopProp}
-      >
-        <span className="text-[11px] text-[var(--color-text-secondary)] font-medium truncate shrink-0">{name}</span>
-        <div className={[
-          'bg-[var(--color-bg-surface)] rounded-[var(--radius-sm)] px-1.5 h-5',
-          'border border-[var(--color-border-subtle)]',
-          'flex items-center gap-1 shrink-0',
-          'transition-colors duration-[var(--motion-fast)]',
-        ].join(' ')}>
-          <select
-            className="text-[11px] font-mono text-right text-[var(--color-text-primary)] bg-transparent outline-none border-none appearance-none cursor-pointer pr-1 max-w-[100px]"
-            value={String(value ?? type[0])}
-            onChange={e => onChange(name, e.target.value)}
-            onPointerDown={stopProp}
-            disabled={disabled}
-          >
-            {type.map((o: string) => (
-              <option key={o} value={o} className="bg-[var(--color-bg-surface)]">{o}</option>
-            ))}
-          </select>
-          <svg className="w-2.5 h-2.5 text-[var(--color-text-muted)] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-          </svg>
-        </div>
-      </div>
-    );
-  }
-
-  return null;
-};
-
-// ==========================================
-// 4. DynamicNode — main component
-// ==========================================
 const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
-  const { nodeSpec, values = {}, message, _invalid, _warning, runState, waitingFor } = data || {};
+  const { nodeSpec, values = {}, message, _invalid, _warning, runState, waitingFor } = data;
   const { isExecutionLocked, updateNodeData } = useFlow();
   const locked = isExecutionLocked ?? false;
   const [collapsed, setCollapsed] = useState(false);
   const valuesRef = useRef(values);
   useLayoutEffect(() => { valuesRef.current = values; }, [values]);
-  const effectiveValues = useMemo(
-    () => valuesWithInputDefaults(nodeSpec, values),
-    [nodeSpec, values],
-  );
-
-  const handleUpdate = useCallback((key: string, v: unknown) => {
-    updateNodeData(id, { values: { ...valuesRef.current, [key]: v } });
+  const effectiveValues = useMemo(() => valuesWithInputDefaults(nodeSpec, values), [nodeSpec, values]);
+  const handleUpdate = useCallback((key: string, value: unknown) => {
+    updateNodeData(id, { values: { ...valuesRef.current, [key]: value } });
   }, [id, updateNodeData]);
+  const connections = useNodeConnections({ id });
+  const updateNodeInternals = useUpdateNodeInternals();
+  const connectedInputs = new Set(connections.filter(c => c.target === id).map(c => c.targetHandle));
+  const connectedOutputs = new Set(connections.filter(c => c.source === id).map(c => c.sourceHandle));
+  const { color, Icon } = categoryStyle(nodeSpec?.category, nodeSpec?.output_node);
+  const title = nodeSpec?.display_name || data.opType || 'Unknown node';
+  const status = runState ?? 'idle';
+  const hasStatus = status !== 'idle' && status !== 'ready';
+  const footerMessage = status === 'running' && waitingFor?.length
+    ? `Waiting for ${waitingFor.join(', ')}`
+    : status === 'done' ? '' : message || '';
 
-  // --- Status ---
-  const status: NodeStatus = runState ?? 'idle';
-  const hasFooter = status !== 'idle' && status !== 'ready';
-  const accentColor = getCategoryAccent(nodeSpec?.category);
-  const isOutputNode = nodeSpec?.output_node === true;
-
-  // --- Footer message ---
-  const footerMessage = useMemo(() => {
-    if (status === 'submitted') return 'Queued';
-    if (status === 'running' && waitingFor?.length) return `Waiting for ${waitingFor[0]}${waitingFor.length > 1 ? ` +${waitingFor.length - 1}` : ''}`;
-    if (status === 'running') return message || 'Running...';
-    if (status === 'done') return 'Completed';
-    if (status === 'failed') return message || 'Failed';
-    if (status === 'cancelled') return 'Cancelled';
-    return message || '';
-  }, [status, waitingFor, message]);
-
-  // --- Parse IO & widgets ---
-  const { linkInputs, widgets, outputs } = useMemo(() => {
-    if (!nodeSpec) return { linkInputs: [], outputs: [], widgets: [] };
-    const links: { name: string; type: string; color: string }[] = [];
-    const wids: { name: string; config: [string | string[], Record<string, unknown>?] }[] = [];
-    const outs: { name: string; type: string; color: string }[] = [];
-
-    const allInputs = { ...(nodeSpec.input?.required || {}), ...(nodeSpec.input?.optional || {}) };
-    Object.entries(allInputs).forEach(([name, config]) => {
-      if (!config) return;
-      const [rawType, rawOptions] = config as [string | string[], Record<string, unknown>?];
-      if (!isInputVisible(inputMeta(config), effectiveValues)) return;
-      const isDropdown = Array.isArray(rawType);
-      const isPrimitive = typeof rawType === 'string' && ['INT', 'FLOAT', 'STRING', 'BOOLEAN', 'LONG'].includes(rawType);
-      // Widgets: primitives (INT/FLOAT/STRING/BOOLEAN/LONG) or explicit dropdowns
-      if (isPrimitive || isDropdown) {
-        wids.push({ name, config: [rawType, rawOptions] });
-      } else if (typeof rawType === 'string') {
-        // Non-primitive types (DASK_ARRAY, ZARR, etc.) are always link inputs, even if they have options
-        links.push({ name, type: rawType, color: getTypeColor(rawType) });
+  const { inputs, widgets, outputs } = useMemo(() => {
+    const inputs: { name: string; type: string; color: string }[] = [];
+    const widgets: { name: string; config: [string | string[], Record<string, unknown>?] }[] = [];
+    if (nodeSpec) {
+      const definitions = { ...nodeSpec.input?.required, ...nodeSpec.input?.optional };
+      for (const [name, config] of Object.entries(definitions)) {
+        if (!config || !isInputVisible(inputMeta(config), effectiveValues)) continue;
+        const [type, options] = config as [string | string[], Record<string, unknown>?];
+        if (Array.isArray(type) || ['INT', 'FLOAT', 'STRING', 'BOOLEAN', 'LONG'].includes(type)) {
+          widgets.push({ name, config: [type, options] });
+        } else if (typeof type === 'string') inputs.push({ name, type, color: getTypeColor(type) });
       }
-    });
-
-    const outputTypes = resolveNodeOutputTypes(nodeSpec, effectiveValues);
-    if (outputTypes.length > 0) {
-      outputTypes.forEach((outType: string, idx: number) => {
-        outs.push({
-          name: nodeSpec.output_name?.[idx] ?? outType,
-          type: outType,
-          color: getTypeColor(outType),
-        });
-      });
     }
-    return { linkInputs: links, outputs: outs, widgets: wids };
-  }, [nodeSpec, values, effectiveValues]);
-
-  const hasIO = linkInputs.length > 0 || outputs.length > 0;
-  const hasWidgets = widgets.length > 0;
+    const outputs = nodeSpec ? resolveNodeOutputTypes(nodeSpec, effectiveValues).map((type, index) => ({
+      name: nodeSpec.output_name?.[index] ?? type, type, color: getTypeColor(type),
+    })) : [];
+    return { inputs, widgets, outputs };
+  }, [nodeSpec, effectiveValues]);
+  const portLayout = [...inputs.map(p => `${p.name}:${p.type}`), '|', ...outputs.map(p => p.type)].join(',');
+  useLayoutEffect(() => { updateNodeInternals(id); }, [id, portLayout, collapsed, updateNodeInternals]);
 
   return (
     <>
-      <NodeResizer
-        color="var(--color-accent)"
-        isVisible={!!selected && !collapsed && !locked}
-        minWidth={260}
-        minHeight={80}
-        handleStyle={{ width: 8, height: 8 }}
-        lineStyle={{ borderColor: 'var(--color-accent)' }}
-      />
-
-      <div
-        className={[
-          'relative flex flex-col rounded-[var(--radius-lg)] overflow-visible',
-          'bg-[var(--color-node-body)]',
-          'border transition-all duration-[var(--motion-normal)]',
-          selected
-            ? 'border-[var(--color-accent)] shadow-[0_0_0_1px_var(--color-accent),var(--shadow-node-selected)]'
-            : 'border-[var(--color-node-border)] shadow-[var(--shadow-node)] hover:shadow-[var(--shadow-node-hover)]',
-          _invalid ? 'border-[var(--color-warning)]' : '',
-        ].join(' ')}
-        style={{ minWidth: 260, overflow: 'visible' }}
-      >
-        {/* ===== HEADER ===== */}
-        <div
-          className={[
-            'relative flex items-center justify-between gap-2 px-3 py-2',
-            'bg-[var(--color-node-header)] border-b border-[var(--color-border-subtle)]',
-            'rounded-t-[var(--radius-lg)] cursor-pointer select-none',
-          ].join(' ')}
-          onDoubleClick={(e) => { e.stopPropagation(); setCollapsed(!collapsed); }}
-        >
-          {/* Left: category dot + title */}
-          <div className="flex items-center gap-2 min-w-0 flex-1">
-            <div
-              className="w-2 h-2 rounded-full shrink-0"
-              style={{ backgroundColor: accentColor }}
-            />
-            <div className="flex flex-col min-w-0">
-              <span className={[
-                'text-[12px] font-semibold truncate',
-                _invalid ? 'text-[var(--color-warning)]' : 'text-[var(--color-text-primary)]',
-              ].join(' ')}>
-                {nodeSpec?.display_name || data.opType || 'Unknown'}
-              </span>
-              <span className="text-[10px] text-[var(--color-text-muted)] truncate">
-                {nodeSpec?.category?.split('/').pop() ?? nodeSpec?.category ?? data.opType}
-              </span>
+      <NodeResizer color="var(--color-accent)" isVisible={Boolean(selected) && !collapsed && !locked}
+        minWidth={300} minHeight={96} handleStyle={{ width: 7, height: 7 }} />
+      <article className="workflow-node node-wrapper" data-node-id={id} data-status={status}
+        data-selected={selected || undefined} data-invalid={_invalid || undefined}
+        data-collapsed={collapsed || undefined} style={{ '--node-category': color } as CSSProperties}>
+        <header className="workflow-node__header" title={nodeSpec?.description || `${title} ? ${nodeSpec?.category || data.opType}`}
+          onDoubleClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
+          <button type="button" className="workflow-node__collapse nodrag" aria-label={collapsed ? 'Expand node' : 'Collapse node'}
+            aria-expanded={!collapsed} onDoubleClick={event => event.stopPropagation()}
+            onClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
+            <ChevronDown size={14} />
+          </button>
+          <span className="workflow-node__category" aria-hidden="true"><Icon size={14} /></span>
+          <h3 className="workflow-node__title">{title}</h3>
+          {nodeSpec?.output_node && <span className="workflow-node__output" title="Output node" aria-label="Output node"><Save size={13} /></span>}
+          {collapsed && hasStatus && <span className="node-status-dot" title={STATUS_LABELS[status]} />}
+        </header>
+        {_invalid && <div className="workflow-node__warning" role="alert">{_warning || 'Node type unavailable. Replace this node.'}</div>}
+        {(inputs.length > 0 || outputs.length > 0) && (
+          <div className="node-ports" aria-label="Node connections">
+            <div className="node-ports__column">
+              {inputs.map(input => <div key={input.name} className="node-port" title={`${input.name} ? ${input.type}`}>
+                <Handle type="target" position={Position.Left} id={input.name}
+                  aria-label={`Input ${input.name} (${input.type})`}
+                  className="node-port__handle node-port__handle--input"
+                  data-connected={connectedInputs.has(input.name) || undefined}
+                  style={{ '--port-color': input.color } as CSSProperties} />
+                <span className="node-port__name">{input.name}</span>
+              </div>)}
             </div>
-          </div>
-
-          {/* Right: status + collapse */}
-          <div className="flex items-center gap-2 shrink-0">
-            {isOutputNode && (
-              <span className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-[var(--color-info-soft)] text-[var(--color-info)] border border-[var(--color-info)]/20">
-                OUTPUT
-              </span>
-            )}
-            {hasFooter && (
-              <Pill variant={STATUS_PILL_VARIANT[status]} dot pulse={status === 'running'}>
-                {STATUS_LABEL[status]}
-              </Pill>
-            )}
-            <button
-              className="w-5 h-5 flex items-center justify-center rounded text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-surface-3)] transition-colors"
-              onClick={(e) => { e.stopPropagation(); setCollapsed(!collapsed); }}
-            >
-              <svg
-                className={['w-3 h-3 transition-transform duration-200', collapsed ? '' : 'rotate-180'].join(' ')}
-                viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        {/* ===== INVALID WARNING ===== */}
-        {_invalid && !collapsed && (
-          <div className="px-3 py-1.5 bg-[var(--color-warning-soft)] border-b border-[var(--color-warning)]/20 text-[10px] text-[var(--color-warning)]">
-            ⚠️ {_warning || 'Node type removed — please replace'}
-          </div>
-        )}
-
-        {/* ===== BODY — I/O always visible, only Parameters collapse ===== */}
-        {hasIO && (
-          <div className="px-3 pt-2 pb-1">
-            <div className="flex gap-3">
-              {/* INPUTS column */}
-              {linkInputs.length > 0 && (
-                <div className="flex-1 min-w-0">
-                  <div className="text-[9px] font-bold uppercase tracking-wider text-[var(--color-text-muted)] mb-1 px-0.5">
-                    Inputs
-                  </div>
-                  <div className="flex flex-col gap-[3px]">
-                    {linkInputs.map((input) => (
-                      <div
-                        key={input.name}
-                        className="relative flex items-center h-6"
-                      >
-                        {/* Handle — positioned to poke LEFT of node */}
-                        <Handle
-                          type="target"
-                          position={Position.Left}
-                          id={input.name}
-                          className="!w-2.5 !h-2.5 !-left-[10px] !border-2 !border-white/70 !rounded-full"
-                          style={{
-                            backgroundColor: input.color,
-                            top: '50%',
-                            transform: 'translateY(-50%)',
-                            zIndex: 10,
-                          }}
-                        />
-                        <span className="text-[11px] text-[var(--color-text-secondary)] truncate pl-1">
-                          {input.name}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* OUTPUTS column */}
-              {outputs.length > 0 && (
-                <div className="flex-1 min-w-0">
-                  <div className="text-[9px] font-bold uppercase tracking-wider text-[var(--color-text-muted)] mb-1 px-0.5 text-right">
-                    Outputs
-                  </div>
-                  <div className="flex flex-col gap-[3px]">
-                    {outputs.map((output, idx) => (
-                      <div
-                        key={idx}
-                        className="relative flex items-center justify-end h-6"
-                      >
-                        {/* Handle — positioned to poke RIGHT of node */}
-                        <Handle
-                          type="source"
-                          position={Position.Right}
-                          id={String(idx)}
-                          className="!w-2.5 !h-2.5 !-right-[10px] !border-2 !border-white/70 !rounded-full"
-                          style={{
-                            backgroundColor: output.color,
-                            top: '50%',
-                            transform: 'translateY(-50%)',
-                            zIndex: 10,
-                          }}
-                        />
-                        <span className="text-[11px] text-[var(--color-text-secondary)] truncate pr-1 text-right">
-                          {output.name}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+            <div className="node-ports__column node-ports__column--outputs">
+              {outputs.map((output, index) => <div key={index} className="node-port" title={`${output.name} ? ${output.type}`}>
+                <span className="node-port__name">{output.name}</span>
+                <Handle type="source" position={Position.Right} id={String(index)}
+                  aria-label={`Output ${output.name} (${output.type})`}
+                  className="node-port__handle node-port__handle--output"
+                  data-connected={connectedOutputs.has(String(index)) || undefined}
+                  style={{ '--port-color': output.color } as CSSProperties} />
+              </div>)}
             </div>
           </div>
         )}
-
-        {/* ===== PARAMETERS (hidden when collapsed) ===== */}
-        {!collapsed && hasWidgets && (
-          <div className="px-3 pb-2 flex flex-col gap-[2px]">
-            <div className="text-[9px] font-bold uppercase tracking-wider text-[var(--color-text-muted)] mb-1 px-0.5">
-              Parameters
-            </div>
-            {widgets.map((w) => (
-              <ControlWidget
-                key={w.name}
-                {...w}
-                value={effectiveValues[w.name]}
-                onChange={handleUpdate}
-                disabled={locked}
-              />
-            ))}
+        {!collapsed && widgets.length > 0 && (
+          <div className="node-parameters" aria-label="Node parameters">
+            {widgets.map(widget => <NodeParameter key={widget.name} {...widget}
+              value={effectiveValues[widget.name]} onChange={handleUpdate} disabled={locked} />)}
           </div>
         )}
-
-        {/* ===== FOOTER ===== */}
-        {hasFooter && (
-          <div className="mt-auto rounded-b-[var(--radius-lg)] overflow-hidden">
-            {/* Status row */}
-            <div className={[
-              'px-3 py-1.5 flex items-center justify-between',
-              'border-t border-[var(--color-border-subtle)]',
-              'bg-[var(--color-node-header)]',
-              'text-[10px] font-mono',
-              'justify-center',
-            ].join(' ')}>
-              <span className={[
-                'truncate max-w-[75%]',
-                'text-center mx-auto text-[var(--color-text-muted)]',
-              ].join(' ')}>
-                {collapsed ? status === 'running' ? 'Running...' : STATUS_LABEL[status] : footerMessage}
-              </span>
-            </div>
-          </div>
-        )}
-      </div>
+        {hasStatus && <footer className="workflow-node__status" role="status" title={message}>
+          <span className="node-status-dot" />
+          <span className="workflow-node__status-label">{STATUS_LABELS[status] || status}</span>
+          {footerMessage && footerMessage !== STATUS_LABELS[status] && <span className="workflow-node__status-message">{footerMessage}</span>}
+        </footer>}
+      </article>
     </>
   );
 };

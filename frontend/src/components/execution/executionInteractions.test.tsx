@@ -19,7 +19,7 @@ async function main() {
   const { createRoot } = await import('react-dom/client');
   const { FlowContext } = await import('../../context/FlowContextDef');
   const { default: Drawer } = await import('./ExecutionSettingsDrawer');
-  const { ValuePopup } = await import('../DynamicNode');
+  const { ValuePopup } = await import('../nodes/NodeValueEditor');
   const { default: BottomPanel } = await import('../layout/BottomPanel');
   const root = createRoot(document.getElementById('root')!);
   const resources = await import('../../utils/workerResources');

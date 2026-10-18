@@ -383,17 +383,11 @@ body {
 .react-flow__node {
   cursor: move;
 }
-.react-flow__node.selected > .node-wrapper {
-  box-shadow: var(--color-node-shadow-selected) !important;
-  border-color: var(--color-accent) !important;
-}
 .react-flow__node.selected {
   outline: none !important;
 }
 .react-flow__node.dragging {
-  box-shadow: 0 12px 40px rgba(0,0,0,0.4) !important;
   z-index: 999 !important;
-  opacity: 0.92;
 }
 
 /* ---- Connection line ---- */
