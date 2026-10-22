@@ -166,6 +166,15 @@ export type ExecutionConfig =
       recoveryLocation: RecoveryLocation;
     };
 
+/** Browser-local, immutable copy of the settings sent with one execution. */
+export interface SubmittedExecutionSettings {
+  executionId: string;
+  config: ExecutionConfig;
+  workerProfiles: WorkerProfile[];
+  workerPools: WorkerPool[];
+  preflight: ExecutionPreflightResponse | null;
+}
+
 export interface ExecutionOutput {
   nodeId: string;
   nodeType: string;

@@ -29,6 +29,8 @@ import {
   synchronizeLogicalResources,
 } from '../../utils/workerResources';
 import { Button } from '../ui/Button';
+import ExecutionSettingsInspector from './ExecutionSettingsInspector';
+import { blocksExecutionChanges } from '../../utils/executionRuntime';
 
 const DEFAULT_SETTINGS: WorkflowExecutionSettings = {
   version: 1,
@@ -423,7 +425,13 @@ export default function ExecutionSettingsDrawer() {
     isConnected,
     isExecuting,
     isPreflighting,
+    executionState,
+    submittedExecutionSettings,
+    recoveredGraphView,
   } = useFlow();
+
+  const hasActiveExecution = isExecuting || blocksExecutionChanges(executionState?.phase ?? 'idle');
+  const readOnly = hasActiveExecution || Boolean(recoveredGraphView);
 
   const savedSettings = activeExecutionSettings ?? DEFAULT_SETTINGS;
   const [draft, setDraft] = useState<SettingsDraft>(() => (
@@ -529,7 +537,7 @@ export default function ExecutionSettingsDrawer() {
   const locationError = contextualError('newRunRecoveryLocation');
   const modeError = contextualError('mode');
   const versionError = contextualError('version');
-  const canSave = !isExecuting
+  const canSave = !readOnly
     && !isSaving
     && !isPreflighting
     && !versionError
@@ -598,6 +606,12 @@ export default function ExecutionSettingsDrawer() {
   };
 
   if (!isExecutionSettingsOpen) return null;
+  if (readOnly) return <ExecutionSettingsInspector
+    snapshot={hasActiveExecution && submittedExecutionSettings?.executionId === executionState?.executionId ? submittedExecutionSettings : null}
+    recoveryConfig={recoveredGraphView?.executionConfig}
+    recoverySummary={recoveredGraphView?.summary}
+    executionId={hasActiveExecution ? executionState?.executionId : recoveredGraphView?.summary.executionId}
+    onClose={closeExecutionSettings} />;
 
   const requiredResources = executionPreflight?.requiredResources;
   const availableResources = executionPreflight?.availableResources;

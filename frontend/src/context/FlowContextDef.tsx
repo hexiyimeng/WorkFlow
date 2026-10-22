@@ -9,6 +9,7 @@ import type {
   WebSocketStatus,
   PluginDiagnostics,
   ExecutionPreflightResponse,
+  SubmittedExecutionSettings,
   RecoveredGraphView,
   RecoveryOpenResponse,
   RecoveryDeleteResponse,
@@ -48,6 +49,7 @@ export interface FlowContextType {
   isCancelling: boolean;       // phase === 'cancelling'
   isPreflighting: boolean;
   executionPreflight: ExecutionPreflightResponse | null;
+  submittedExecutionSettings: SubmittedExecutionSettings | null;
   isExecutionSettingsOpen: boolean;
   executionSettingsValidation: WorkflowExecutionSettingsValidation | null;
   isRecoveryBrowserOpen: boolean;

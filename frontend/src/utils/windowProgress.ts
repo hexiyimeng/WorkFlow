@@ -85,7 +85,7 @@ export const normalizeWindowProgress = (value: unknown): WindowExecutionProgress
     currentWindow,
     completedWindows,
     totalWindows,
-    progress: suppliedProgress ?? calculatedProgress,
+    progress: calculatedProgress,
     windowStatus: status,
     message: typeof payload.message === 'string' && payload.message.trim()
       ? payload.message

@@ -10,7 +10,7 @@ function assert(condition: boolean, message: string): asserts condition {
 const source = (relativePath: string): string => readFileSync(
   join(process.cwd(), 'src', relativePath),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 
 const app = source('App.tsx');
 const header = source('components/layout/Header.tsx');

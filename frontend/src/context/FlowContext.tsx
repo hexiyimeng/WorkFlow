@@ -102,6 +102,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isPreflighting,
     executionPreflight,
     lastSubmittedExecutionConfig,
+    submittedExecutionSettings,
     isRecoveryBrowserOpen,
     recoveredGraphView,
     executionState,
@@ -309,26 +310,23 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   ]);
 
   const openExecutionSettings = useCallback(() => {
-    if (isRecoveryGraphReadOnly) {
-      addLog('Close the recovered workflow before editing normal execution settings.', 'warning');
-      return;
-    }
     closeRecoveryBrowser();
-    setExecutionSettingsValidation(activeExecutionSettingsStoredValidation);
     setIsExecutionSettingsOpen(true);
+    if (isExecutionLocked) return;
+    setExecutionSettingsValidation(activeExecutionSettingsStoredValidation);
     void refreshExecutionSettingsPreflight(activeExecutionSettings).catch(() => undefined);
   }, [
     activeExecutionSettings,
     activeExecutionSettingsStoredValidation,
-    addLog,
     closeRecoveryBrowser,
-    isRecoveryGraphReadOnly,
+    isExecutionLocked,
     refreshExecutionSettingsPreflight,
   ]);
 
   const saveExecutionSettings = useCallback(async (
     settings: WorkflowExecutionSettings,
   ): Promise<boolean> => {
+    if (isExecutionLocked) return false;
     const structuralValidation = validateWorkflowExecutionSettings(settings);
     if (!structuralValidation.isValid) {
       setExecutionSettingsValidation(structuralValidation);
@@ -372,6 +370,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [
     addLog,
     clearPreparedExecution,
+    isExecutionLocked,
     preflightExecutionSettings,
     saveActiveExecutionSettings,
   ]);
@@ -637,6 +636,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isCancelling,
     isPreflighting,
     executionPreflight,
+    submittedExecutionSettings,
     isExecutionSettingsOpen,
     executionSettingsValidation,
     isRecoveryBrowserOpen,
@@ -664,7 +664,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     activeExecutionSettings, activeExecutionSettingsConfigured, activeExecutionSettingsSource,
     theme, isConsoleOpen, connectingType,
     executionState, websocketStatus, isExecuting, isCancelling, isPreflighting,
-    executionPreflight, isExecutionSettingsOpen, executionSettingsValidation,
+    executionPreflight, submittedExecutionSettings, isExecutionSettingsOpen, executionSettingsValidation,
     isRecoveryBrowserOpen, recoveredGraphView,
     isRecoveryGraphReadOnly, isExecutionLocked,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,

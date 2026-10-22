@@ -66,12 +66,12 @@ export default function BottomPanel() {
       </button>
       <span className="output-connection" data-state={websocketStatus} title={websocketStatus === 'connected' ? 'Backend connected' : 'Backend disconnected'}><i />{websocketStatus === 'connected' ? 'Connected' : websocketStatus === 'reconnecting' ? 'Reconnecting' : 'Offline'}</span>
       <span className="output-phase" data-phase={phase}>{PHASE_LABELS[phase] || phase}</span>
-      {windowProgress && (isExecuting || isCancelling) ? <div className="output-window-progress">
-        <span>{windowProgress.message}</span><strong>{windowProgress.completedWindows} / {windowProgress.totalWindows}<small>{windowProgress.progress.toFixed(1)}%</small></strong>
+      {windowProgress ? <div className="output-window-progress"
+        title="A Window is complete when all its outputs have finished. Concurrent submission does not increase completion progress.">
+        <span>{windowProgress.windowStatus === 'finalizing' && isExecuting ? 'Finalizing outputs' : 'Windows completed'}</span><strong>{windowProgress.completedWindows} / {windowProgress.totalWindows}<small>{windowProgress.progress.toFixed(1)}%</small></strong>
         <div className="output-progress-track" role="progressbar" aria-label="Window execution progress" aria-valuemin={0} aria-valuemax={100}
           aria-valuenow={windowProgress.progress} aria-valuetext={`${windowProgress.completedWindows} of ${windowProgress.totalWindows} Windows completed`}>
           <div style={{ width: `${windowProgress.progress}%` }} />
-          {windowProgress.windowStatus === 'running' && windowProgress.totalWindows > 0 && <i style={{ left: `${(windowProgress.currentWindow - 1) * 100 / windowProgress.totalWindows}%`, width: `${Math.max(100 / windowProgress.totalWindows, .75)}%` }} />}
         </div>
       </div> : <span className="output-summary-message" title={message}>{message}</span>}
       {executionState.executionId && <code className="output-execution-id" title={`Execution: ${executionState.executionId}`}>{executionState.executionId.slice(0, 8)}</code>}

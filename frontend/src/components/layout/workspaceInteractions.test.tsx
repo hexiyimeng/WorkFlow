@@ -77,6 +77,26 @@ async function main() {
   await click('[aria-label="Clear logs"]');
   assert(document.querySelectorAll('.output-log').length === 0, 'clear removes the visible log history');
   await act(async () => { panelRoot.unmount(); });
+
+  const progressRoot = createRoot(document.getElementById('root')!);
+  const { normalizeWindowProgress } = await import('../../utils/windowProgress');
+  for (const [currentWindow, completedWindows, phase] of [
+    [1, 0, 'running'], [2, 0, 'running'], [3, 0, 'running'],
+    [3, 1, 'running'], [1, 2, 'running'], [3, 3, 'running'], [3, 3, 'succeeded'],
+  ] as const) {
+    const progress = normalizeWindowProgress({ currentWindow, completedWindows, totalWindows: 3,
+      windowStatus: completedWindows === 3 ? 'finalizing' : 'running', message: `Window ${currentWindow} / 3` });
+    await act(async () => { progressRoot.render(<FlowContext.Provider value={{
+      logs: [], clearLogs: () => undefined, isConsoleOpen: false, toggleConsole: () => undefined,
+      websocketStatus: 'connected', isExecuting: phase === 'running', isCancelling: false, stopFlow: () => undefined,
+      executionState: { phase, executionId: 'concurrent', lastError: null, windowProgress: progress },
+    } as unknown as import('../../context/FlowContextDef').FlowContextType}><Output /></FlowContext.Provider>); });
+    const bar = document.querySelector('[role="progressbar"]')!;
+    assert(Number(bar.getAttribute('aria-valuenow')) === completedWindows * 100 / 3, 'only successful completions advance the bar, including out-of-order finishes');
+    assert(!bar.querySelector('i'), 'a submitted Window must not draw a false completion segment');
+    assert(document.body.textContent?.includes(`${completedWindows} / 3`), 'count and percentage use the same completion metric');
+  }
+  await act(async () => { progressRoot.unmount(); });
   dom.window.close();
   console.log('workspace interaction tests passed');
 }

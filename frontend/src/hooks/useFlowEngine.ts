@@ -13,6 +13,7 @@ import type {
   PluginDiagnostics,
   ReloadNodesResponse,
   ExecutionConfig,
+  SubmittedExecutionSettings,
   ExecutionPreflightResponse,
   WindowExecutionProgress,
   RecoveredGraphView,
@@ -56,6 +57,7 @@ import {
   websocketReconnectDelayMs,
 } from '../utils/executionRuntime';
 import { workerResourcePayload } from '../utils/workerResources';
+import { copySubmittedExecutionSettings, rememberSubmittedExecutionSettings, readSubmittedExecutionSettings } from '../utils/submittedExecutionSettings';
 
 // === Reset helper ===
 const resetRuntimeNodeState = (
@@ -222,6 +224,7 @@ export const useFlowEngine = (
   const [isPreflighting, setIsPreflighting] = useState(false);
   const [executionPreflight, setExecutionPreflight] = useState<ExecutionPreflightResponse | null>(null);
   const [lastSubmittedExecutionConfig, setLastSubmittedExecutionConfig] = useState<ExecutionConfig | null>(null);
+  const [submittedExecutionSettings, setSubmittedExecutionSettings] = useState<SubmittedExecutionSettings | null>(readSubmittedExecutionSettings);
   const [isRecoveryBrowserOpen, setIsRecoveryBrowserOpen] = useState(false);
   const [recoveredGraphView, setRecoveredGraphView] = useState<RecoveredGraphView | null>(null);
 
@@ -1117,13 +1120,19 @@ export const useFlowEngine = (
     })));
 
     try {
+      const snapshot = copySubmittedExecutionSettings({
+        executionId, config: executionConfig, ...workerResourcePayload(), preflight: executionPreflightRef.current,
+      });
       ws.send(JSON.stringify({
         command: 'execute_graph',
         graph,
         executionId,
         executionConfig,
-        ...workerResourcePayload(),
+        workerProfiles: snapshot.workerProfiles,
+        workerPools: snapshot.workerPools,
       }));
+      setSubmittedExecutionSettings(snapshot);
+      rememberSubmittedExecutionSettings(snapshot);
       addLog(
         executionConfig.mode === 'window' && executionConfig.resumeAction === 'resume'
           ? 'Resuming Workflow...'
@@ -1417,6 +1426,7 @@ export const useFlowEngine = (
     isPreflighting,
     executionPreflight,
     lastSubmittedExecutionConfig,
+    submittedExecutionSettings,
     isRecoveryBrowserOpen,
     recoveredGraphView,
     executionState,

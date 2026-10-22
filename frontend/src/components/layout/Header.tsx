@@ -150,7 +150,7 @@ export default function Header() {
           <span className="workspace-settings-summary" title={executionSettingsSummary} data-configured={activeExecutionSettingsConfigured || undefined}>
             {!activeExecutionSettingsConfigured && <span className="workspace-status-dot" />}{activeExecutionSettingsConfigured ? executionSettingsSummary : `Not configured · ${executionSettingsSummary}`}
           </span>
-          <Button variant="ghost" size="md" onClick={openExecutionSettings} disabled={isExecuting || isPreflighting || recoveredGraphView !== null}
+          <Button variant="ghost" size="md" onClick={openExecutionSettings} disabled={isPreflighting}
             icon={<SlidersHorizontal size={15} />} title={`Execution Settings: ${executionSettingsSummary}`}><span>Execution Settings</span></Button>
           <Button variant="ghost" size="md" onClick={openRecoveryBrowser} disabled={isExecuting || isPreflighting || !isConnected}
             icon={<FolderClock size={15} />} title={isConnected ? 'Inspect or execute a recovery record' : 'Reconnect to open Recovery'}>
