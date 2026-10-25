@@ -1,3 +1,5 @@
+import { SubgraphNode, BoundaryNode } from './SubgraphNode';
+import SelectionToolbar from './SelectionToolbar';
 import { useState, useCallback, useEffect, useRef, type ComponentType } from 'react';
 import { ReactFlow, Background, MiniMap, Panel, useReactFlow, useNodesInitialized, BackgroundVariant,
   ConnectionMode, SelectionMode, type Node, type NodeProps, type NodeTypes } from '@xyflow/react';
@@ -9,11 +11,11 @@ import ContextMenu from './ContextMenu';
 import CanvasToolbar from './CanvasToolbar';
 import type { NodeData } from '../../types';
 
-const nodeTypes: NodeTypes = { dynamic: DynamicNode as ComponentType<NodeProps<Node<NodeData>>> };
+const nodeTypes: NodeTypes = { dynamic: DynamicNode as ComponentType<NodeProps<Node<NodeData>>>, subgraph: SubgraphNode, boundary: BoundaryNode };
 
 export default function FlowEditor() {
   const { nodes, edges, onNodesChange, onEdgesChange, onConnect, theme, addNodeAt, isValidConnection,
-    onConnectStart, onConnectEnd, isExecutionLocked, isRecoveryGraphReadOnly, recoveredGraphView, activeWorkflowDocumentId } = useFlow();
+    onConnectStart, onConnectEnd, isExecutionLocked, isRecoveryGraphReadOnly, recoveredGraphView, activeWorkflowDocumentId, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph, activeWorkflow } = useFlow();
   const { screenToFlowPosition, fitView } = useReactFlow();
   const nodesInitialized = useNodesInitialized();
   const fittedDocumentRef = useRef<string | null>(null);
@@ -32,7 +34,7 @@ export default function FlowEditor() {
     const type = event.dataTransfer.getData('application/reactflow');
     if (type) addNodeAt(type, screenToFlowPosition({ x: event.clientX, y: event.clientY }));
   }, [screenToFlowPosition, addNodeAt, isExecutionLocked]);
-  const documentKey = recoveredGraphView?.recoveryDirectory || activeWorkflowDocumentId;
+  const documentKey = `${recoveredGraphView?.recoveryDirectory || activeWorkflowDocumentId}/${subgraphPath.join('/')}`;
   useEffect(() => {
     if (!nodesInitialized || nodes.length === 0 || fittedDocumentRef.current === documentKey) return;
     const frame = requestAnimationFrame(() => {
@@ -44,6 +46,7 @@ export default function FlowEditor() {
 
   return <div className="workspace-canvas" data-tool={mode}
     onDrop={onDrop} onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }} onContextMenu={onPaneContextMenu}>
+    {breadcrumbs.length > 0 && <nav className="subgraph-breadcrumbs" aria-label="Subgraph navigation"><button onClick={() => navigateSubgraph(0)}>{activeWorkflow?.name || 'Workflow'}</button>{breadcrumbs.map((item, index) => <span key={item.id}> / <button onClick={() => navigateSubgraph(index + 1)}>{item.name}</button></span>)}</nav>}
     {nodes.length === 0 && <div className="canvas-empty"><span className="canvas-empty__icon"><Workflow size={30} /></span>
       <h1>Build your workflow</h1><p>Add a node from the library, connect the steps,<br />and run your image processing pipeline.</p>
       <div><span><MousePointer2 size={13} />Right-click to add nodes</span><MoveRight size={14} /><span>Connect & run</span></div>
@@ -58,7 +61,8 @@ export default function FlowEditor() {
       selectionOnDrag={mode === 'select'} selectionMode={SelectionMode.Partial} panActivationKeyCode="Space"
       minZoom={.1} maxZoom={3} colorMode={theme} onPaneContextMenu={onPaneContextMenu} onPaneClick={() => setMenu(null)}
       nodesDraggable nodesConnectable={!isExecutionLocked} edgesReconnectable={!isExecutionLocked} elementsSelectable
-      deleteKeyCode={isExecutionLocked ? null : ['Backspace', 'Delete']}>
+      deleteKeyCode={null} onNodeDoubleClick={(_, node) => { if (node.data.subgraph) enterSubgraph(node.id); }}>
+      <SelectionToolbar />
       <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="var(--color-canvas-grid-minor)" />
       {showMap && <MiniMap position="bottom-right" style={{ width: 192, height: 128, bottom: 66, right: 16, margin: 0 }}
         nodeColor="var(--color-border-strong)" maskColor="var(--color-bg-overlay)" zoomable pannable />}

@@ -18,10 +18,19 @@ import type {
   WorkflowExecutionSettings,
   WorkflowExecutionSettingsSource,
   WorkflowExecutionSettingsValidation,
+  LibraryReference,
 } from '../types';
+import type { useWorkflowLibrary } from '../hooks/useWorkflowLibrary';
 import type { ParsedWorkflowDocument } from '../utils/workflowPersistence';
 
-export interface FlowContextType {
+export interface FlowContextType extends ReturnType<typeof useWorkflowLibrary> {
+  rootNodes: Node<NodeData>[];
+  rootEdges: Edge[];
+  editGraph: (change: (graph: { nodes: Node<NodeData>[]; edges: Edge[] }) => { nodes: Node<NodeData>[]; edges: Edge[] }) => void;
+  subgraphPath: string[];
+  breadcrumbs: Array<{ id: string; name: string }>;
+  enterSubgraph: (id: string) => void;
+  navigateSubgraph: (depth: number) => void;
   // === State ===
   nodes: Node<NodeData>[];
   edges: Edge[];
@@ -127,6 +136,7 @@ export interface FlowContextType {
     document: ParsedWorkflowDocument,
     hydratedNodes: Node<NodeData>[],
     hydratedEdges: Edge[],
+    libraryRef?: LibraryReference,
   ) => void;
 }
 

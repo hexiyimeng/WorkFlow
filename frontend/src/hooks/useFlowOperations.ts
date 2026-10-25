@@ -3,6 +3,7 @@ import { useRef, useCallback, useEffect } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import type { NodeData, LogEntry, NodeSpec } from '../types';
 import { stripRuntimeNodeData, hydrateNodeFromSpec } from '../utils/workflowPersistence';
+import { cloneGraphIds } from '../utils/subgraphs';
 import type { SerializedNode } from '../utils/workflowPersistence';
 
 export const useFlowOperations = (
@@ -21,7 +22,7 @@ export const useFlowOperations = (
   // === Copy ===
   const handleCopy = useCallback(() => {
     if (isExecutionLocked) return;
-    const selectedNodes = nodes.filter(n => n.selected);
+    const selectedNodes = nodes.filter(n => n.selected && !n.data.boundary);
     if (selectedNodes.length === 0) return;
     const selectedIds = new Set(selectedNodes.map(n => n.id));
     const selectedEdges = edges.filter(e => selectedIds.has(e.source) && selectedIds.has(e.target));
@@ -36,7 +37,10 @@ export const useFlowOperations = (
   const handlePaste = useCallback(() => {
     if (isExecutionLocked) return;
     if (!clipboardRef.current) return;
-    const { nodes: cpNodes, edges: cpEdges } = clipboardRef.current;
+    const original = clipboardRef.current;
+    const cloned = cloneGraphIds({ nodes: original.nodes as unknown as Node<NodeData>[], edges: original.edges });
+    const cpNodes = cloned.nodes as unknown as SerializedNode[];
+    const cpEdges = cloned.edges;
 
     const idMap = new Map<string, string>();
     const newNodes: Node<NodeData>[] = [];
@@ -82,14 +86,16 @@ export const useFlowOperations = (
     const selectedNodes = nodes.filter(n => n.selected);
     const selectedEdges = edges.filter(e => e.selected);
     if (selectedNodes.length === 0 && selectedEdges.length === 0) return;
-    setNodes(nds => nds.filter(n => !n.selected));
-    setEdges(eds => eds.filter(e => !e.selected));
+    const deleted = new Set(selectedNodes.filter(n => !n.data.boundary).map(n => n.id));
+    setNodes(nds => nds.filter(n => !deleted.has(n.id)));
+    setEdges(eds => eds.filter(e => !e.selected && !deleted.has(e.source) && !deleted.has(e.target)));
   }, [nodes, edges, setNodes, setEdges, isExecutionLocked]);
 
   // === Keyboard shortcuts ===
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
+      if (document.querySelector('[aria-modal="true"]')) return;
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable) return;
       const isCtrl = e.metaKey || e.ctrlKey;
       if (isExecutionLocked) return;

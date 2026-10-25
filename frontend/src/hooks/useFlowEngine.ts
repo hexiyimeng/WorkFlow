@@ -1,4 +1,6 @@
-﻿import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
+import { compileWorkflow as buildExecutionGraph } from '../utils/compileWorkflow';
+import { mapGraphNodes } from '../utils/subgraphs';
+import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import { executionDiagnostic } from '../utils/executionDiagnostics';
 import type {
@@ -63,7 +65,7 @@ import { copySubmittedExecutionSettings, rememberSubmittedExecutionSettings, rea
 const resetRuntimeNodeState = (
   setNodes: React.Dispatch<React.SetStateAction<Node<NodeData>[]>>,
 ) => {
-  setNodes(nds => nds.map(n => ({
+  setNodes(nds => mapGraphNodes(nds, n => ({
     ...n,
     data: { ...n.data, message: '', runState: undefined, waitingFor: undefined, device: undefined, executionId: undefined },
   })));
@@ -116,23 +118,6 @@ type ExecutionGraph = Record<string, {
   type: string;
   inputs: Record<string, unknown>;
 }>;
-
-const buildExecutionGraph = (
-  nodes: Node<NodeData>[],
-  edges: Edge[],
-): ExecutionGraph => {
-  const graph: ExecutionGraph = {};
-  nodes.forEach(node => {
-    const inputs = { ...node.data.values };
-    edges.forEach(edge => {
-      if (edge.target === node.id && edge.targetHandle) {
-        inputs[edge.targetHandle] = [edge.source, parseInt(edge.sourceHandle || '0')];
-      }
-    });
-    graph[node.id] = { type: node.data.opType, inputs };
-  });
-  return graph;
-};
 
 // === Execution state reducer ===
 type ExecutionAction =
@@ -761,7 +746,7 @@ export const useFlowEngine = (
             }
           }
           if (!msg.taskId) return;
-          setNodes(nds => nds.map(n => {
+          setNodes(nds => mapGraphNodes(nds, n => {
             if (n.id !== msg.taskId) return n;
             return {
               ...n,
@@ -1107,7 +1092,7 @@ export const useFlowEngine = (
     dispatchExecution({ type: 'START', executionId });
 
     setEdges(currentEdges => currentEdges.map(edge => ({ ...edge, animated: true })));
-    setNodes(currentNodes => currentNodes.map(node => ({
+    setNodes(currentNodes => mapGraphNodes(currentNodes, node => ({
       ...node,
       data: {
         ...node.data,
@@ -1211,7 +1196,7 @@ export const useFlowEngine = (
       throw new Error('Another execution is already active.');
     }
 
-    const graph = buildExecutionGraph(nodes, edges);
+    const graph = buildExecutionGraph({ nodes, edges });
     const requestId = preflightRequestIdRef.current + 1;
     preflightRequestIdRef.current = requestId;
     preflightAbortRef.current?.abort();

@@ -8,6 +8,7 @@ import type {
   WorkflowMetadata,
 } from '../types';
 import { serializeWorkflowDocument } from '../utils/workflowPersistence';
+import { workflowServer } from '../utils/workflowDrafts';
 import {
   resolveWorkflowExecutionSettings,
   commitWorkflowExecutionSettings,
@@ -143,7 +144,7 @@ export const useWorkflowExecutionSettingsStore = (
                 workflowName: activeWorkflow.name,
                 timestamp: Date.now(),
               });
-              storage.setItem(AUTOSAVE_KEY, JSON.stringify(document));
+              storage.setItem(AUTOSAVE_KEY, JSON.stringify({ ...document, _libraryRef: activeWorkflow.libraryRef, _server: workflowServer() }));
             },
           ]
         : [],

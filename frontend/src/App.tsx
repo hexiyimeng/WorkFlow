@@ -1,3 +1,4 @@
+import LibrarySaveDialog from './components/layout/LibrarySaveDialog';
 import Header from './components/layout/Header';
 import PluginDiagnosticsBanner from './components/layout/PluginDiagnosticsBanner';
 import Sidebar from './components/layout/Sidebar';
@@ -21,6 +22,7 @@ export default function App() {
       </div>
       <ExecutionSettingsDrawer />
       <RecoveryBrowserDialog />
+      <LibrarySaveDialog />
     </div>
   );
 }

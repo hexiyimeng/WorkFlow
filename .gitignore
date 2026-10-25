@@ -44,3 +44,4 @@ tmp/
 # Local design documents and historical cluster validation records
 /docs/
 /deploy/hpc/validation/
+/user/

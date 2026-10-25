@@ -1,5 +1,6 @@
+import WorkflowLibraryPanel from './WorkflowLibraryPanel';
 import { useMemo, useState, type DragEvent } from 'react';
-import { Boxes, ChevronDown, ChevronsDownUp, ChevronsUpDown, PanelLeftClose, Plus, Search, Terminal, X, Box, GripVertical } from 'lucide-react';
+import { Boxes, Workflow, ChevronDown, ChevronsDownUp, ChevronsUpDown, PanelLeftClose, Plus, Search, Terminal, X, Box, GripVertical } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 import { usePanelResize } from '../../hooks/usePanelResize';
 import type { NodeSpec } from '../../types';
@@ -26,6 +27,7 @@ function NodeItem({ node, locked, add }: { node: LibraryNode; locked: boolean; a
 export default function Sidebar() {
   const { addNode, nodeDefs, isExecutionLocked, isConsoleOpen, toggleConsole } = useFlow();
   const [open, setOpen] = useState(true);
+  const [panel, setPanel] = useState<'nodes' | 'workflows'>('nodes');
   const [search, setSearch] = useState('');
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const { size, separatorProps } = usePanelResize('x', 276, 240, 420);
@@ -50,12 +52,15 @@ export default function Sidebar() {
     return next;
   });
   return (
-    <aside className="workspace-sidebar" aria-label="Node library">
+    <aside className="workspace-sidebar" aria-label={panel === 'nodes' ? 'Node library' : 'Workflow library'}>
       <nav className="workspace-rail" aria-label="Workspace panels">
-        <button title="Node Library" aria-label="Node Library" aria-expanded={open} data-active={open || undefined} onClick={() => setOpen(current => !current)}><Boxes size={19} /></button>
+        <button title="Node Library" aria-label="Node Library" aria-expanded={open} data-active={open && panel === 'nodes' || undefined} onClick={() => { setPanel('nodes'); setOpen(panel === 'nodes' ? !open : true); }}><Boxes size={19} /></button>
+        <button title="Workflow Library" aria-label="Workflow Library" data-active={open && panel === 'workflows' || undefined}
+          onClick={() => { setPanel('workflows'); setOpen(panel === 'workflows' ? !open : true); }}><Workflow size={19} /></button>
         <button title="Toggle output" aria-label="Toggle output" aria-pressed={isConsoleOpen} data-active={isConsoleOpen || undefined} onClick={toggleConsole}><Terminal size={18} /></button>
       </nav>
       {open && <section className="library-panel" style={{ width: size }}>
+        {panel === 'workflows' ? <WorkflowLibraryPanel /> : <>
         <header className="library-heading"><div><h2>Node Library</h2><span>{entries.length} available nodes</span></div>
           <button className="workspace-icon-button" title="Collapse node library" aria-label="Collapse node library" onClick={() => setOpen(false)}><PanelLeftClose size={16} /></button>
         </header>
@@ -80,6 +85,7 @@ export default function Sidebar() {
           {entries.length === 0 && <div className="library-empty"><Boxes size={24} /><span>Waiting for node definitions…</span></div>}
         </div>
         <footer className="library-footer"><GripVertical size={12} />Drag to the canvas or click to add</footer>
+        </>}
         <div {...separatorProps} aria-label="Resize node library" className="library-resize-handle" />
       </section>}
     </aside>

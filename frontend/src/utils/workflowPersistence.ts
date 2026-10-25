@@ -21,7 +21,9 @@ import type {
   NodeSpec,
   WorkflowExecutionSettingsValidation,
   WorkflowMetadata,
+  SubgraphGraph,
 } from '../types';
+import { subgraphSpec } from './subgraphs.ts';
 import { canConnectPorts, resolveNodeOutputTypes } from './portTypes.ts';
 import {
   cloneWorkflowExecutionSettings,
@@ -40,6 +42,7 @@ export interface SerializedFlow {
 
 /** Persistent JSON document used by manual save/load and browser autosave. */
 export interface SerializedWorkflowDocument extends SerializedFlow {
+  schemaVersion?: number;
   workflowId: string;
   metadata: WorkflowMetadata;
   workflow_name?: string;
@@ -78,6 +81,11 @@ export interface SerializedNode {
     values?: Record<string, unknown>;
     dimensions?: Record<string, number>;
     selected?: boolean;
+    title?: string;
+    color?: string;
+    bypassed?: boolean;
+    boundary?: 'input' | 'output';
+    subgraph?: SubgraphGraph;
   };
 }
 
@@ -98,6 +106,11 @@ export interface SerializedNodeForStorage {
     values?: Record<string, unknown>;
     dimensions?: Record<string, number>;
     selected?: boolean;
+    title?: string;
+    color?: string;
+    bypassed?: boolean;
+    boundary?: 'input' | 'output';
+    subgraph?: SubgraphGraph;
   };
 }
 
@@ -132,6 +145,11 @@ export function stripRuntimeNodeData(node: Node<NodeData>): SerializedNode {
       values: node.data.values,
       dimensions: node.data.dimensions as Record<string, number> | undefined,
       selected: node.selected,
+      title: node.data.title,
+      color: node.data.color,
+      bypassed: node.data.bypassed || undefined,
+      boundary: node.data.boundary,
+      subgraph: node.data.subgraph ? { ...node.data.subgraph, ...serializeFlowForStorage(node.data.subgraph.nodes, node.data.subgraph.edges) } as unknown as SubgraphGraph : undefined,
     },
   };
 }
@@ -205,6 +223,7 @@ export function serializeWorkflowDocument({
   }
   const flow = serializeFlowForStorage(nodes, edges);
   return {
+    schemaVersion: 2,
     workflowId: normalizedWorkflowId,
     metadata: cloneWorkflowMetadata(metadata),
     ...flow,
@@ -229,10 +248,17 @@ export function hydrateNodeFromSpec(
   positionOverride?: { x: number; y: number }
 ): Node<NodeData> {
   const opType = serialized.data?.opType;
-  const latestSpec = opType ? nodeDefs[opType] : undefined;
+  const subgraph = serialized.data?.subgraph;
+  const boundary = serialized.data?.boundary;
+  const latestSpec = subgraph ? subgraphSpec(subgraph) : boundary ? { type: opType, display_name: serialized.data.title || 'Interface', category: 'Interface', input: { required: boundary === 'output' ? { value: [String(serialized.data.values?.portType || '*')] } : {} }, output: boundary === 'input' ? [String(serialized.data.values?.portType || '*')] : [] } as NodeSpec : opType ? nodeDefs[opType] : undefined;
 
   const baseData: NodeData = {
     opType: opType ?? '',
+    title: serialized.data.title,
+    color: serialized.data.color,
+    bypassed: serialized.data.bypassed,
+    boundary,
+    subgraph: subgraph ? { ...subgraph, nodes: hydrateNodesWithLatestSpecs(subgraph.nodes as unknown as SerializedNode[], nodeDefs) } : undefined,
     values: serialized.data?.values ?? {},
     message: '',
     runState: undefined,
@@ -308,6 +334,7 @@ export function validateEdgesWithLatestSpecs(
       return false;
     }
 
+    if (sourceNode.data._invalid || targetNode.data._invalid) return true;
     const sourceHandleIndex = parseInt(edge.sourceHandle || '0');
     const targetHandleName = edge.targetHandle;
 
@@ -363,9 +390,9 @@ export function hydrateFlowWithLatestSpecs(
 
   const hydratedNodes = hydrateNodesWithLatestSpecs(flow.nodes, nodeDefs);
 
-  const invalidNodeTypes = hydratedNodes
-    .filter(n => n.data._invalid)
-    .map(n => n.data.opType);
+  const unavailable = (nodes: Node<NodeData>[]): string[] => nodes.flatMap(n => n.data.subgraph
+    ? unavailable(n.data.subgraph.nodes) : n.data._invalid ? [n.data.opType] : []);
+  const invalidNodeTypes = unavailable(hydratedNodes);
 
   const { validEdges, removedCount, warnings: edgeWarnings } = validateEdgesWithLatestSpecs(
     flow.edges,
@@ -414,10 +441,14 @@ export function hydratePastedNodes(
  *
  * Returns null if the format is completely unrecognizable.
  */
-export function parseStoredFlow(raw: unknown): SerializedFlow | null {
+export function parseStoredFlow(raw: unknown, depth = 0): SerializedFlow | null {
+  if (depth > 32) throw new Error('Subgraph nesting exceeds 32 levels.');
   if (!raw || typeof raw !== 'object') return null;
 
   const obj = raw as Record<string, unknown>;
+  if (obj.schemaVersion !== undefined && obj.schemaVersion !== 1 && obj.schemaVersion !== 2) {
+    throw new Error('Unsupported workflow schema version.');
+  }
   const graphEnvelope = obj.graph;
   const graph = (
     graphEnvelope !== null
@@ -429,6 +460,23 @@ export function parseStoredFlow(raw: unknown): SerializedFlow | null {
     : obj;
   const rawNodes = graph.nodes;
   if (!Array.isArray(rawNodes)) return null;
+
+  const parseSubgraph = (value: unknown): SubgraphGraph | undefined => {
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid subgraph document.');
+    const candidate = value as Record<string, unknown>;
+    const inner = parseStoredFlow(candidate, depth + 1);
+    if (!inner || !Array.isArray(candidate.inputs) || !Array.isArray(candidate.outputs)) throw new Error('Invalid subgraph interface.');
+    const ports = (values: unknown[]) => values.map(value => {
+      if (!value || typeof value !== 'object') throw new Error('Invalid subgraph port.');
+      const p = value as Record<string, unknown>;
+      if (!['id', 'name', 'type', 'nodeId'].every(key => typeof p[key] === 'string')) throw new Error('Invalid subgraph port.');
+      if (!inner.nodes.some(n => n.id === p.nodeId)) throw new Error('Subgraph interface references a missing node.');
+      return { id: p.id as string, name: p.name as string, type: p.type as string, nodeId: p.nodeId as string };
+    });
+    return { nodes: inner.nodes as unknown as Node<NodeData>[], edges: inner.edges,
+      inputs: ports(candidate.inputs), outputs: ports(candidate.outputs) };
+  };
 
   const serializedNodes: SerializedNode[] = rawNodes.map((n: unknown) => {
     if (!n || typeof n !== 'object') return null;
@@ -446,6 +494,11 @@ export function parseStoredFlow(raw: unknown): SerializedFlow | null {
         values: nodeData?.values as Record<string, unknown> | undefined,
         dimensions: nodeData?.dimensions as Record<string, number> | undefined,
         selected: Boolean(nodeData?.selected),
+        title: typeof nodeData?.title === 'string' ? nodeData.title : undefined,
+        color: typeof nodeData?.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(nodeData.color) ? nodeData.color : undefined,
+        bypassed: nodeData?.bypassed === true || undefined,
+        boundary: nodeData?.boundary === 'input' || nodeData?.boundary === 'output' ? nodeData.boundary : undefined,
+        subgraph: parseSubgraph(nodeData?.subgraph),
       },
     };
   }).filter(Boolean) as SerializedNode[];

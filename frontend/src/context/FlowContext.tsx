@@ -1,6 +1,8 @@
+import { useWorkflowLibrary } from '../hooks/useWorkflowLibrary';
+import { useSubgraphEditor } from '../hooks/useSubgraphEditor';
 // src/context/FlowContext.tsx
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { useNodesState, useEdgesState, addEdge, type Connection, type Node, type Edge, type OnConnectStart, type OnConnectEnd, type OnNodesChange, type OnEdgesChange } from '@xyflow/react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { applyNodeChanges as applyNodes, applyEdgeChanges as applyEdges, addEdge, type Connection, type Node, type Edge, type OnConnectStart, type OnConnectEnd, type OnNodesChange, type OnEdgesChange } from '@xyflow/react';
 import type {
   LogEntry,
   NodeData,
@@ -40,8 +42,13 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ===========================================
   // 1. Base State
   // ===========================================
-  const [nodes, setNodes, applyNodeChanges] = useNodesState<Node<NodeData>>([]);
-  const [edges, setEdges, applyEdgeChanges] = useEdgesState<Edge>([]);
+  const [rootGraph, setRootGraph] = useState<{ nodes: Node<NodeData>[]; edges: Edge[] }>({ nodes: [], edges: [] });
+  const { nodes: rootNodes, edges: rootEdges } = rootGraph;
+  const setRootNodes = useCallback<React.Dispatch<React.SetStateAction<Node<NodeData>[]>>>(action => setRootGraph(previous => ({ ...previous,
+    nodes: typeof action === 'function' ? action(previous.nodes) : action })), []);
+  const setRootEdges = useCallback<React.Dispatch<React.SetStateAction<Edge[]>>>(action => setRootGraph(previous => ({ ...previous,
+    edges: typeof action === 'function' ? action(previous.edges) : action })), []);
+  const { nodes, edges, setNodes, setEdges, editGraph, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph, resetSubgraph } = useSubgraphEditor(rootGraph, setRootGraph);
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try { return localStorage.getItem('WorkFlow_THEME') === 'dark' ? 'dark' : 'light'; }
     catch { return 'light'; }
@@ -119,13 +126,13 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     closeRecoveredGraph,
     stopFlow,
     reloadNodes,
-  } = useFlowEngine(nodes, edges, setNodes, setEdges, addLog);
+  } = useFlowEngine(rootNodes, rootEdges, setRootNodes, setRootEdges, addLog);
 
   // ===========================================
   // 3. Undo/Redo — snapshots store stripped nodes, restore rehydrates
   // ===========================================
-  const { undo, redo, takeSnapshot, syncCurrentState } = useUndoRedo(
-    [], [], (nds) => setNodes(nds), (eds) => setEdges(eds), nodeDefs
+  const { undo, redo, takeSnapshot, syncCurrentState, resetHistory } = useUndoRedo(
+    [], [], setRootNodes, setRootEdges, nodeDefs
   );
 
   // ===========================================
@@ -134,6 +141,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const isRecoveryGraphReadOnly = recoveredGraphView !== null;
   const {
     workflows,
+    updateWorkflow, openDocument: _openDocument,
     activeWorkflow,
     activeWorkflowId,
     createWorkflow: _createWorkflow,
@@ -144,23 +152,36 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     updateWorkflowMetadata,
     loadWorkflowDocument: _loadWorkflowDocument,
   } = useWorkflows(
-    nodes,
-    edges,
-    setNodes,
-    setEdges,
+    rootNodes,
+    rootEdges,
+    setRootNodes,
+    setRootEdges,
     nodeDefs,
     addLog,
     !isRecoveryGraphReadOnly,
   );
 
+  const historyTabRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (historyTabRef.current !== activeWorkflowId) {
+      historyTabRef.current = activeWorkflowId;
+      resetHistory(rootNodes, rootEdges);
+    }
+  }, [activeWorkflowId, resetHistory, rootNodes, rootEdges]);
+
+  const restoreAutosaveDocument = useCallback<typeof _loadWorkflowDocument>((document, restoredNodes, restoredEdges, reference) => {
+    _loadWorkflowDocument(document, restoredNodes, restoredEdges, reference);
+    resetHistory(restoredNodes, restoredEdges);
+  }, [_loadWorkflowDocument, resetHistory]);
+
   useAutoSave(
-    nodes,
-    edges,
-    setNodes,
-    setEdges,
+    rootNodes,
+    rootEdges,
+    setRootNodes,
+    setRootEdges,
     nodeDefs,
     activeWorkflow,
-    _loadWorkflowDocument,
+    restoreAutosaveDocument,
     !isRecoveryGraphReadOnly,
   );
 
@@ -177,8 +198,8 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     workflows,
     activeWorkflowId,
     updateWorkflowMetadata,
-    nodes,
-    edges,
+    rootNodes,
+    rootEdges,
   );
 
   // ===========================================
@@ -195,15 +216,15 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const permittedChanges = isExecutionLocked
       ? filterLockedNodeChanges(changes)
       : changes;
-    if (permittedChanges.length > 0) applyNodeChanges(permittedChanges);
-  }, [applyNodeChanges, isExecutionLocked]);
+    if (permittedChanges.length > 0) setNodes(previous => applyNodes(permittedChanges.filter(change => change.type !== 'remove' || !previous.find(n => n.id === change.id)?.data.boundary), previous));
+  }, [setNodes, isExecutionLocked]);
 
   const onEdgesChange = useCallback<OnEdgesChange<Edge>>((changes) => {
     const permittedChanges = isExecutionLocked
       ? filterLockedEdgeChanges(changes)
       : changes;
-    if (permittedChanges.length > 0) applyEdgeChanges(permittedChanges);
-  }, [applyEdgeChanges, isExecutionLocked]);
+    if (permittedChanges.length > 0) setEdges(previous => applyEdges(permittedChanges, previous));
+  }, [setEdges, isExecutionLocked]);
 
   // ===========================================
   // 6. Workflows — stored as stripped nodes, hydrated on switch
@@ -224,30 +245,44 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Wrap workflow ops with execution lock
   const createWorkflow = useCallback(() => {
     if (isExecutionLocked) { addLog('Cannot create workflow while executing', 'warning'); return; }
+    resetSubgraph();
     resetExecutionSettingsUi();
     _createWorkflow();
-  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _createWorkflow]);
+  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _createWorkflow, resetSubgraph]);
 
   const switchWorkflow = useCallback((id: string) => {
     if (isExecutionLocked) { addLog('Cannot switch workflow while executing', 'warning'); return; }
+    resetSubgraph();
     resetExecutionSettingsUi();
     _switchWorkflow(id);
-  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _switchWorkflow]);
+  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _switchWorkflow, resetSubgraph]);
 
   const deleteWorkflow = useCallback((id: string) => {
     if (isExecutionLocked) { addLog('Cannot delete workflow while executing', 'warning'); return; }
+    resetSubgraph();
     resetExecutionSettingsUi();
     _deleteWorkflow(id);
-  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _deleteWorkflow]);
+  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _deleteWorkflow, resetSubgraph]);
 
   const loadWorkflowDocument = useCallback<typeof _loadWorkflowDocument>((
     document,
     hydratedNodes,
     hydratedEdges,
+    libraryRef,
   ) => {
+    resetSubgraph();
     resetExecutionSettingsUi();
-    _loadWorkflowDocument(document, hydratedNodes, hydratedEdges);
-  }, [_loadWorkflowDocument, resetExecutionSettingsUi]);
+    _loadWorkflowDocument(document, hydratedNodes, hydratedEdges, libraryRef);
+    resetHistory(hydratedNodes, hydratedEdges);
+  }, [_loadWorkflowDocument, resetExecutionSettingsUi, resetSubgraph, resetHistory]);
+
+  const openDocument = useCallback<typeof _openDocument>((document, hydratedNodes, hydratedEdges, reference) => {
+    resetSubgraph();
+    resetExecutionSettingsUi();
+    _openDocument(document, hydratedNodes, hydratedEdges, reference);
+  }, [_openDocument, resetSubgraph, resetExecutionSettingsUi]);
+  const library = useWorkflowLibrary({ nodes: rootNodes, edges: rootEdges, activeWorkflow, workflows, nodeDefs,
+    locked: isExecutionLocked, openDocument, updateWorkflow, switchWorkflow, editGraph, addLog });
 
   const preflightExecutionSettings = useCallback(async (
     settings: WorkflowExecutionSettings,
@@ -478,12 +513,12 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ===========================================
   useEffect(() => {
     if (isRecoveryGraphReadOnly) return;
-    syncCurrentState(nodes, edges);
-    const hasActiveExecution = nodes.some(
+    syncCurrentState(rootNodes, rootEdges);
+    const hasActiveExecution = rootNodes.some(
       n => n.data.runState === 'submitted' || n.data.runState === 'running'
     );
     if (!hasActiveExecution) takeSnapshot();
-  }, [nodes, edges, isRecoveryGraphReadOnly, syncCurrentState, takeSnapshot]);
+  }, [rootNodes, rootEdges, isRecoveryGraphReadOnly, syncCurrentState, takeSnapshot]);
 
   // ===========================================
   // 7. Snapshot trigger — only on non-running state changes
@@ -494,7 +529,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ===========================================
   const { handleCopy, handlePaste, handleDelete } = useFlowOperations(
     nodes, edges, setNodes, setEdges,
-    undo, redo, addLog, isExecutionLocked, nodeDefs
+    undo, redo, addLog, isExecutionLocked || library.libraryBusy, nodeDefs
   );
 
   // ===========================================
@@ -620,9 +655,11 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [isExecutionLocked, nodes, setEdges, setNodes]);
 
   // ===========================================
-  // 10. Context memoization
+  // 10. Editor and execution services exposed to the UI
   // ===========================================
-  const contextValue = useMemo(() => ({
+  const contextValue = {
+    ...library,
+    rootNodes, rootEdges, editGraph, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph,
     nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected: isConnected, logs, workflows, activeWorkflow, activeWorkflowId,
     activeWorkflowDocumentId,
     executionSettingsByWorkflowId,
@@ -642,7 +679,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isRecoveryBrowserOpen,
     recoveredGraphView,
     isRecoveryGraphReadOnly,
-    isExecutionLocked,
+    isExecutionLocked: isExecutionLocked || library.libraryBusy,
     setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
     addNode, addNodeAt, updateNodeData,
     runFlow,
@@ -658,28 +695,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isValidConnection, undo, redo,
     onConnectStart, onConnectEnd, connectingType,
     handleCopy, handlePaste, handleDelete,
-  }), [
-    nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected, logs, workflows, activeWorkflow, activeWorkflowId,
-    activeWorkflowDocumentId, executionSettingsByWorkflowId,
-    activeExecutionSettings, activeExecutionSettingsConfigured, activeExecutionSettingsSource,
-    theme, isConsoleOpen, connectingType,
-    executionState, websocketStatus, isExecuting, isCancelling, isPreflighting,
-    executionPreflight, submittedExecutionSettings, isExecutionSettingsOpen, executionSettingsValidation,
-    isRecoveryBrowserOpen, recoveredGraphView,
-    isRecoveryGraphReadOnly, isExecutionLocked,
-    setNodes, setEdges, onNodesChange, onEdgesChange, onConnect,
-    addNode, addNodeAt, updateNodeData, runFlow,
-    openExecutionSettings, closeExecutionSettings,
-    saveExecutionSettings, refreshExecutionSettingsPreflight,
-    openRecoveryBrowser, closeRecoveryBrowser, browseServerDirectories,
-    inspectRecoveryDirectory, openRecoveryDirectory, deleteRecoveryDirectory,
-    executeRecoveryDirectory,
-    closeRecoveredGraph, stopFlow, reloadNodes, clearLogs, addLog,
-    createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
-    loadWorkflowDocument,
-    toggleTheme, toggleConsole, isValidConnection, undo, redo,
-    onConnectStart, onConnectEnd, handleCopy, handlePaste, handleDelete,
-  ]);
+  };
 
   return (
     <FlowContext.Provider value={contextValue}>

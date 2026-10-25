@@ -1,6 +1,6 @@
-import { useRef, useState, type ChangeEvent } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent } from 'react';
 import { useReactFlow } from '@xyflow/react';
-import { Activity, FileDown, FolderOpen, FolderClock, RefreshCw, SlidersHorizontal, Sun, Moon, Plus, X, Play, Square, Undo2, Redo2, Terminal, Workflow } from 'lucide-react';
+import { Activity, FileDown, Save, Copy, FolderOpen, FolderClock, RefreshCw, SlidersHorizontal, Sun, Moon, Plus, X, Play, Square, Undo2, Redo2, Terminal, Workflow } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 import { Button } from '../ui/Button';
 import { IconButton } from '../ui/IconButton';
@@ -9,6 +9,7 @@ import { formatWorkflowExecutionSettingsSummary } from '../../utils/workflowExec
 
 export default function Header() {
   const {
+    rootNodes, rootEdges, workflowDirty, requestLibrarySave, libraryBusy,
     theme, toggleTheme, workflows, activeWorkflow, activeWorkflowId,
     createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, loadWorkflowDocument,
     activeExecutionSettings, activeExecutionSettingsConfigured, openExecutionSettings,
@@ -22,8 +23,10 @@ export default function Header() {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [nameDraft, setNameDraft] = useState('');
   const cancelRenameRef = useRef(false);
+  const saveRequestRef = useRef(requestLibrarySave);
+  useLayoutEffect(() => { saveRequestRef.current = requestLibrarySave; }, [requestLibrarySave]);
   // === Save (export stripped/serialized workflow JSON) ===
-  const handleSave = () => {
+  const handleExport = () => {
     if (!reactFlowInstance) return;
     const currentFlow = workflows.find(w => w.id === activeWorkflowId);
     const defaultName = currentFlow ? currentFlow.name : `workflow_${Date.now()}`;
@@ -32,8 +35,8 @@ export default function Header() {
     const serialized = serializeWorkflowDocument({
       workflowId: activeWorkflow?.workflowId ?? activeWorkflow?.id ?? activeWorkflowId,
       metadata: activeWorkflow?.metadata ?? {},
-      nodes: reactFlowInstance.getNodes() as import('@xyflow/react').Node<import('../../types').NodeData>[],
-      edges: reactFlowInstance.getEdges(),
+      nodes: rootNodes,
+      edges: rootEdges,
       workflowName: finalName,
       timestamp: Date.now(),
     });
@@ -71,31 +74,51 @@ export default function Header() {
         return;
       }
 
-      const document = parseWorkflowDocument(parsed);
-      if (!document || !Array.isArray(document.nodes) || !Array.isArray(document.edges)) {
-        alert('Invalid file format');
-        return;
-      }
+      try {
+        const document = parseWorkflowDocument(parsed);
+        if (!document || !Array.isArray(document.nodes) || !Array.isArray(document.edges)) {
+          alert('Invalid file format');
+          return;
+        }
 
-      if (Object.keys(nodeDefs).length === 0) {
-        alert('Node definitions not loaded yet. Please wait and try again.');
-        return;
-      }
+        if (Object.keys(nodeDefs).length === 0) {
+          alert('Node definitions not loaded yet. Please wait and try again.');
+          return;
+        }
 
-      const result = hydrateFlowWithLatestSpecs(document, nodeDefs);
-      loadWorkflowDocument(document, result.nodes, result.edges);
+        const result = hydrateFlowWithLatestSpecs(document, nodeDefs);
+        loadWorkflowDocument(document, result.nodes, result.edges);
 
-      if (result.invalidNodeTypes.length > 0) {
-        alert(`Loaded ${result.nodes.length} nodes (${result.invalidNodeTypes.length} unavailable node type(s) marked invalid)`);
-      } else if (result.removedEdges > 0) {
-        alert(`Loaded ${result.nodes.length} nodes, removed ${result.removedEdges} invalid connection(s)`);
-      }
+        if (result.invalidNodeTypes.length > 0) {
+          alert(`Loaded ${result.nodes.length} nodes (${result.invalidNodeTypes.length} unavailable node type(s) marked invalid)`);
+        } else if (result.removedEdges > 0) {
+          alert(`Loaded ${result.nodes.length} nodes, removed ${result.removedEdges} invalid connection(s)`);
+        }
 
-      requestAnimationFrame(() => { void reactFlowInstance.fitView({ padding: .16, maxZoom: 1, duration: 200 }); });
+        requestAnimationFrame(() => { void reactFlowInstance.fitView({ padding: .16, maxZoom: 1, duration: 200 }); });
+      } catch (error) { alert(`Load failed: ${(error as Error).message}`); }
     };
     reader.readAsText(file);
     e.target.value = '';
   };
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        if (document.querySelector('[aria-modal="true"]')) return;
+        if (!isExecutionLocked && !libraryBusy) {
+          // Numeric fields commit on blur. Save on the following frame using
+          // the latest document, including the value just entered.
+          if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+          const asCopy = event.shiftKey;
+          requestAnimationFrame(() => saveRequestRef.current(asCopy));
+        }
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [isExecutionLocked, libraryBusy]);
 
   const executionSettingsSummary = formatWorkflowExecutionSettingsSummary(activeExecutionSettings);
   const commitRename = (id: string) => {
@@ -120,10 +143,10 @@ export default function Header() {
               }} /> : <button role="tab" aria-selected={wf.id === activeWorkflowId} disabled={isExecutionLocked}
                 title={`${wf.name} · Double-click to rename`} onClick={() => switchWorkflow(wf.id)}
                 onDoubleClick={() => { if (!isExecutionLocked) { setNameDraft(wf.name); setRenaming(wf.id); } }}>
-                <Workflow size={13} /><span>{wf.name}</span>
+                <Workflow size={13} /><span>{wf.name}{wf.id === activeWorkflowId && workflowDirty ? ' *' : ''}</span>
               </button>}
-            {workflows.length > 1 && <button className="workflow-tab__close" title={`Close ${wf.name}`} aria-label={`Close ${wf.name}`} disabled={isExecutionLocked}
-              onClick={() => { if (confirm(`Close "${wf.name}"?`)) deleteWorkflow(wf.id); }}><X size={12} /></button>}
+            <button className="workflow-tab__close" title={`Close ${wf.name}`} aria-label={`Close ${wf.name}`} disabled={isExecutionLocked || libraryBusy}
+              onClick={() => { if (confirm(`Close "${wf.name}"?`)) deleteWorkflow(wf.id); }}><X size={12} /></button>
           </div>)}
           <IconButton title="New Workflow" aria-label="New Workflow" onClick={createWorkflow} disabled={isExecutionLocked}><Plus size={16} /></IconButton>
         </div>
@@ -138,8 +161,10 @@ export default function Header() {
       </div>
       <div className="workspace-actionbar">
         <div className="workspace-file-actions" role="toolbar" aria-label="Workflow actions">
-          <button className="workspace-text-button" title="Load workflow" onClick={() => fileInputRef.current?.click()} disabled={isExecutionLocked}><FolderOpen size={15} /><span>Open</span></button>
-          <button className="workspace-text-button" title="Save workflow" onClick={handleSave} disabled={isExecutionLocked}><FileDown size={15} /><span>Save</span></button>
+          <button className="workspace-text-button" title="Import workflow JSON" onClick={() => fileInputRef.current?.click()} disabled={isExecutionLocked}><FolderOpen size={15} /><span>Import</span></button>
+          <button className="workspace-text-button" title="Save workflow (Ctrl+S)" onClick={() => requestLibrarySave()} disabled={isExecutionLocked || libraryBusy}><Save size={15} /><span>Save</span></button>
+          <button className="workspace-text-button" title="Save as a new workflow (Ctrl+Shift+S)" onClick={() => requestLibrarySave(true)} disabled={isExecutionLocked || libraryBusy}><Copy size={15} /><span>Save as</span></button>
+          <button className="workspace-text-button" title="Export workflow JSON" onClick={handleExport} disabled={isExecutionLocked}><FileDown size={15} /><span>Export</span></button>
           <span className="workspace-divider" />
           <IconButton title="Undo" aria-label="Undo" disabled={isExecutionLocked} onClick={undo}><Undo2 size={15} /></IconButton>
           <IconButton title="Redo" aria-label="Redo" disabled={isExecutionLocked} onClick={redo}><Redo2 size={15} /></IconButton>
@@ -160,7 +185,7 @@ export default function Header() {
           <span className="workspace-divider" />
           {isExecuting ? <Button variant="danger" size="md" onClick={stopFlow} disabled={!isConnected} icon={<Square size={13} fill="currentColor" />}>Stop</Button> :
             <Button variant="primary" size="md" className="workspace-run-button" onClick={() => { void runFlow(); }} icon={<Play size={13} fill="currentColor" />}
-              loading={isPreflighting} disabled={isExecutionLocked || !isConnected || recoveredGraphView !== null}>
+              loading={isPreflighting} disabled={isExecutionLocked || libraryBusy || !isConnected || recoveredGraphView !== null}>
               {isPreflighting ? 'Checking...' : 'Run'}
             </Button>}
         </div>

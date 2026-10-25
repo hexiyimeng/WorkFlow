@@ -41,7 +41,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
   const connectedInputs = new Set(connections.filter(c => c.target === id).map(c => c.targetHandle));
   const connectedOutputs = new Set(connections.filter(c => c.source === id).map(c => c.sourceHandle));
   const { color, Icon } = categoryStyle(nodeSpec?.category, nodeSpec?.output_node);
-  const title = nodeSpec?.display_name || data.opType || 'Unknown node';
+  const title = data.title || nodeSpec?.display_name || data.opType || 'Unknown node';
   const status = runState ?? 'idle';
   const hasStatus = status !== 'idle' && status !== 'ready';
   const footerMessage = status === 'running' && waitingFor?.length
@@ -75,7 +75,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
         minWidth={300} minHeight={96} handleStyle={{ width: 7, height: 7 }} />
       <article className="workflow-node node-wrapper" data-node-id={id} data-status={status}
         data-selected={selected || undefined} data-invalid={_invalid || undefined}
-        data-collapsed={collapsed || undefined} style={{ '--node-category': color } as CSSProperties}>
+        data-bypassed={data.bypassed || undefined} data-collapsed={collapsed || undefined} style={{ '--node-category': data.color || color } as CSSProperties}>
         <header className="workflow-node__header" title={nodeSpec?.description || `${title} · ${nodeSpec?.category || data.opType}`}
           onDoubleClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
           <button type="button" className="workflow-node__collapse nodrag" aria-label={collapsed ? 'Expand node' : 'Collapse node'}

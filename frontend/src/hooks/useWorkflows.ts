@@ -6,6 +6,7 @@ import type {
   WorkflowMetadata,
   NodeData,
   NodeSpec,
+  LibraryReference,
 } from '../types';
 import {
   serializeFlowForStorage,
@@ -16,6 +17,7 @@ import {
   type ParsedWorkflowDocument,
 } from '../utils/workflowPersistence';
 import { createWorkflowId } from '../utils/workflowExecutionSettings';
+import { workflowServer } from '../utils/workflowDrafts';
 
 const AUTOSAVE_KEY = 'WorkFlow_AUTOSAVE';
 
@@ -52,7 +54,9 @@ const initialWorkflowFromAutosave = (): Workflow => {
   if (!raw) return defaultWorkflow();
 
   try {
-    const parsed = parseWorkflowDocument(JSON.parse(raw));
+    const saved = JSON.parse(raw);
+    if (saved._server && saved._server !== workflowServer()) return defaultWorkflow();
+    const parsed = parseWorkflowDocument(saved);
     if (!parsed) return defaultWorkflow();
     return {
       id: createTabId(),
@@ -73,6 +77,7 @@ export type LoadWorkflowDocument = (
   document: ParsedWorkflowDocument,
   hydratedNodes: Node<NodeData>[],
   hydratedEdges: Edge[],
+  libraryRef?: LibraryReference,
 ) => void;
 
 export const useWorkflows = (
@@ -99,16 +104,13 @@ export const useWorkflows = (
   const saveCurrentWorkflow = useCallback(() => {
     if (!persistenceEnabled || !nodeDefsReady) return;
     const serialized = serializeFlowForStorage(nodes, edges);
-    setWorkflows(previous => previous.map(workflow => (
-      workflow.id === activeWorkflowId
-        ? {
-            ...workflow,
-            nodes: serialized.nodes as unknown as Node<NodeData>[],
-            edges: serialized.edges,
-            timestamp: Date.now(),
-          }
-        : workflow
-    )));
+    setWorkflows(previous => {
+      const current = previous.find(workflow => workflow.id === activeWorkflowId);
+      if (current && JSON.stringify({ nodes: current.nodes, edges: current.edges }) === JSON.stringify(serialized)) return previous;
+      return previous.map(workflow => workflow.id === activeWorkflowId
+        ? { ...workflow, nodes: serialized.nodes as unknown as Node<NodeData>[], edges: serialized.edges, timestamp: Date.now() }
+        : workflow);
+    });
   }, [
     activeWorkflowId,
     edges,
@@ -143,6 +145,7 @@ export const useWorkflows = (
     document,
     hydratedNodes,
     hydratedEdges,
+    libraryRef,
   ) => {
     const serialized = serializeFlowForStorage(hydratedNodes, hydratedEdges);
     const metadata = cloneMetadata(document.metadata);
@@ -151,6 +154,7 @@ export const useWorkflows = (
         ? {
             ...workflow,
             workflowId: document.workflowId,
+            libraryRef,
             metadata,
             name: document.workflowName?.trim() || workflow.name,
             nodes: serialized.nodes as unknown as Node<NodeData>[],
@@ -164,6 +168,7 @@ export const useWorkflows = (
   }, [activeWorkflowId, setEdges, setNodes]);
 
   const switchWorkflow = useCallback((id: string) => {
+    if (id === activeWorkflowId) return;
     saveCurrentWorkflow();
 
     const target = workflows.find(workflow => workflow.id === id);
@@ -199,6 +204,7 @@ export const useWorkflows = (
     addLog,
     nodeDefs,
     nodeDefsReady,
+    activeWorkflowId,
     saveCurrentWorkflow,
     setEdges,
     setNodes,
@@ -228,7 +234,9 @@ export const useWorkflows = (
 
   const deleteWorkflow = useCallback((id: string) => {
     if (workflows.length <= 1) {
-      addLog('Cannot delete the last workflow', 'warning');
+      const empty = defaultWorkflow();
+      setWorkflows([empty]); setActiveWorkflowId(empty.id); setNodes([]); setEdges([]);
+      addLog('Closed workflow tab. Saved files are kept.', 'info');
       return;
     }
 
@@ -276,8 +284,24 @@ export const useWorkflows = (
     )));
   }, []);
 
+  const updateWorkflow = useCallback((id: string, patch: Partial<Workflow>) => {
+    setWorkflows(previous => previous.map(workflow => workflow.id === id ? { ...workflow, ...patch } : workflow));
+  }, []);
+
+  const openDocument = useCallback((document: ParsedWorkflowDocument, hydratedNodes: Node<NodeData>[], hydratedEdges: Edge[], reference?: LibraryReference) => {
+    saveCurrentWorkflow();
+    const flow = serializeFlowForStorage(hydratedNodes, hydratedEdges);
+    const workflow: Workflow = { id: createTabId(), workflowId: document.workflowId, metadata: cloneMetadata(document.metadata),
+      name: document.workflowName || 'Workflow', nodes: flow.nodes as unknown as Node<NodeData>[], edges: flow.edges,
+      timestamp: Date.now(), libraryRef: reference };
+    setWorkflows(previous => [...previous, workflow]);
+    setActiveWorkflowId(workflow.id);
+    setNodes(hydratedNodes); setEdges(hydratedEdges);
+  }, [saveCurrentWorkflow, setNodes, setEdges]);
+
   return {
     workflows,
+    updateWorkflow, openDocument,
     activeWorkflow,
     activeWorkflowId,
     createWorkflow,

@@ -329,7 +329,19 @@ export interface NodeSpec {
   output_name?: string[];
   output_node?: boolean;
   required_worker_profile?: string;
+  bypassMapping?: Record<string, string>;
 }
+
+export interface SubgraphPort { id: string; name: string; type: string; nodeId: string }
+export interface SubgraphGraph {
+  nodes: Node<NodeData>[];
+  edges: Edge[];
+  inputs: SubgraphPort[];
+  outputs: SubgraphPort[];
+}
+
+export interface LibraryReference { id: string; revision: number; folder: string; fingerprint: string }
+export interface LibraryItem { id: string; name: string; folder: string; revision: number; updatedAt: number }
 
 export interface PluginLoadedEntry {
   module: string;
@@ -395,6 +407,11 @@ export interface NodeData extends Record<string, unknown> {
   opType: string;
   nodeSpec: NodeSpec;
   values: Record<string, unknown>;
+  title?: string;
+  color?: string;
+  bypassed?: boolean;
+  subgraph?: SubgraphGraph;
+  boundary?: 'input' | 'output';
   message?: string;
   runState?: RunState;
   waitingFor?: string[];
@@ -491,6 +508,7 @@ export interface Workflow {
   nodes: Node<NodeData>[];
   edges: Edge[];
   timestamp: number;
+  libraryRef?: LibraryReference;
 }
 
 export interface LogEntry {
