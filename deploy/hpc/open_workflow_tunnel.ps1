@@ -3,8 +3,9 @@ param(
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$User,
 
+    [Parameter(Mandatory = $true)]
     [ValidatePattern('^[A-Za-z0-9.-]+$')]
-    [string]$ClusterHost = '10.200.201.2',
+    [string]$ClusterHost,
 
     [ValidateRange(1, 65535)]
     [int]$LocalPort = 18000,
