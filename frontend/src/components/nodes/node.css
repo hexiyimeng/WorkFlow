@@ -1,7 +1,9 @@
 /* Node-local tokens: the canvas and application keep their own theme. */
 :root {
-  --node-surface: #ffffff;
-  --node-heading: #f2f3f5;
+  --node-base-surface: #ffffff;
+  --node-base-heading: #f2f3f5;
+  --node-surface: var(--node-base-surface);
+  --node-heading: var(--node-base-heading);
   --node-outline: #cfd3da;
   --node-divider: #e5e7eb;
   --node-text: #28303c;
@@ -12,8 +14,10 @@
   --node-shadow: 0 3px 12px #18243412, 0 1px 3px #1824340a;
 }
 .dark {
-  --node-surface: #292b30;
-  --node-heading: #34363c;
+  --node-base-surface: #292b30;
+  --node-base-heading: #34363c;
+  --node-surface: var(--node-base-surface);
+  --node-heading: var(--node-base-heading);
   --node-outline: #484c55;
   --node-divider: #3a3d45;
   --node-text: #e0e2e8;
@@ -183,6 +187,32 @@
 .node-toggle[aria-checked="true"] .node-toggle__track > span { transform: translateX(12px); background: #fff; }
 .node-toggle[aria-checked="true"] .node-toggle__label { color: var(--node-text); }
 .node-parameter[data-disabled] { opacity: .55; }
+.node-parameter { position: relative; }
+.workflow-node .node-widget-slot, .subgraph-node .node-widget-slot { left: -15px; top: 15px; width: 10px; height: 10px; border: 2px solid var(--port-color, #a4afc0); background: var(--node-surface); z-index: 6; transform: translate(-50%, -50%); }
+.workflow-node .node-parameter--text .node-widget-slot { top: 9px; }
+.workflow-node .node-widget-slot[data-connected] { background: var(--port-color, #a4afc0); }
+.node-parameter__linked { grid-column: 1 / -1; color: var(--node-label); font-size: 10px; text-align: right; margin-top: -4px; }
+.node-advanced-toggle { padding: 9px 14px; border-top: 1px solid var(--node-divider); color: var(--node-label); font-size: 11px; cursor: pointer; }
+.node-advanced-toggle:hover { color: var(--node-text); }
+.node-color-picker { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.node-color-picker > button { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 50%; border: 1px solid var(--color-border-strong); padding: 3px; }
+.node-color-picker > button > span { width: 19px; height: 19px; border-radius: 50%; color: var(--color-text-primary); font-size: 13px; text-align: center; line-height: 19px; }
+.node-color-picker > button[aria-pressed=true] { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.node-custom-color { display: flex; align-items: center; gap: 5px; font-size: 11px; cursor: pointer; }
+.node-custom-color input { width: 26px; height: 26px; border: 0; padding: 0; background: transparent; cursor: pointer; }
+.selection-toolbar .node-color-menu { min-width: 250px; }
+.selection-toolbar .node-color-menu .node-color-picker > button { width: 27px; height: 27px; }
+.subgraph-node.workflow-node { border-color: var(--node-outline); }
+.subgraph-node.workflow-node .workflow-node__header { border-top-color: var(--node-category); }
+.subgraph-node .node-parameters:empty { display: none; }
+.boundary-node { color: var(--node-text); background: var(--node-surface); border-color: var(--node-outline); }
+.boundary-node header { background: var(--node-heading); border-radius: 8px 8px 0 0; }
+.boundary-node:has(.boundary-default) { width: 270px; }
+.boundary-node > .boundary-default { padding: 0 12px 12px; }
+.boundary-default .node-parameter { grid-template-columns: minmax(0,1fr); }
+.interface-placeholder { position: relative; width: 205px; min-height: 62px; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 12px; border: 1px dashed var(--color-border-strong); border-radius: 8px; color: var(--color-text-secondary); background: var(--color-bg-surface); font-size: 12px; }
+.interface-placeholder small { width: 100%; font-size: 10px; color: var(--color-text-muted); }
+.interface-placeholder .react-flow__handle { width: 12px; height: 12px; background: var(--color-text-muted); border: 2px solid var(--color-bg-surface); }
 .node-parameter button:disabled, .node-parameter input:disabled, .node-parameter select:disabled { cursor: not-allowed; }
 .node-number-field button:disabled { opacity: .3; }
 .dark .node-select-field select { color-scheme: dark; }

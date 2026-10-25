@@ -2,14 +2,24 @@ import type { Edge, Node } from '@xyflow/react';
 import type { NodeData, NodeSpec, SubgraphGraph } from '../types';
 import { resolveNodeOutputTypes, canConnectPorts } from './portTypes.ts';
 import { visibleNodeInputNames } from './inputVisibility.ts';
+import { inputPortType, isWidgetInput, nodeInputValue, nodeInputValues, validInputLiteral, withNodeInputValue } from './nodeInputs.ts';
 
 export type Graph = { nodes: Node<NodeData>[]; edges: Edge[] };
 export const newNodeId = () => `node-${crypto.randomUUID()}`;
+export const NEW_SUBGRAPH_INPUT = '__interface_add_input__';
+export const NEW_SUBGRAPH_OUTPUT = '__interface_add_output__';
+export const isInterfacePlaceholder = (id: string) => id === NEW_SUBGRAPH_INPUT || id === NEW_SUBGRAPH_OUTPUT;
 const primitive = new Set(['STRING', 'INT', 'LONG', 'FLOAT', 'BOOLEAN']);
 
 export function subgraphSpec(graph: SubgraphGraph): NodeSpec {
   return { type: '__subgraph__', display_name: 'Subgraph', category: 'Subgraphs',
-    input: { required: Object.fromEntries(graph.inputs.map(p => [p.id, [p.type]])) },
+    input: { required: Object.fromEntries(graph.inputs.map(p => {
+      if (!p.config) return [p.id, [p.type]];
+      // Conditions in a child schema reference child parameter names, not host port IDs.
+      const options = { ...p.config[1] };
+      delete options.visible_when;
+      return [p.id, [p.config[0], options]];
+    })) },
     output: graph.outputs.map(p => p.type), output_name: graph.outputs.map(p => p.name) };
 }
 
@@ -51,7 +61,8 @@ function refreshInterface(subgraph: SubgraphGraph): SubgraphGraph {
     const existing = previous.filter(p => subgraph.nodes.some(n => n.id === p.nodeId && n.data.boundary === kind));
     const added = subgraph.nodes.filter(n => n.data.boundary === kind && !existing.some(p => p.nodeId === n.id));
     return [...existing, ...added.map(n => ({ id: `${kind}_${n.id}`, nodeId: n.id,
-      name: n.data.title || kind, type: String(n.data.values.portType || '*') }))];
+      name: n.data.title || kind, type: String(n.data.values.portType || '*'),
+      ...(n.data.boundaryConfig ? { config: n.data.boundaryConfig } : {}) }))];
   };
   const inputs = collect('input').map(port => ({ ...port,
     name: subgraph.nodes.find(n => n.id === port.nodeId)?.data.title || port.name }));
@@ -59,7 +70,7 @@ function refreshInterface(subgraph: SubgraphGraph): SubgraphGraph {
     const edge = subgraph.edges.find(e => e.target === port.nodeId);
     const source = subgraph.nodes.find(n => n.id === edge?.source);
     return { ...port, name: subgraph.nodes.find(n => n.id === port.nodeId)?.data.title || port.name,
-      type: source ? resolveNodeOutputTypes(source.data.nodeSpec, source.data.values)[Number(edge?.sourceHandle || 0)] || port.type : port.type };
+      type: source ? resolveNodeOutputTypes(source.data.nodeSpec, nodeInputValues(source, subgraph))[Number(edge?.sourceHandle || 0)] || port.type : port.type };
   });
   const nodes = subgraph.nodes.map(node => {
     const port = outputs.find(p => p.nodeId === node.id);
@@ -71,19 +82,54 @@ function refreshInterface(subgraph: SubgraphGraph): SubgraphGraph {
 
 export function exposePort(graph: Graph, nodeId: string, kind: 'input' | 'output', handle: string): Graph {
   const node = graph.nodes.find(n => n.id === nodeId);
-  if (!node || node.data.boundary) throw new Error('Select an internal node.');
+  if (!node || (node.data.boundary && !(kind === 'output' && node.data.boundary === 'input'))) throw new Error('请选择内部节点。');
   const config = node.data.nodeSpec.input.required[handle] || node.data.nodeSpec.input.optional?.[handle];
-  const type = kind === 'input' ? String(config?.[0] || '') : resolveNodeOutputTypes(node.data.nodeSpec, node.data.values)[Number(handle)];
-  if (!type || (kind === 'input' && (Array.isArray(config?.[0]) || primitive.has(type)))) throw new Error('Only connection ports can be exposed here. Edit scalar parameters inside the subgraph.');
+  const type = kind === 'input' ? inputPortType(config) : resolveNodeOutputTypes(node.data.nodeSpec, nodeInputValues(node, graph))[Number(handle)];
+  if (!type || (kind === 'input' && !config)) throw new Error('找不到输入端口。');
   if (kind === 'input' && graph.edges.some(e => e.target === nodeId && e.targetHandle === handle)) throw new Error('Disconnect this input before exposing it.');
   const id = newNodeId();
-  const title = kind === 'input' ? handle : node.data.nodeSpec.output_name?.[Number(handle)] || `Output ${Number(handle) + 1}`;
-  const boundary: Node<NodeData> = { id, type: 'boundary', position: { x: kind === 'input' ? node.position.x - 280 : node.position.x + 380, y: node.position.y },
-    data: { opType: `__${kind}__`, boundary: kind, title, values: { portType: type },
-      nodeSpec: { type: `__${kind}__`, display_name: title, category: 'Interface', input: { required: kind === 'output' ? { value: [type] } : {} }, output: kind === 'input' ? [type] : [] } } };
+  const title = kind === 'input' ? node.data.inputLabels?.[handle] || handle : node.data.outputLabels?.[handle] || node.data.nodeSpec.output_name?.[Number(handle)] || `Output ${Number(handle) + 1}`;
+  const siblings = graph.nodes.filter(n => n.data.boundary === kind);
+  const boundary: Node<NodeData> = { id, type: 'boundary', position: {
+    x: siblings[0]?.position.x ?? (kind === 'input' ? node.position.x - 280 : node.position.x + 380),
+    y: siblings.length ? Math.max(...siblings.map(n => n.position.y + (n.measured?.height || (n.data.boundaryConfig ? 170 : 100)))) + 32 : node.position.y,
+  },
+    data: { opType: `__${kind}__`, boundary: kind, title,
+      boundaryConfig: kind === 'input' && isWidgetInput(config) ? config : undefined,
+      values: { portType: type, ...(kind === 'input' && isWidgetInput(config) ? { value: nodeInputValue(node, handle) } : {}) },
+      nodeSpec: { type: `__${kind}__`, display_name: title, category: 'Interface', input: { required: kind === 'output' ? { value: [type] } : isWidgetInput(config) ? { value: config! } : {} }, output: kind === 'input' ? [type] : [] } } };
   const edge = kind === 'input' ? { id: newNodeId(), source: id, sourceHandle: '0', target: nodeId, targetHandle: handle }
     : { id: newNodeId(), source: nodeId, sourceHandle: handle, target: id, targetHandle: 'value' };
   return { nodes: [...graph.nodes, boundary], edges: [...graph.edges, edge] };
+}
+
+export function editSubgraphPort(graph: Graph, wrapperId: string, kind: 'input' | 'output', portId: string,
+  action: { name?: string; remove?: boolean; move?: -1 | 1; value?: unknown }): Graph {
+  return updateGraphAtPath(graph, [wrapperId], current => {
+    const sub = current as SubgraphGraph;
+    const ports = kind === 'input' ? sub.inputs : sub.outputs;
+    const port = ports.find(p => p.id === portId);
+    if (!port) return current;
+    if (action.remove) return removeBoundary(sub, port.nodeId);
+    const reordered = [...ports];
+    const index = reordered.indexOf(port), target = index + (action.move || 0);
+    if (action.move && target >= 0 && target < reordered.length) [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+    return { ...sub, [kind === 'input' ? 'inputs' : 'outputs']: reordered,
+      nodes: sub.nodes.map(n => n.id !== port.nodeId ? n : { ...n, data: { ...n.data,
+        ...(action.name?.trim() ? { title: action.name.trim() } : {}),
+        ...(Object.hasOwn(action, 'value') ? { values: { ...n.data.values, value: action.value } } : {}) } }) };
+  });
+}
+
+export function removeBoundary(graph: Graph, id: string): Graph {
+  const boundary = graph.nodes.find(n => n.id === id);
+  if (!boundary?.data.boundary) return graph;
+  const hasDefault = boundary.data.boundary === 'input' && Object.hasOwn(boundary.data.values, 'value');
+  return { ...graph, nodes: graph.nodes.filter(n => n.id !== id).map(n => {
+    let next = n;
+    if (hasDefault && !n.data.boundary) for (const edge of graph.edges.filter(e => e.source === id && e.target === n.id && e.targetHandle)) next = withNodeInputValue(next, edge.targetHandle!, boundary.data.values.value);
+    return next;
+  }), edges: graph.edges.filter(e => e.source !== id && e.target !== id) };
 }
 
 export function mapGraphNodes(nodes: Node<NodeData>[], change: (node: Node<NodeData>) => Node<NodeData>): Node<NodeData>[] {
@@ -113,22 +159,27 @@ export function convertSelection(graph: Graph, title: string): Graph {
   const inputForTarget = new Map<string, string>();
   const outputForSource = new Map<string, number>();
   for (const node of selected) {
-    const visible = visibleNodeInputNames(node.data.nodeSpec, node.data.values);
+    const visible = visibleNodeInputNames(node.data.nodeSpec, nodeInputValues(node, graph));
     for (const [name, config] of Object.entries({ ...node.data.nodeSpec.input.required, ...node.data.nodeSpec.input.optional })) {
       const incoming = graph.edges.find(e => e.target === node.id && e.targetHandle === name);
       if (!visible.has(name) || (incoming && ids.has(incoming.source))) continue;
-      if (Array.isArray(config[0]) || primitive.has(String(config[0]))) continue;
+      // Scalar widgets keep their local editor and slot. Only promote a scalar
+      // automatically when an existing external connection crosses the boundary.
+      if (isWidgetInput(config) && !incoming) continue;
       const boundaryId = newNodeId();
       const portId = `in_${sub.inputs.length}`;
       const portName = selected.length === 1 ? name : `${node.data.title || node.data.nodeSpec.display_name} · ${name}`;
-      sub.inputs.push({ id: portId, name: portName, type: String(config[0]), nodeId: boundaryId });
+      sub.inputs.push({ id: portId, name: portName, type: inputPortType(config), nodeId: boundaryId,
+        ...(isWidgetInput(config) ? { config } : {}) });
       inputForTarget.set(`${node.id}:${name}`, portId);
       sub.nodes.push({ id: boundaryId, type: 'boundary', position: { x: 0, y: 100 + 120 * sub.inputs.length },
-        data: { opType: '__input__', title: portName, boundary: 'input', values: { portType: String(config[0]) },
-          nodeSpec: { type: '__input__', display_name: portName, category: 'Interface', input: { required: {} }, output: [String(config[0])] } } });
+        data: { opType: '__input__', title: portName, boundary: 'input',
+          boundaryConfig: isWidgetInput(config) ? config : undefined,
+          values: { portType: inputPortType(config), ...(isWidgetInput(config) ? { value: nodeInputValue(node, name) } : {}) },
+          nodeSpec: { type: '__input__', display_name: portName, category: 'Interface', input: { required: isWidgetInput(config) ? { value: config } : {} }, output: [inputPortType(config)] } } });
       sub.edges.push({ id: newNodeId(), source: boundaryId, sourceHandle: '0', target: node.id, targetHandle: name });
     }
-    resolveNodeOutputTypes(node.data.nodeSpec, node.data.values).forEach((type, index) => {
+    resolveNodeOutputTypes(node.data.nodeSpec, nodeInputValues(node, graph)).forEach((type, index) => {
       const boundaryId = newNodeId();
       const name = node.data.nodeSpec.output_name?.[index] || `Output ${index + 1}`;
       outputForSource.set(`${node.id}:${index}`, sub.outputs.length);
@@ -192,7 +243,8 @@ export function flattenGraph(graph: Graph): Graph {
   const flat = expand(graph);
   const byId = new Map(flat.nodes.map(n => [n.id, n]));
   if (byId.size !== flat.nodes.length) throw new Error('Duplicate node IDs in workflow.');
-  const resolve = (id: string, handle: string, seen = new Set<string>()): { source: string; sourceHandle: string } | null => {
+  type Resolved = { source: string; sourceHandle: string } | { value: unknown } | null;
+  const resolve = (id: string, handle: string, seen = new Set<string>()): Resolved => {
     const node = byId.get(id);
     if (!node) throw new Error(`Connection references missing node ${id}.`);
     if (!node.data.boundary && !node.data.bypassed) return { source: id, sourceHandle: handle };
@@ -202,12 +254,25 @@ export function flattenGraph(graph: Graph): Graph {
     if (!input) throw new Error(`Node ${node.data.title || node.data.nodeSpec.display_name} cannot be bypassed.`);
     const edge = flat.edges.find(e => e.target === id && e.targetHandle === input);
     if (!edge) {
+      if (node.data.boundary === 'input' && Object.hasOwn(node.data.values, 'value')) return { value: node.data.values.value };
       if (node.data.boundary === 'input') return null;
       throw new Error(`Unconnected ${node.data.boundary === 'output' ? 'subgraph output' : 'bypass input'}: ${node.data.title || id}.`);
     }
     return resolve(edge.source, edge.sourceHandle || '0', nextSeen);
   };
   const nodes = flat.nodes.filter(n => !n.data.boundary && !n.data.bypassed);
+  const constants = new Map<string, Record<string, unknown>>();
+  for (const edge of flat.edges) {
+    const target = byId.get(edge.target);
+    if (!target || target.data.boundary || target.data.bypassed) continue;
+    const source = resolve(edge.source, edge.sourceHandle || '0');
+    if (!source || !('value' in source)) continue;
+    const input = target.data.nodeSpec.input.required[edge.targetHandle || ''] || target.data.nodeSpec.input.optional?.[edge.targetHandle || ''];
+    if (!input || !validInputLiteral(source.value, input)) throw new Error(`子图参数 ${target.data.title || target.id}.${edge.targetHandle} 的值不符合参数类型或可选范围。`);
+    constants.set(target.id, { ...constants.get(target.id), [edge.targetHandle!]: source.value });
+  }
+  const effectiveNodes = nodes.map(n => constants.has(n.id) ? { ...n, data: { ...n.data, values: { ...n.data.values, ...constants.get(n.id) } } } : n);
+  const effectiveById = new Map(effectiveNodes.map(n => [n.id, n]));
   const edges: Edge[] = [];
   for (const edge of flat.edges) {
     const target = byId.get(edge.target);
@@ -215,10 +280,11 @@ export function flattenGraph(graph: Graph): Graph {
     if (target.data.boundary || target.data.bypassed) continue;
     const source = resolve(edge.source, edge.sourceHandle || '0');
     if (source) {
-      const sourceNode = byId.get(source.source)!;
-      const output = resolveNodeOutputTypes(sourceNode.data.nodeSpec, sourceNode.data.values)[Number(source.sourceHandle)];
       const input = target.data.nodeSpec.input.required[edge.targetHandle || ''] || target.data.nodeSpec.input.optional?.[edge.targetHandle || ''];
-      if (!output || !input || typeof input[0] !== 'string' || !canConnectPorts(output, input[0]).ok)
+      if ('value' in source) continue;
+      const sourceNode = effectiveById.get(source.source)!;
+      const output = resolveNodeOutputTypes(sourceNode.data.nodeSpec, sourceNode.data.values)[Number(source.sourceHandle)];
+      if (!output || !input || !canConnectPorts(output, inputPortType(input)).ok)
         throw new Error(`Incompatible connection: ${sourceNode.data.title || sourceNode.id} → ${target.data.title || target.id}.`);
       if (edges.some(e => e.target === edge.target && e.targetHandle === edge.targetHandle)) throw new Error('Multiple connections to the same input.');
       edges.push({ ...edge, ...source });
@@ -233,7 +299,7 @@ export function flattenGraph(graph: Graph): Graph {
     visiting.delete(id); visited.add(id);
   };
   nodes.forEach(n => visit(n.id));
-  return { nodes, edges };
+  return { nodes: effectiveNodes, edges };
 }
 
 export function unpackSubgraph(graph: Graph, id: string): Graph {
@@ -256,11 +322,17 @@ export function unpackSubgraph(graph: Graph, id: string): Graph {
     }
     return next;
   })];
+  const constants = new Map<string, Record<string, unknown>>();
   const resolve = (edge: Edge, seen = new Set<string>()): Edge | null => {
     if (!boundaryIds.has(edge.source)) return edge;
     if (seen.has(edge.source)) throw new Error('Cyclic subgraph interface.');
     const previous = expandedEdges.find(e => e.target === edge.source);
     if (!previous) {
+      const boundary = sub.nodes.find(n => n.id === edge.source);
+      if (boundary?.data.boundary === 'input' && Object.hasOwn(boundary.data.values, 'value')) {
+        constants.set(edge.target, { ...constants.get(edge.target), [edge.targetHandle!]: boundary.data.values.value });
+        return null;
+      }
       if (sub.inputs.some(p => p.nodeId === edge.source)) return null;
       throw new Error('Connect this subgraph output before unpacking.');
     }
@@ -269,9 +341,16 @@ export function unpackSubgraph(graph: Graph, id: string): Graph {
   const edges = expandedEdges.filter(e => !boundaryIds.has(e.target)).flatMap(edge => {
     const resolved = resolve(edge); return resolved ? [resolved] : [];
   });
-  return { nodes: [...graph.nodes.filter(n => n.id !== id).map(n => ({ ...n, selected: false })),
-    ...sub.nodes.filter(n => !boundaryIds.has(n.id)).map(n => ({ ...n, selected: true,
-      position: { x: n.position.x + wrapper.position.x, y: n.position.y + wrapper.position.y } }))], edges };
+  const applyValues = (node: Node<NodeData>) => {
+    let next = node;
+    for (const [name, value] of Object.entries(constants.get(node.id) || {})) next = withNodeInputValue(next, name, value);
+    return next;
+  };
+  return { nodes: [...graph.nodes.filter(n => n.id !== id).map(n => ({ ...applyValues(n), selected: false })),
+    ...sub.nodes.filter(n => !boundaryIds.has(n.id)).map(n => {
+      const next = applyValues(n);
+      return { ...next, selected: true, position: { x: n.position.x + wrapper.position.x, y: n.position.y + wrapper.position.y } };
+    })], edges };
 
 }
 

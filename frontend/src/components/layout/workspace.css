@@ -221,7 +221,7 @@
 .subgraph-node__ports > div > div { position:relative; padding:8px 15px; font-size:12px; }
 .subgraph-node__ports > div:last-child { text-align:right; }
 .subgraph-node footer { padding:10px 14px; color:var(--color-text-muted); font-size:11px; border-top:1px solid var(--color-border-subtle); }
-.boundary-node { width:205px; border:1px solid var(--color-border-strong); border-radius:9px; background:var(--color-bg-surface); box-shadow:var(--shadow-panel); }
+.boundary-node { width:205px; border:1px solid var(--node-outline); border-radius:9px; background:var(--node-surface); box-shadow:var(--shadow-panel); }
 .boundary-node[data-selected] { outline:2px solid var(--color-accent); }
 .boundary-node header { display:flex; gap:7px; align-items:center; padding:9px 12px; font-size:11px; color:var(--color-text-muted); border-bottom:1px solid var(--color-border-subtle); }
 .boundary-node > div { position:relative; padding:12px; font-size:13px; }
@@ -249,7 +249,3 @@
 .library-modal p { font-size:12px; color:var(--color-text-secondary); margin:12px 0; }
 .library-modal p.library-error { color:var(--color-danger); padding:0; }
 .library-modal footer { display:flex; justify-content:flex-end; gap:10px; margin-top:22px; }
-.node-info-dialog { width:min(620px,95vw); }
-.node-info-dialog dl { display:grid; grid-template-columns:100px 1fr; gap:7px; font-size:12px; margin:14px 0; }
-.node-info-dialog dd { overflow-wrap:anywhere; }
-.node-info-dialog pre { white-space:pre-wrap; overflow-wrap:anywhere; padding:12px; background:var(--color-bg-surface-2); font-size:12px; border-radius:6px; }

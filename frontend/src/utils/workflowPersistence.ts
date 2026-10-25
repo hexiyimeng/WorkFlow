@@ -22,9 +22,11 @@ import type {
   WorkflowExecutionSettingsValidation,
   WorkflowMetadata,
   SubgraphGraph,
+  InputDefinition,
 } from '../types';
 import { subgraphSpec } from './subgraphs.ts';
 import { canConnectPorts, resolveNodeOutputTypes } from './portTypes.ts';
+import { nodeInputValues } from './nodeInputs.ts';
 import {
   cloneWorkflowExecutionSettings,
   createWorkflowId,
@@ -83,6 +85,10 @@ export interface SerializedNode {
     selected?: boolean;
     title?: string;
     color?: string;
+    inputLabels?: Record<string, string>;
+    outputLabels?: Record<string, string>;
+    showAdvanced?: boolean;
+    boundaryConfig?: InputDefinition;
     bypassed?: boolean;
     boundary?: 'input' | 'output';
     subgraph?: SubgraphGraph;
@@ -108,10 +114,29 @@ export interface SerializedNodeForStorage {
     selected?: boolean;
     title?: string;
     color?: string;
+    inputLabels?: Record<string, string>;
+    outputLabels?: Record<string, string>;
+    showAdvanced?: boolean;
+    boundaryConfig?: InputDefinition;
     bypassed?: boolean;
     boundary?: 'input' | 'output';
     subgraph?: SubgraphGraph;
   };
+}
+
+function parseDisplayLabels(value: unknown): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid input/output display labels.');
+  if (Object.values(value).some(label => typeof label !== 'string')) throw new Error('Invalid input/output display label.');
+  return { ...value } as Record<string, string>;
+}
+
+function parseInputDefinition(value: unknown): InputDefinition | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length < 1 || value.length > 2
+    || !(typeof value[0] === 'string' || (Array.isArray(value[0]) && value[0].length && value[0].every(v => typeof v === 'string')))
+    || (value[1] !== undefined && (!value[1] || typeof value[1] !== 'object' || Array.isArray(value[1])))) throw new Error('Invalid subgraph parameter definition.');
+  return value as InputDefinition;
 }
 
 // ============================================================
@@ -147,6 +172,10 @@ export function stripRuntimeNodeData(node: Node<NodeData>): SerializedNode {
       selected: node.selected,
       title: node.data.title,
       color: node.data.color,
+      inputLabels: node.data.inputLabels,
+      outputLabels: node.data.outputLabels,
+      showAdvanced: node.data.showAdvanced || undefined,
+      boundaryConfig: node.data.boundaryConfig,
       bypassed: node.data.bypassed || undefined,
       boundary: node.data.boundary,
       subgraph: node.data.subgraph ? { ...node.data.subgraph, ...serializeFlowForStorage(node.data.subgraph.nodes, node.data.subgraph.edges) } as unknown as SubgraphGraph : undefined,
@@ -250,12 +279,16 @@ export function hydrateNodeFromSpec(
   const opType = serialized.data?.opType;
   const subgraph = serialized.data?.subgraph;
   const boundary = serialized.data?.boundary;
-  const latestSpec = subgraph ? subgraphSpec(subgraph) : boundary ? { type: opType, display_name: serialized.data.title || 'Interface', category: 'Interface', input: { required: boundary === 'output' ? { value: [String(serialized.data.values?.portType || '*')] } : {} }, output: boundary === 'input' ? [String(serialized.data.values?.portType || '*')] : [] } as NodeSpec : opType ? nodeDefs[opType] : undefined;
+  const latestSpec = subgraph ? subgraphSpec(subgraph) : boundary ? { type: opType, display_name: serialized.data.title || 'Interface', category: 'Interface', input: { required: boundary === 'output' ? { value: [String(serialized.data.values?.portType || '*')] } : { ...(serialized.data.boundaryConfig ? { value: serialized.data.boundaryConfig } : {}) } }, output: boundary === 'input' ? [String(serialized.data.values?.portType || '*')] : [] } as NodeSpec : opType ? nodeDefs[opType] : undefined;
 
   const baseData: NodeData = {
     opType: opType ?? '',
     title: serialized.data.title,
     color: serialized.data.color,
+    inputLabels: serialized.data.inputLabels,
+    outputLabels: serialized.data.outputLabels,
+    showAdvanced: serialized.data.showAdvanced,
+    boundaryConfig: serialized.data.boundaryConfig,
     bypassed: serialized.data.bypassed,
     boundary,
     subgraph: subgraph ? { ...subgraph, nodes: hydrateNodesWithLatestSpecs(subgraph.nodes as unknown as SerializedNode[], nodeDefs) } : undefined,
@@ -340,15 +373,13 @@ export function validateEdgesWithLatestSpecs(
 
     if (!targetHandleName) return true;
 
-    const outputTypes = resolveNodeOutputTypes(sourceNode.data.nodeSpec, sourceNode.data.values);
+    const outputTypes = resolveNodeOutputTypes(sourceNode.data.nodeSpec, nodeInputValues(sourceNode, { nodes, edges }));
     const outputType = outputTypes[sourceHandleIndex] || 'unknown';
 
     const targetSpec = targetNode.data.nodeSpec;
     const inputConfig = targetSpec?.input?.required?.[targetHandleName]
       || targetSpec?.input?.optional?.[targetHandleName];
-    const inputType = Array.isArray(inputConfig) && typeof inputConfig[0] === 'string'
-      ? inputConfig[0]
-      : 'unknown';
+    const inputType = Array.isArray(inputConfig?.[0]) ? 'STRING' : typeof inputConfig?.[0] === 'string' ? inputConfig[0] : 'unknown';
 
     const result = canConnectPorts(outputType, inputType);
     if (!result.ok) {
@@ -472,7 +503,8 @@ export function parseStoredFlow(raw: unknown, depth = 0): SerializedFlow | null 
       const p = value as Record<string, unknown>;
       if (!['id', 'name', 'type', 'nodeId'].every(key => typeof p[key] === 'string')) throw new Error('Invalid subgraph port.');
       if (!inner.nodes.some(n => n.id === p.nodeId)) throw new Error('Subgraph interface references a missing node.');
-      return { id: p.id as string, name: p.name as string, type: p.type as string, nodeId: p.nodeId as string };
+      const config = parseInputDefinition(p.config);
+      return { id: p.id as string, name: p.name as string, type: p.type as string, nodeId: p.nodeId as string, ...(config ? { config } : {}) };
     });
     return { nodes: inner.nodes as unknown as Node<NodeData>[], edges: inner.edges,
       inputs: ports(candidate.inputs), outputs: ports(candidate.outputs) };
@@ -495,6 +527,10 @@ export function parseStoredFlow(raw: unknown, depth = 0): SerializedFlow | null 
         dimensions: nodeData?.dimensions as Record<string, number> | undefined,
         selected: Boolean(nodeData?.selected),
         title: typeof nodeData?.title === 'string' ? nodeData.title : undefined,
+        inputLabels: parseDisplayLabels(nodeData?.inputLabels),
+        outputLabels: parseDisplayLabels(nodeData?.outputLabels),
+        showAdvanced: nodeData?.showAdvanced === true || undefined,
+        boundaryConfig: parseInputDefinition(nodeData?.boundaryConfig),
         color: typeof nodeData?.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(nodeData.color) ? nodeData.color : undefined,
         bypassed: nodeData?.bypassed === true || undefined,
         boundary: nodeData?.boundary === 'input' || nodeData?.boundary === 'output' ? nodeData.boundary : undefined,

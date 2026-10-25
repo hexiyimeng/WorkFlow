@@ -6,6 +6,7 @@ import BottomPanel from './components/layout/BottomPanel';
 import FlowEditor from './components/flow/FlowEditor';
 import ExecutionSettingsDrawer from './components/execution/ExecutionSettingsDrawer';
 import RecoveryBrowserDialog from './components/execution/RecoveryBrowserDialog';
+import NodeInspector from './components/nodes/NodeInspector';
 
 export default function App() {
   return (
@@ -19,6 +20,7 @@ export default function App() {
           <FlowEditor />
           <BottomPanel />
         </main>
+        <NodeInspector />
       </div>
       <ExecutionSettingsDrawer />
       <RecoveryBrowserDialog />

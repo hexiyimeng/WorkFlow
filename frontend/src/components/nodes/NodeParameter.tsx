@@ -1,4 +1,4 @@
-import { useId, useRef, useState, type KeyboardEvent } from 'react';
+import { useId, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { ChevronDown, ChevronLeft, ChevronRight, Expand } from 'lucide-react';
 import { ValuePopup } from './NodeValueEditor';
 
@@ -8,6 +8,9 @@ interface NodeParameterProps {
   value: unknown;
   onChange: (name: string, value: unknown) => void;
   disabled?: boolean;
+  label?: string;
+  slot?: ReactNode;
+  linked?: boolean;
 }
 
 function parameterLabel(name: string): string {
@@ -77,7 +80,7 @@ export function NodeParameter(props: NodeParameterProps) {
   const labelId = useId();
   const [editing, setEditing] = useState(false);
   const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null);
-  const label = typeof options?.label === 'string' ? options.label : parameterLabel(name);
+  const label = props.label || (typeof options?.label === 'string' ? options.label : parameterLabel(name));
   const tooltip = typeof options?.tooltip === 'string' ? options.tooltip : name;
   const stopKey = (event: KeyboardEvent) => event.stopPropagation();
   const isString = type === 'STRING';
@@ -88,6 +91,7 @@ export function NodeParameter(props: NodeParameterProps) {
       data-parameter={name} data-disabled={disabled || undefined}
       onPointerDown={event => event.stopPropagation()} onDoubleClick={event => event.stopPropagation()}
       onKeyDown={stopKey}>
+      {props.slot}
       <span id={labelId} className="node-parameter__label" title={`${label}\n${tooltip}`}>{label}</span>
       {isString ? (
         <>
@@ -95,7 +99,7 @@ export function NodeParameter(props: NodeParameterProps) {
             aria-label={`Edit ${name}`} title={String(value ?? '') || tooltip}
             onClick={event => { setAnchorRect(event.currentTarget.getBoundingClientRect()); setEditing(true); }}>
             <span className={`node-text-field__value${value == null || value === '' ? ' is-empty' : ''}`}>
-              {String(value ?? '') || 'Click to enter a value…'}
+              {String(value ?? '') || '点击输入…'}
             </span>
             <Expand size={12} aria-hidden="true" />
           </button>
@@ -106,7 +110,7 @@ export function NodeParameter(props: NodeParameterProps) {
       ) : type === 'BOOLEAN' ? (
         <button type="button" role="switch" aria-checked={bool} aria-label={name}
           className="node-toggle" disabled={disabled} onClick={() => onChange(name, !bool)}>
-          <span className="node-toggle__label">{String(bool ? options?.on ?? 'On' : options?.off ?? 'Off')}</span>
+          <span className="node-toggle__label">{String(bool ? options?.on ?? '开' : options?.off ?? '关')}</span>
           <span className="node-toggle__track" aria-hidden="true"><span /></span>
         </button>
       ) : Array.isArray(type) ? (
@@ -119,6 +123,7 @@ export function NodeParameter(props: NodeParameterProps) {
           <ChevronDown size={12} aria-hidden="true" />
         </div>
       ) : ['INT', 'FLOAT', 'LONG'].includes(String(type)) ? <NumberField {...props} /> : null}
+      {props.linked && <small className="node-parameter__linked">连线优先</small>}
     </div>
   );
 }

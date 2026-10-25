@@ -332,7 +332,8 @@ export interface NodeSpec {
   bypassMapping?: Record<string, string>;
 }
 
-export interface SubgraphPort { id: string; name: string; type: string; nodeId: string }
+export type InputDefinition = [string | string[], Record<string, unknown>?];
+export interface SubgraphPort { id: string; name: string; type: string; nodeId: string; config?: InputDefinition }
 export interface SubgraphGraph {
   nodes: Node<NodeData>[];
   edges: Edge[];
@@ -409,6 +410,10 @@ export interface NodeData extends Record<string, unknown> {
   values: Record<string, unknown>;
   title?: string;
   color?: string;
+  inputLabels?: Record<string, string>;
+  outputLabels?: Record<string, string>;
+  showAdvanced?: boolean;
+  boundaryConfig?: InputDefinition;
   bypassed?: boolean;
   subgraph?: SubgraphGraph;
   boundary?: 'input' | 'output';

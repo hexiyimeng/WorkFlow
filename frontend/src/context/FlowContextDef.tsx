@@ -31,6 +31,9 @@ export interface FlowContextType extends ReturnType<typeof useWorkflowLibrary> {
   breadcrumbs: Array<{ id: string; name: string }>;
   enterSubgraph: (id: string) => void;
   navigateSubgraph: (depth: number) => void;
+  isNodeInspectorOpen: boolean;
+  openNodeInspector: () => void;
+  closeNodeInspector: () => void;
   // === State ===
   nodes: Node<NodeData>[];
   edges: Edge[];

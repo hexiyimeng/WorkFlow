@@ -4,8 +4,10 @@ import { ChevronDown, Database, ScanLine, SlidersHorizontal, Save } from 'lucide
 import type { NodeData } from '../types';
 import { useFlow } from '../hooks/useFlowContext';
 import { parsePortType, resolveNodeOutputTypes } from '../utils/portTypes';
-import { inputMeta, isInputVisible, valuesWithInputDefaults } from '../utils/inputVisibility';
+import { inputMeta, isInputVisible } from '../utils/inputVisibility';
 import { NodeParameter } from './nodes/NodeParameter';
+import { inputPortType, nodeInputValues } from '../utils/nodeInputs';
+import { nodeColorStyle } from '../utils/nodePresentation';
 
 const TYPE_COLORS: Record<string, string> = {
   ZARR_HANDLE: '#d7ad66', IMAGE: '#78a9e2', INT: '#88bc9a', FLOAT: '#cea0cd',
@@ -21,24 +23,24 @@ function categoryStyle(category = '', output = false) {
   return { color: '#779ac3', Icon: SlidersHorizontal };
 }
 const STATUS_LABELS: Record<string, string> = {
-  ready: 'Ready', submitted: 'Queued', running: 'Running', done: 'Completed',
-  failed: 'Failed', cancelled: 'Cancelled',
+  ready: '就绪', submitted: '排队中', running: '运行中', done: '已完成',
+  failed: '失败', cancelled: '已取消',
 };
 
 const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
   const { nodeSpec, values = {}, message, _invalid, _warning, runState, waitingFor } = data;
-  const { isExecutionLocked, updateNodeData } = useFlow();
+  const { isExecutionLocked, updateNodeData, nodes, edges } = useFlow();
   const locked = isExecutionLocked ?? false;
   const [collapsed, setCollapsed] = useState(false);
   const valuesRef = useRef(values);
   useLayoutEffect(() => { valuesRef.current = values; }, [values]);
-  const effectiveValues = useMemo(() => valuesWithInputDefaults(nodeSpec, values), [nodeSpec, values]);
+  const effectiveValues = useMemo(() => nodeInputValues({ id, data }, { nodes, edges }), [id, data, nodes, edges]);
   const handleUpdate = useCallback((key: string, value: unknown) => {
     updateNodeData(id, { values: { ...valuesRef.current, [key]: value } });
   }, [id, updateNodeData]);
   const connections = useNodeConnections({ id });
   const updateNodeInternals = useUpdateNodeInternals();
-  const connectedInputs = new Set(connections.filter(c => c.target === id).map(c => c.targetHandle));
+  const connectedInputs = useMemo(() => new Set(connections.filter(c => c.target === id).map(c => c.targetHandle)), [connections, id]);
   const connectedOutputs = new Set(connections.filter(c => c.source === id).map(c => c.sourceHandle));
   const { color, Icon } = categoryStyle(nodeSpec?.category, nodeSpec?.output_node);
   const title = data.title || nodeSpec?.display_name || data.opType || 'Unknown node';
@@ -49,24 +51,25 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
     : status === 'done' ? '' : message || '';
 
   const { inputs, widgets, outputs } = useMemo(() => {
-    const inputs: { name: string; type: string; color: string }[] = [];
+    const inputs: { name: string; label: string; type: string; color: string }[] = [];
     const widgets: { name: string; config: [string | string[], Record<string, unknown>?] }[] = [];
     if (nodeSpec) {
       const definitions = { ...nodeSpec.input?.required, ...nodeSpec.input?.optional };
       for (const [name, config] of Object.entries(definitions)) {
         if (!config || !isInputVisible(inputMeta(config), effectiveValues)) continue;
+        if (nodeSpec.input.optional?.[name] && !data.showAdvanced && !connectedInputs.has(name)) continue;
         const [type, options] = config as [string | string[], Record<string, unknown>?];
         if (Array.isArray(type) || ['INT', 'FLOAT', 'STRING', 'BOOLEAN', 'LONG'].includes(type)) {
           widgets.push({ name, config: [type, options] });
-        } else if (typeof type === 'string') inputs.push({ name, type, color: getTypeColor(type) });
+        } else if (typeof type === 'string') inputs.push({ name, label: data.inputLabels?.[name] || name, type, color: getTypeColor(type) });
       }
     }
     const outputs = nodeSpec ? resolveNodeOutputTypes(nodeSpec, effectiveValues).map((type, index) => ({
-      name: nodeSpec.output_name?.[index] ?? type, type, color: getTypeColor(type),
+      name: data.outputLabels?.[String(index)] || nodeSpec.output_name?.[index] || type, type, color: getTypeColor(type),
     })) : [];
     return { inputs, widgets, outputs };
-  }, [nodeSpec, effectiveValues]);
-  const portLayout = [...inputs.map(p => `${p.name}:${p.type}`), '|', ...outputs.map(p => p.type)].join(',');
+  }, [nodeSpec, effectiveValues, data.inputLabels, data.outputLabels, data.showAdvanced, connectedInputs]);
+  const portLayout = [...inputs.map(p => `${p.name}:${p.type}`), ...widgets.map(p => `${p.name}:${inputPortType(p.config)}:${connectedInputs.has(p.name)}`), '|', ...outputs.map(p => p.type)].join(',');
   useLayoutEffect(() => { updateNodeInternals(id); }, [id, portLayout, collapsed, updateNodeInternals]);
 
   return (
@@ -75,10 +78,10 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
         minWidth={300} minHeight={96} handleStyle={{ width: 7, height: 7 }} />
       <article className="workflow-node node-wrapper" data-node-id={id} data-status={status}
         data-selected={selected || undefined} data-invalid={_invalid || undefined}
-        data-bypassed={data.bypassed || undefined} data-collapsed={collapsed || undefined} style={{ '--node-category': data.color || color } as CSSProperties}>
+        data-bypassed={data.bypassed || undefined} data-collapsed={collapsed || undefined} style={nodeColorStyle(data.color, color)}>
         <header className="workflow-node__header" title={nodeSpec?.description || `${title} · ${nodeSpec?.category || data.opType}`}
           onDoubleClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
-          <button type="button" className="workflow-node__collapse nodrag" aria-label={collapsed ? 'Expand node' : 'Collapse node'}
+          <button type="button" className="workflow-node__collapse nodrag" title={collapsed ? '展开节点' : '收起节点'} aria-label={collapsed ? 'Expand node' : 'Collapse node'}
             aria-expanded={!collapsed} onDoubleClick={event => event.stopPropagation()}
             onClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
             <ChevronDown size={14} />
@@ -89,7 +92,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
           {collapsed && hasStatus && <span className="node-status-dot" title={STATUS_LABELS[status]} />}
         </header>
         {_invalid && <div className="workflow-node__warning" role="alert">{_warning || 'Node type unavailable. Replace this node.'}</div>}
-        {(inputs.length > 0 || outputs.length > 0) && (
+        {(inputs.length > 0 || outputs.length > 0 || (collapsed && widgets.length > 0)) && (
           <div className="node-ports" aria-label="Node connections">
             <div className="node-ports__column">
               {inputs.map(input => <div key={input.name} className="node-port" title={`${input.name} · ${input.type}`}>
@@ -98,7 +101,12 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
                   className="node-port__handle node-port__handle--input"
                   data-connected={connectedInputs.has(input.name) || undefined}
                   style={{ '--port-color': input.color } as CSSProperties} />
-                <span className="node-port__name">{input.name}</span>
+                <span className="node-port__name">{input.label}</span>
+              </div>)}
+              {collapsed && widgets.map(widget => <div key={widget.name} className="node-port">
+                <Handle type="target" position={Position.Left} id={widget.name} className="node-port__handle node-port__handle--input"
+                  style={{ '--port-color': getTypeColor(inputPortType(widget.config)) } as CSSProperties} />
+                <span>{data.inputLabels?.[widget.name] || widget.name}</span>
               </div>)}
             </div>
             <div className="node-ports__column node-ports__column--outputs">
@@ -116,9 +124,16 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
         {!collapsed && widgets.length > 0 && (
           <div className="node-parameters" aria-label="Node parameters">
             {widgets.map(widget => <NodeParameter key={widget.name} {...widget}
-              value={effectiveValues[widget.name]} onChange={handleUpdate} disabled={locked} />)}
+              label={data.inputLabels?.[widget.name]} value={effectiveValues[widget.name]} onChange={handleUpdate}
+              disabled={locked || connectedInputs.has(widget.name)} linked={connectedInputs.has(widget.name)}
+              slot={<Handle type="target" position={Position.Left} id={widget.name}
+                aria-label={`Input ${widget.name} (${inputPortType(widget.config)})`} title={`${widget.name} · ${inputPortType(widget.config)} · 可输入或连线`}
+                className="node-port__handle node-widget-slot" isConnectable={!locked} data-connected={connectedInputs.has(widget.name) || undefined}
+                style={{ '--port-color': getTypeColor(inputPortType(widget.config)) } as CSSProperties} />} />)}
           </div>
         )}
+        {!collapsed && Object.keys(nodeSpec.input.optional || {}).length > 0 && <button className="node-advanced-toggle nodrag"
+          disabled={locked} onClick={() => updateNodeData(id, { showAdvanced: !data.showAdvanced })}>{data.showAdvanced ? '隐藏高级输入' : '显示高级输入'}</button>}
         {hasStatus && <footer className="workflow-node__status" role="status" title={message}>
           <span className="node-status-dot" />
           <span className="workflow-node__status-label">{STATUS_LABELS[status] || status}</span>

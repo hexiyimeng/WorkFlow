@@ -1,5 +1,7 @@
 import { useWorkflowLibrary } from '../hooks/useWorkflowLibrary';
 import { useSubgraphEditor } from '../hooks/useSubgraphEditor';
+import { inputPortType, nodeInputValues } from '../utils/nodeInputs';
+import { exposePort, NEW_SUBGRAPH_INPUT, NEW_SUBGRAPH_OUTPUT } from '../utils/subgraphs';
 // src/context/FlowContext.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { applyNodeChanges as applyNodes, applyEdgeChanges as applyEdges, addEdge, type Connection, type Node, type Edge, type OnConnectStart, type OnConnectEnd, type OnNodesChange, type OnEdgesChange } from '@xyflow/react';
@@ -54,6 +56,9 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     catch { return 'light'; }
   });
   const [isConsoleOpen, setIsConsoleOpen] = useState(false);
+  const [isNodeInspectorOpen, setIsNodeInspectorOpen] = useState(false);
+  const openNodeInspector = useCallback(() => setIsNodeInspectorOpen(true), []);
+  const closeNodeInspector = useCallback(() => setIsNodeInspectorOpen(false), []);
   const [connectingType, setConnectingType] = useState<string | null>(null);
   const [isExecutionSettingsOpen, setIsExecutionSettingsOpen] = useState(false);
   const [executionSettingsValidation, setExecutionSettingsValidation] = useState<
@@ -546,16 +551,24 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!sourceNode || !targetNode || !targetHandle) return 'Invalid Connection';
 
     const sourceIndex = parseInt(sourceHandle || '0');
-    const sourceType = resolveNodeOutputTypes(sourceNode.data.nodeSpec, sourceNode.data.values)[sourceIndex] || 'unknown';
+    const sourceType = resolveNodeOutputTypes(sourceNode.data.nodeSpec, nodeInputValues(sourceNode, { nodes, edges }))[sourceIndex] || 'unknown';
     const targetConfig = targetNode.data.nodeSpec.input?.required?.[targetHandle] || targetNode.data.nodeSpec.input?.optional?.[targetHandle];
-    const targetType = Array.isArray(targetConfig) && typeof targetConfig[0] === 'string'
-      ? targetConfig[0]
-      : 'unknown';
+    const targetType = inputPortType(targetConfig);
 
     return canConnectPorts(sourceType, targetType).reason || 'Invalid Connection';
-  }, [nodes]);
+  }, [nodes, edges]);
 
   const isValidConnection = useCallback((connection: Connection | Edge) => {
+    if (subgraphPath.length && connection.source === NEW_SUBGRAPH_INPUT) {
+      const target = nodes.find(n => n.id === connection.target);
+      return !!target && !target.data.boundary && !!connection.targetHandle
+        && !!(target.data.nodeSpec.input.required[connection.targetHandle] || target.data.nodeSpec.input.optional?.[connection.targetHandle])
+        && !edges.some(e => e.target === target.id && e.targetHandle === connection.targetHandle);
+    }
+    if (subgraphPath.length && connection.target === NEW_SUBGRAPH_OUTPUT) {
+      const source = nodes.find(n => n.id === connection.source);
+      return !!source && source.data.boundary !== 'output' && !!source.data.nodeSpec.output[Number(connection.sourceHandle || 0)];
+    }
     const sourceNode = nodes.find(n => n.id === connection.source);
     const targetNode = nodes.find(n => n.id === connection.target);
     if (!sourceNode || !targetNode) return false;
@@ -567,15 +580,13 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     if (!sourceSpec?.output?.[sourceHandleIndex] || !targetSpec || !targetHandleName) return false;
 
-    const outputTypes = resolveNodeOutputTypes(sourceSpec, sourceNode.data.values);
+    const outputTypes = resolveNodeOutputTypes(sourceSpec, nodeInputValues(sourceNode, { nodes, edges }));
     const outputType = outputTypes[sourceHandleIndex];
     const inputConfig = targetSpec.input?.required?.[targetHandleName] || targetSpec.input?.optional?.[targetHandleName];
     if (!outputType || !inputConfig) return false;
 
-    const inputType = Array.isArray(inputConfig) ? inputConfig[0] : inputConfig;
-    if (typeof inputType !== 'string') return false;
-    return canConnectPorts(outputType, inputType).ok;
-  }, [nodes]);
+    return canConnectPorts(outputType, inputPortType(inputConfig)).ok;
+  }, [nodes, edges, subgraphPath]);
 
   const onConnect = useCallback((params: Connection) => {
     if (isExecutionLocked) { addLog('Cannot connect while executing', 'warning'); return; }
@@ -584,20 +595,28 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
       addLog(getConnectionTypeError(params.source, params.target, params.sourceHandle, params.targetHandle), 'error');
       return;
     }
+    if (subgraphPath.length && (params.source === NEW_SUBGRAPH_INPUT || params.target === NEW_SUBGRAPH_OUTPUT)) {
+      try {
+        editGraph(graph => params.source === NEW_SUBGRAPH_INPUT
+          ? exposePort(graph, params.target!, 'input', params.targetHandle!)
+          : exposePort(graph, params.source!, 'output', params.sourceHandle || '0'));
+      } catch (error) { addLog((error as Error).message, 'error'); }
+      return;
+    }
     setEdges(eds => {
       const withoutExisting = eds.filter(
         e => !(e.target === params.target && e.targetHandle === params.targetHandle)
       );
       return addEdge({ ...params, animated: false, style: { stroke: '#94a3b8', strokeWidth: 2 } }, withoutExisting);
     });
-  }, [setEdges, isValidConnection, addLog, isExecutionLocked, getConnectionTypeError]);
+  }, [setEdges, isValidConnection, addLog, isExecutionLocked, getConnectionTypeError, editGraph, subgraphPath]);
 
   const onConnectStart: OnConnectStart = useCallback((_, { nodeId, handleId, handleType }) => {
     if (isExecutionLocked) return;
     if (handleType !== 'source') return;
     const node = nodes.find(n => n.id === nodeId);
-    if (node) setConnectingType(resolveNodeOutputTypes(node.data.nodeSpec, node.data.values)[parseInt(handleId || '0')] || null);
-  }, [nodes, isExecutionLocked]);
+    if (node) setConnectingType(resolveNodeOutputTypes(node.data.nodeSpec, nodeInputValues(node, { nodes, edges }))[parseInt(handleId || '0')] || null);
+  }, [nodes, edges, isExecutionLocked]);
 
   const onConnectEnd: OnConnectEnd = useCallback((_, connectionState) => {
     setConnectingType(null);
@@ -658,6 +677,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 10. Editor and execution services exposed to the UI
   // ===========================================
   const contextValue = {
+    isNodeInspectorOpen, openNodeInspector, closeNodeInspector,
     ...library,
     rootNodes, rootEdges, editGraph, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph,
     nodes, edges, nodeDefs, pluginDiagnostics, pluginStatusError, dashboardUrl, isReloadingNodes, isConnected: isConnected, logs, workflows, activeWorkflow, activeWorkflowId,
