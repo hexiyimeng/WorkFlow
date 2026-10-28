@@ -70,7 +70,7 @@ export function useWorkflowLibrary(options: {
     if (locked || !node.data.subgraph) return;
     setError(null); setSaveDialog({ kind: 'subgraphs', asCopy: true, name: node.data.title || 'Subgraph', folder: '', graph: { nodes: [node], edges: [] } });
   };
-  const openLibraryItem = async (kind: LibraryKind, id: string) => {
+  const openLibraryItem = async (kind: LibraryKind, id: string, position?: { x: number; y: number }) => {
     if (locked || busyRef.current) return;
     if (kind === 'workflows') {
       const existing = workflows.find(w => w.libraryRef?.id === id);
@@ -102,7 +102,7 @@ export function useWorkflowLibrary(options: {
         if (hydrated.nodes.length !== 1 || !hydrated.nodes[0].data.subgraph) throw new Error('Invalid subgraph blueprint.');
         const cloned = cloneGraphIds(hydrated);
         editGraph(graph => ({ ...graph, nodes: [...graph.nodes.map(n => ({ ...n, selected: false })),
-          ...cloned.nodes.map(n => ({ ...n, position: { x: 200, y: 150 }, selected: true }))] }));
+          ...cloned.nodes.map(n => ({ ...n, data: { ...n.data, title: record.name }, position: position || { x: 200, y: 150 }, selected: true }))] }));
       }
       addLog(`${kind === 'workflows' ? 'Opened' : 'Inserted'} ${record.name}`, 'info');
     } catch (error) { setError((error as Error).message); addLog((error as Error).message, 'error'); }

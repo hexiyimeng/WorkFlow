@@ -17,6 +17,7 @@
 .inspector-field__heading { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
 .inspector-field__heading code { color: var(--color-text-muted); font-size: 10px; max-width: 46%; overflow-wrap: anywhere; text-align: right; }
 .inspector-name { flex: 1; width: 100%; min-width: 0; padding: 5px 6px; border: 1px solid transparent; border-radius: 4px; background: transparent; font-size: 13px; }
+.inspector-field-name { display: block; flex: 1; min-width: 0; padding: 5px 6px; overflow-wrap: anywhere; font-size: 13px; }
 .inspector-name:not(:disabled):hover { border-color: var(--color-border-default); }
 .inspector-field__actions { display: flex; align-items: center; gap: 2px; margin-top: 8px; }
 .inspector-field__actions small { color: var(--color-text-muted); font-size: 11px; flex: 1; }

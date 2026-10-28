@@ -1,4 +1,5 @@
 import WorkflowLibraryPanel from './WorkflowLibraryPanel';
+import SubgraphLibraryGroup from './SubgraphLibraryGroup';
 import { useMemo, useState, type DragEvent } from 'react';
 import { Boxes, Workflow, ChevronDown, ChevronsDownUp, ChevronsUpDown, PanelLeftClose, Plus, Search, Terminal, X, Box, GripVertical } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
@@ -25,7 +26,7 @@ function NodeItem({ node, locked, add }: { node: LibraryNode; locked: boolean; a
 }
 
 export default function Sidebar() {
-  const { addNode, nodeDefs, isExecutionLocked, isConsoleOpen, toggleConsole } = useFlow();
+  const { addNode, nodeDefs, libraryItems, isExecutionLocked, isConsoleOpen, toggleConsole } = useFlow();
   const [open, setOpen] = useState(true);
   const [panel, setPanel] = useState<'nodes' | 'workflows'>('nodes');
   const [search, setSearch] = useState('');
@@ -46,6 +47,7 @@ export default function Sidebar() {
     const text = `${node.display_name} ${node.type} ${node.category} ${node.description || ''} ${node.required_worker_profile || ''}`.toLowerCase();
     return terms.every(term => text.includes(term));
   });
+  const subgraphMatches = libraryItems.subgraphs.filter(item => terms.every(term => `${item.name} ${item.folder} 子图 Blueprint`.toLowerCase().includes(term))).length;
   const toggleCategory = (category: string) => setCollapsed(previous => {
     const next = new Set(previous);
     if (next.has(category)) next.delete(category); else next.add(category);
@@ -61,17 +63,17 @@ export default function Sidebar() {
       </nav>
       {open && <section className="library-panel" style={{ width: size }}>
         {panel === 'workflows' ? <WorkflowLibraryPanel /> : <>
-        <header className="library-heading"><div><h2>Node Library</h2><span>{entries.length} available nodes</span></div>
+        <header className="library-heading"><div><h2>Node Library</h2><span>{entries.length + libraryItems.subgraphs.length} available nodes</span></div>
           <button className="workspace-icon-button" title="Collapse node library" aria-label="Collapse node library" onClick={() => setOpen(false)}><PanelLeftClose size={16} /></button>
         </header>
         <div className="library-search"><Search size={14} /><input type="search" aria-label="Search nodes" placeholder="Search nodes, types, categories…" value={search}
           onChange={event => setSearch(event.target.value)} />
           {search && <button aria-label="Clear node search" onClick={() => setSearch('')}><X size={13} /></button>}
         </div>
-        <div className="library-list-heading"><span>{terms.length ? `${results.length} matching nodes` : 'All nodes'}</span>
+        <div className="library-list-heading"><span>{terms.length ? `${results.length + subgraphMatches} matching nodes` : 'All nodes'}</span>
           {!terms.length && <button className="workspace-icon-button" title={collapsed.size ? 'Expand all categories' : 'Collapse all categories'}
             aria-label={collapsed.size ? 'Expand all categories' : 'Collapse all categories'}
-            onClick={() => setCollapsed(collapsed.size ? new Set() : new Set(groups.map(group => group.category)))}>
+            onClick={() => setCollapsed(collapsed.size ? new Set() : new Set([...groups.map(group => group.category), '__subgraphs__']))}>
             {collapsed.size ? <ChevronsUpDown size={14} /> : <ChevronsDownUp size={14} />}</button>}
         </div>
         <div className="library-list custom-scrollbar">
@@ -81,8 +83,9 @@ export default function Sidebar() {
             </button>
             {!collapsed.has(group.category) && group.nodes.map(node => <NodeItem key={node.type} node={node} locked={isExecutionLocked} add={addNode} />)}
           </section>)}
-          {terms.length > 0 && results.length === 0 && <div className="library-empty"><Search size={24} /><strong>No matching nodes</strong><span>Try a node name, category or data type.</span><button onClick={() => setSearch('')}>Clear search</button></div>}
-          {entries.length === 0 && <div className="library-empty"><Boxes size={24} /><span>Waiting for node definitions…</span></div>}
+          <SubgraphLibraryGroup search={search} collapsed={collapsed.has('__subgraphs__')} toggle={() => toggleCategory('__subgraphs__')} />
+          {terms.length > 0 && results.length + subgraphMatches === 0 && <div className="library-empty"><Search size={24} /><strong>No matching nodes</strong><span>Try a node name, category or data type.</span><button onClick={() => setSearch('')}>Clear search</button></div>}
+          {entries.length + libraryItems.subgraphs.length === 0 && <div className="library-empty"><Boxes size={24} /><span>Waiting for node definitions…</span></div>}
         </div>
         <footer className="library-footer"><GripVertical size={12} />Drag to the canvas or click to add</footer>
         </>}

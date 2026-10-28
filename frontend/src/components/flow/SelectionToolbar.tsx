@@ -21,12 +21,12 @@ export default function SelectionToolbar() {
       <button aria-label="Delete selected nodes" title="删除所选节点" disabled={isExecutionLocked || !editable.length} onClick={handleDelete}><Trash2 size={16} /></button>
       <button aria-label="Node information" title="节点详情 · 参数 / 信息 / 设置" onClick={openNodeInspector}><Info size={16} /></button>
       <button aria-label="Node color" title="节点颜色" disabled={isExecutionLocked} onClick={() => setShowColors(value => !value)}><Palette size={16} /></button>
-      {single && <button aria-label="Rename node" title="重命名节点" disabled={isExecutionLocked}
+      {single && !single.data.boundary && <button aria-label="Rename node" title="重命名节点" disabled={isExecutionLocked}
         onClick={() => { const name = prompt('节点名称', single.data.title || single.data.nodeSpec.display_name); if (name?.trim()) updateNodeData(single.id, { title: name.trim() }); }}><Pencil size={16} /></button>}
       {single?.data.subgraph ? <>
         <button aria-label="Enter selected subgraph" title="进入子图" onClick={() => enterSubgraph(single.id)}><LogIn size={16} /></button>
         <button aria-label="Unpack subgraph" title="展开子图" disabled={isExecutionLocked} onClick={() => action(() => editGraph(graph => unpackSubgraph(graph, single.id)))}><Ungroup size={16} /></button>
-        <button aria-label="Save subgraph to library" title="保存子图到工作流库" disabled={isExecutionLocked} onClick={() => saveSubgraphToLibrary(single)}><Save size={16} /></button>
+        <button aria-label="Save subgraph to library" title="保存为可复用节点（Blueprint）" disabled={isExecutionLocked} onClick={() => saveSubgraphToLibrary(single)}><Save size={16} /></button>
       </> : <button aria-label="Convert selection to subgraph" title="将选区转化为子图（支持单个节点）" disabled={isExecutionLocked || !editable.length || editable.length !== selected.length}
         onClick={() => action(() => editGraph(graph => convertSelection(graph, single ? single.data.title || single.data.nodeSpec.display_name : '新子图')))}><Boxes size={16} /></button>}
       {subgraphPath.length > 0 && single && !single.data.boundary && <button aria-label="Expose subgraph ports" title="公开输入 / 输出到父图" disabled={isExecutionLocked} onClick={() => setShowPorts(value => !value)}><Plug size={16} /></button>}

@@ -212,6 +212,10 @@
 .node-port-menu button { text-align:left; padding:8px; border-radius:4px; }
 .node-port-menu button:hover:not(:disabled) { background:var(--color-bg-surface-2); }
 .node-port-menu small { color:var(--color-text-muted); margin-top:5px; }
+.subgraph-library-heading { display:flex; align-items:center; padding-right:8px; }
+.subgraph-library-heading .library-group__heading { flex:1; min-width:0; }
+.subgraph-library-empty { padding:8px 16px 14px; color:var(--color-text-muted); font-size:12px; line-height:1.6; }
+.subgraph-blueprint .saved-workflow__open.library-node { margin:0; width:auto; min-width:0; }
 .workflow-node[data-bypassed] { opacity:.6; border-style:dashed; }
 .subgraph-node { min-width:300px; border:1px solid var(--color-border-strong); }
 .subgraph-node .workflow-node__header { display:flex; gap:10px; padding:12px; border-top:3px solid var(--color-accent); }
@@ -228,9 +232,6 @@
 .boundary-node small { display:block; padding:0 12px 10px; color:var(--color-text-muted); font-size:11px; }
 .subgraph-breadcrumbs { position:absolute; top:14px; left:14px; z-index:6; padding:9px 13px; background:var(--color-bg-surface); border:1px solid var(--color-border-default); border-radius:8px; box-shadow:var(--shadow-panel); font-size:13px; }
 .subgraph-breadcrumbs button:hover { color:var(--color-accent); }
-.library-kind-tabs { display:flex; margin:0 14px 12px; padding:3px; background:var(--color-bg-surface-2); border-radius:6px; }
-.library-kind-tabs button { flex:1; padding:7px; font-size:12px; border-radius:4px; }
-.library-kind-tabs button[aria-selected=true] { background:var(--color-bg-surface); box-shadow:var(--shadow-panel); }
 .saved-workflow { display:flex; align-items:center; border-radius:7px; margin:3px 7px; }
 .saved-workflow:hover { background:var(--color-bg-surface-2); }
 .saved-workflow__open { display:flex; align-items:center; text-align:left; gap:10px; padding:10px 8px; flex:1; min-width:0; }

@@ -18,6 +18,10 @@ function EditableLabel({ value, label, disabled, onChange }: { value: string; la
     onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') { event.currentTarget.value = value; event.currentTarget.blur(); } }} />;
 }
 
+function FieldName({ value, label }: { value: string; label: string }) {
+  return <span className="inspector-field-name" aria-label={label} title={`${value} · 字段名称暂不支持修改`}>{value}</span>;
+}
+
 function InputFields({ node, edges, path = [], promote, search = '' }: { node: Node<NodeData>; edges: Edge[]; path?: string[]; promote: boolean; search?: string }) {
   const { nodes, editGraph, isExecutionLocked: locked, addLog } = useFlow();
   const change = (update: (node: Node<NodeData>) => Node<NodeData>) => editGraph(graph => updateGraphAtPath(graph, path, inner => ({ ...inner, nodes: inner.nodes.map(n => n.id === node.id ? update(n) : n) })));
@@ -27,8 +31,7 @@ function InputFields({ node, edges, path = [], promote, search = '' }: { node: N
     const connection = edges.find(e => e.target === node.id && e.targetHandle === name);
     const display = node.data.inputLabels?.[name] || name;
     return <section className="inspector-field" key={name} data-input={name}>
-      <div className="inspector-field__heading"><EditableLabel value={display} label={`输入名称 ${name}`} disabled={locked}
-        onChange={next => change(n => ({ ...n, data: { ...n.data, inputLabels: { ...n.data.inputLabels, [name]: next } } }))} />
+      <div className="inspector-field__heading"><FieldName value={display} label={`输入名称 ${name}`} />
         <code>{inputPortType(config)}</code></div>
       {isWidgetInput(config) && <NodeParameter name={name} label={display} config={config} value={values[name]} disabled={locked || !!connection} linked={!!connection}
         onChange={(_, value) => change(n => withNodeInputValue(n, name, value))} />}
@@ -58,7 +61,7 @@ export default function NodeInspector() {
     const action = (change: Parameters<typeof editSubgraphPort>[4]) => safe(() => editGraph(graph => editSubgraphPort(graph, node.id, kind, port.id, change)));
     const linked = kind === 'input' && edges.some(e => e.target === node.id && e.targetHandle === port.id);
     return <section className="inspector-field" key={port.id} data-port={port.id}>
-      <div className="inspector-field__heading"><EditableLabel value={port.name} label={`${kind === 'input' ? '输入' : '输出'}名称 ${port.id}`} disabled={locked} onChange={name => action({ name })} /><code>{port.type}</code></div>
+      <div className="inspector-field__heading"><FieldName value={port.name} label={`${kind === 'input' ? '输入' : '输出'}名称 ${port.id}`} /><code>{port.type}</code></div>
       {kind === 'input' && isWidgetInput(port.config) && <NodeParameter name={port.id} label={port.name} config={port.config!} value={nodeInputValues(node, { nodes, edges })[port.id]} disabled={locked || linked} linked={linked}
         onChange={(_, value) => action({ value })} />}
       <div className="inspector-field__actions"><small>{linked ? '已连接 · 使用上游值' : kind === 'input' && port.config ? '父图与子图共享此默认值' : '子图接口'}</small>
@@ -85,21 +88,22 @@ export default function NodeInspector() {
             <details className="inspector-advanced"><summary>高级参数 · 内部节点</summary>{sub.nodes.filter(n => !n.data.boundary && matches(`${n.data.title || n.data.nodeSpec.display_name} ${Object.keys({ ...n.data.nodeSpec.input.required, ...n.data.nodeSpec.input.optional }).join(' ')}`)).map(child => <details key={child.id}><summary>{child.data.title || child.data.nodeSpec.display_name}</summary><InputFields node={child} edges={sub.edges} path={[node.id]} promote /></details>)}</details>
           </> : <>
             <h3>{node.data.boundary ? '子图接口' : '输入'}</h3>
-            {node.data.boundary && <EditableLabel value={node.data.title || '接口'} label="接口名称" disabled={locked} onChange={title => updateNodeData(node.id, { title })} />}
+            {node.data.boundary && <FieldName value={node.data.title || '接口'} label="接口名称" />}
             <div className="inspector-inputs"><InputFields node={node} edges={edges} search={search} promote={subgraphPath.length > 0 && !node.data.boundary} /></div>
             {node.data.boundary === 'input' && !node.data.boundaryConfig && <p className="inspector-note">此接口传递 {String(node.data.values.portType)}，请从父图连接数据。</p>}
             <h3>输出</h3>{resolveNodeOutputTypes(node.data.nodeSpec, nodeInputValues(node, { nodes, edges })).map((type, index) => matches(node.data.outputLabels?.[index] || node.data.nodeSpec.output_name?.[index] || type) && <section className="inspector-field" key={index}>
-              <div className="inspector-field__heading"><EditableLabel value={node.data.outputLabels?.[index] || node.data.nodeSpec.output_name?.[index] || type} label={`输出名称 ${index}`} disabled={locked}
-                onChange={name => updateNodeData(node.id, { outputLabels: { ...node.data.outputLabels, [index]: name } })} /><code>{type}</code></div>
+              <div className="inspector-field__heading"><FieldName value={node.data.outputLabels?.[index] || node.data.nodeSpec.output_name?.[index] || type} label={`输出名称 ${index}`} /><code>{type}</code></div>
               {subgraphPath.length > 0 && node.data.boundary !== 'output' && <button className="inspector-link" disabled={locked} onClick={() => safe(() => editGraph(graph => exposePort(graph, node.id, 'output', String(index))))}><Plug size={14} />公开为子图输出</button>}
             </section>)}
           </>}
         </>)}
         {tab === 'info' && selected.map(n => <section className="inspector-info" key={n.id}><h3>{n.data.title || n.data.nodeSpec.display_name}</h3><p>{n.data.nodeSpec.description || (n.data.subgraph ? '可进入编辑的子图，接口连接到内部节点。' : '此节点由插件提供。')}</p>
           <dl><dt>类型</dt><dd>{n.data.opType}</dd><dt>分类</dt><dd>{n.data.nodeSpec.category || '—'}</dd><dt>ID</dt><dd>{n.id}</dd><dt>运行状态</dt><dd>{n.data.runState || '未运行'}</dd>{n.data.nodeSpec.required_worker_profile && <><dt>Worker 类型</dt><dd>{n.data.nodeSpec.required_worker_profile}</dd></>}</dl>
-          <p className="inspector-note">输入输出类型由节点接口声明；显示名称可在参数页修改。</p></section>)}
+          <p className="inspector-note">输入输出类型由节点接口声明；字段名称暂不支持修改。</p></section>)}
         {tab === 'settings' && <>
-          {node && <><h3>节点名称</h3><EditableLabel value={node.data.title || node.data.nodeSpec.display_name} label="节点名称" disabled={locked} onChange={title => updateNodeData(node.id, { title })} /></>}
+          {node && <><h3>{node.data.boundary ? '接口名称' : '节点名称'}</h3>{node.data.boundary
+            ? <FieldName value={node.data.title || node.data.nodeSpec.display_name} label="接口名称" />
+            : <EditableLabel value={node.data.title || node.data.nodeSpec.display_name} label="节点名称" disabled={locked} onChange={title => updateNodeData(node.id, { title })} />}</>}
           <h3>节点颜色</h3><NodeColorPicker color={node?.data.color} disabled={locked} onChange={color => editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => n.selected ? { ...n, data: { ...n.data, color } } : n) }))} />
           {node && !sub && !node.data.boundary && <label className="inspector-checkbox"><input type="checkbox" checked={!!node.data.showAdvanced} disabled={locked} onChange={event => updateNodeData(node.id, { showAdvanced: event.target.checked })} />显示高级输入</label>}
           {node && !node.data.boundary && <label className="inspector-checkbox"><input type="checkbox" checked={!!node.data.bypassed} disabled={locked || !bypassMapping(node)} onChange={event => updateNodeData(node.id, { bypassed: event.target.checked })} />忽略节点（Bypass）</label>}

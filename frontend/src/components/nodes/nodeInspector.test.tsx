@@ -39,10 +39,9 @@ async function main() {
   assert.equal(snapshot.nodes[0].data.values.diameter, 13, 'sidebar edits the same graph values as the node');
   await click('[aria-label="重置 diameter"]');
   assert.equal(snapshot.nodes[0].data.values.diameter, 10);
-  const alias = document.querySelector<HTMLInputElement>('[aria-label="输入名称 diameter"]')!;
-  await act(async () => { alias.focus(); alias.value = '直径'; alias.blur(); });
-  assert.equal(snapshot.nodes[0].data.inputLabels?.diameter, '直径');
-  assert(Object.hasOwn(snapshot.nodes[0].data.nodeSpec.input.required, 'diameter'), 'renaming a display label preserves the backend parameter key');
+  assert.equal(document.querySelector('[aria-label="输入名称 diameter"]')!.tagName, 'SPAN', 'input field names are read-only text');
+  assert.equal(document.querySelector('[aria-label="输出名称 0"]')!.tagName, 'SPAN', 'output field names are read-only text');
+  assert.equal(snapshot.nodes[0].data.inputLabels, undefined, 'editing values does not create display aliases');
   await act(async () => { [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(e => e.textContent === '信息')!.click(); });
   assert(document.querySelector('.inspector-info')!.textContent!.includes('Process image blocks'));
   assert.equal(document.querySelectorAll('.inspector-info pre').length, 0, 'information is human-readable instead of a JSON dump');
@@ -57,8 +56,23 @@ async function main() {
   await click('[aria-label="关闭节点面板"]');
   assert.equal(document.querySelector('.node-inspector'), null);
   await act(async () => root.unmount());
+
+  const { convertSelection, exposePort, updateGraphAtPath } = await import('../../utils/subgraphs');
+  let wrapped = convertSelection({ nodes: [initial], edges: [] }, 'Subgraph');
+  const wrapperId = wrapped.nodes[0].id;
+  wrapped = updateGraphAtPath(wrapped, [wrapperId], inner => exposePort(inner, 'process', 'input', 'diameter'));
+  const second = createRoot(document.getElementById('root')!);
+  const readonlyContext = { nodes: wrapped.nodes, edges: [], subgraphPath: [], isNodeInspectorOpen: true, isExecutionLocked: false, closeNodeInspector: () => undefined } as unknown as FlowContextType;
+  await act(async () => second.render(<FlowContext.Provider value={readonlyContext}><NodeInspector /></FlowContext.Provider>));
+  assert([...document.querySelectorAll('[aria-label^="输入名称"], [aria-label^="输出名称"]')].every(e => e.tagName === 'SPAN'), 'public subgraph port names are read-only');
+  const boundary = wrapped.nodes[0].data.subgraph!.nodes.find(n => n.data.boundary === 'input')!;
+  await act(async () => second.render(<FlowContext.Provider value={{ ...readonlyContext, nodes: [{ ...boundary, selected: true }], subgraphPath: [wrapperId] }}><NodeInspector /></FlowContext.Provider>));
+  assert.equal(document.querySelector('[aria-label="接口名称"]')!.tagName, 'SPAN', 'boundary names cannot be edited inside a subgraph');
+  await act(async () => { [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(e => e.textContent === '设置')!.click(); });
+  assert.equal(document.querySelector('[aria-label="接口名称"]')!.tagName, 'SPAN', 'settings cannot bypass the field-name restriction');
+  await act(async () => second.unmount());
   dom.window.close();
-  console.log('node inspector editing, connections, aliases, colors and execution lock tests passed');
+  console.log('node inspector editing, connections, read-only field names, colors and execution lock tests passed');
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

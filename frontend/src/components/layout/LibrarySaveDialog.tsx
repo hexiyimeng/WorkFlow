@@ -27,10 +27,10 @@ function SaveForm({ dialog, close, save, busy, error }: {
     }
   }}>
     <form ref={panel} className="library-modal" role="dialog" aria-modal="true" aria-label="Save workflow" onSubmit={event => { event.preventDefault(); if (name.trim()) void save(dialog, name.trim(), folder.trim()); }}>
-      <header><h2>{dialog.kind === 'subgraphs' ? 'Save subgraph' : dialog.asCopy ? 'Save workflow as' : 'Save workflow'}</h2><button type="button" aria-label="Close save dialog" disabled={busy} onClick={close}><X size={18} /></button></header>
+      <header><h2>{dialog.kind === 'subgraphs' ? '保存为可复用节点（Blueprint）' : dialog.asCopy ? 'Save workflow as' : 'Save workflow'}</h2><button type="button" aria-label="Close save dialog" disabled={busy} onClick={close}><X size={18} /></button></header>
       <label>Name<input aria-label="Saved workflow name" value={name} required maxLength={160} disabled={busy} onChange={event => setName(event.target.value)} /></label>
       <label>Folder <small>(optional)</small><input aria-label="Workflow folder" placeholder="For example: Experiments" value={folder} maxLength={320} disabled={busy} onChange={event => setFolder(event.target.value)} /></label>
-      <p>Saved in this server’s project user/{dialog.kind}/ directory.</p>
+      <p>{dialog.kind === 'subgraphs' ? '保存后可从节点库添加，实例之间独立编辑。' : '保存到后端服务所在的工作流库。'}</p>
       {error && <p className="library-error" role="alert">{error}</p>}
       <footer><Button type="button" variant="ghost" onClick={close} disabled={busy}>Cancel</Button><Button type="submit" variant="primary" disabled={!name.trim() || busy} loading={busy}>Save</Button></footer>
     </form>

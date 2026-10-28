@@ -16,7 +16,7 @@ const nodeTypes: NodeTypes = { dynamic: DynamicNode as ComponentType<NodeProps<N
 
 export default function FlowEditor() {
   const { nodes, edges, onNodesChange, onEdgesChange, onConnect, theme, addNodeAt, isValidConnection,
-    onConnectStart, onConnectEnd, isExecutionLocked, isRecoveryGraphReadOnly, recoveredGraphView, activeWorkflowDocumentId, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph, activeWorkflow } = useFlow();
+    onConnectStart, onConnectEnd, isExecutionLocked, isRecoveryGraphReadOnly, recoveredGraphView, activeWorkflowDocumentId, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph, activeWorkflow, openLibraryItem } = useFlow();
   const { screenToFlowPosition, fitView } = useReactFlow();
   const nodesInitialized = useNodesInitialized();
   const fittedDocumentRef = useRef<string | null>(null);
@@ -32,9 +32,12 @@ export default function FlowEditor() {
   const onDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault();
     if (isExecutionLocked) return;
+    const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
+    const blueprint = event.dataTransfer.getData('application/workflow-subgraph');
+    if (blueprint) { void openLibraryItem('subgraphs', blueprint, position); return; }
     const type = event.dataTransfer.getData('application/reactflow');
-    if (type) addNodeAt(type, screenToFlowPosition({ x: event.clientX, y: event.clientY }));
-  }, [screenToFlowPosition, addNodeAt, isExecutionLocked]);
+    if (type) addNodeAt(type, position);
+  }, [screenToFlowPosition, addNodeAt, isExecutionLocked, openLibraryItem]);
   const documentKey = `${recoveredGraphView?.recoveryDirectory || activeWorkflowDocumentId}/${subgraphPath.join('/')}`;
   // These two affordances exist only in the canvas. They never enter saved or executable graphs.
   const placeholders: Node<NodeData>[] = subgraphPath.length ? (['input', 'output'] as const).map(kind => {
@@ -56,7 +59,7 @@ export default function FlowEditor() {
   }, [nodesInitialized, nodes.length, documentKey, fitView]);
 
   return <div className="workspace-canvas" data-tool={mode}
-    onDrop={onDrop} onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }} onContextMenu={onPaneContextMenu}>
+    onDrop={onDrop} onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = event.dataTransfer.types.includes('application/workflow-subgraph') ? 'copy' : 'move'; }} onContextMenu={onPaneContextMenu}>
     {breadcrumbs.length > 0 && <nav className="subgraph-breadcrumbs" aria-label="Subgraph navigation"><button onClick={() => navigateSubgraph(0)}>{activeWorkflow?.name || 'Workflow'}</button>{breadcrumbs.map((item, index) => <span key={item.id}> / <button onClick={() => navigateSubgraph(index + 1)}>{item.name}</button></span>)}</nav>}
     {nodes.length === 0 && <div className="canvas-empty"><span className="canvas-empty__icon"><Workflow size={30} /></span>
       <h1>Build your workflow</h1><p>Add a node from the library, connect the steps,<br />and run your image processing pipeline.</p>

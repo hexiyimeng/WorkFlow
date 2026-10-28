@@ -26,6 +26,7 @@ async function main() {
     },
     addNode: (type: string) => added.push(type), isExecutionLocked: false,
     isConsoleOpen: false, toggleConsole: () => undefined,
+    libraryItems: { workflows: [], subgraphs: [] }, libraryBusy: false, libraryError: null,
   } as unknown as import('../../context/FlowContextDef').FlowContextType;
   await act(async () => { root.render(<FlowContext.Provider value={context}><Sidebar /></FlowContext.Provider>); });
   assert(document.querySelectorAll('.library-node').length === 2, 'node categories start expanded');
@@ -44,6 +45,20 @@ async function main() {
   await setInput('[aria-label="Search nodes"]', 'unavailable');
   assert(document.body.textContent?.includes('No matching nodes'), 'empty searches have a useful message');
   await click('[aria-label="Clear node search"]');
+  const inserted: string[] = [];
+  const blueprintContext = { ...context, libraryItems: { workflows: [{ id: 'workflow-id', name: 'Complete workflow', folder: '', updatedAt: 1, revision: 1 }], subgraphs: [{ id: 'blueprint-id', name: 'Reusable segmentation', folder: 'Microscopy', updatedAt: 1, revision: 1 }] },
+    openLibraryItem: (kind: string, id: string) => { inserted.push(`${kind}/${id}`); },
+  } as unknown as import('../../context/FlowContextDef').FlowContextType;
+  await act(async () => root.render(<FlowContext.Provider value={blueprintContext}><Sidebar /></FlowContext.Provider>));
+  await setInput('[aria-label="Search nodes"]', 'reusable');
+  assert(document.querySelectorAll('.subgraph-blueprint').length === 1, 'subgraphs are searchable in the node library');
+  assert(!document.body.textContent?.includes('No matching nodes'), 'blueprint matches count as node search results');
+  await click('[aria-label="Add subgraph Reusable segmentation"]');
+  assert(inserted[0] === 'subgraphs/blueprint-id', 'selecting a blueprint inserts a node instead of opening a workflow');
+  await click('[aria-label="Workflow Library"]');
+  assert(document.querySelectorAll('.saved-workflow').length === 1 && document.body.textContent?.includes('Complete workflow'), 'workflow library lists complete workflows only');
+  assert(!document.body.textContent?.includes('Reusable segmentation'), 'subgraphs are not mixed into the workflow library');
+  await click('[aria-label="Node Library"]'); await click('[aria-label="Clear node search"]');
   await act(async () => { root.render(<FlowContext.Provider value={{ ...context, isExecutionLocked: true }}><Sidebar /></FlowContext.Provider>); });
   const item = document.querySelector<HTMLButtonElement>('[aria-label="Add Image Reader"]')!;
   assert(item.disabled && !item.draggable, 'execution lock prevents both adding and dragging');
