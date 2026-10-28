@@ -24,9 +24,10 @@ import type {
   SubgraphGraph,
   InputDefinition,
 } from '../types';
-import { subgraphSpec } from './subgraphs.ts';
+import { subgraphSpec, normalizeGraph } from './subgraphs.ts';
 import { canConnectPorts, resolveNodeOutputTypes } from './portTypes.ts';
 import { nodeInputValues } from './nodeInputs.ts';
+import { GROUP_SPEC, isGroup } from './groups.ts';
 import {
   cloneWorkflowExecutionSettings,
   createWorkflowId,
@@ -80,6 +81,7 @@ export interface SerializedNode {
   position: { x: number; y: number };
   data: {
     opType: string;
+    group?: { width: number; height: number };
     values?: Record<string, unknown>;
     dimensions?: Record<string, number>;
     selected?: boolean;
@@ -109,6 +111,7 @@ export interface SerializedNodeForStorage {
   position: { x: number; y: number };
   data: {
     opType: string;
+    group?: { width: number; height: number };
     values?: Record<string, unknown>;
     dimensions?: Record<string, number>;
     selected?: boolean;
@@ -122,6 +125,14 @@ export interface SerializedNodeForStorage {
     boundary?: 'input' | 'output';
     subgraph?: SubgraphGraph;
   };
+}
+
+function parseGroup(value: unknown): NodeData['group'] {
+  if (value === undefined) return undefined;
+  const box = value as NodeData['group'];
+  if (!box || !Number.isFinite(box.width) || !Number.isFinite(box.height) || box.width < 240 || box.height < 160)
+    throw new Error('Invalid group dimensions.');
+  return { width: box.width, height: box.height };
 }
 
 function parseDisplayLabels(value: unknown): Record<string, string> | undefined {
@@ -167,6 +178,7 @@ export function stripRuntimeNodeData(node: Node<NodeData>): SerializedNode {
     position: { x: node.position.x, y: node.position.y },
     data: {
       opType: node.data.opType,
+      group: node.data.group,
       values: node.data.values,
       dimensions: node.data.dimensions as Record<string, number> | undefined,
       selected: node.selected,
@@ -279,9 +291,11 @@ export function hydrateNodeFromSpec(
   const opType = serialized.data?.opType;
   const subgraph = serialized.data?.subgraph;
   const boundary = serialized.data?.boundary;
-  const latestSpec = subgraph ? subgraphSpec(subgraph) : boundary ? { type: opType, display_name: serialized.data.title || 'Interface', category: 'Interface', input: { required: boundary === 'output' ? { value: [String(serialized.data.values?.portType || '*')] } : { ...(serialized.data.boundaryConfig ? { value: serialized.data.boundaryConfig } : {}) } }, output: boundary === 'input' ? [String(serialized.data.values?.portType || '*')] : [] } as NodeSpec : opType ? nodeDefs[opType] : undefined;
+  const group = serialized.data?.group;
+  const latestSpec = group ? GROUP_SPEC : subgraph ? subgraphSpec(subgraph) : boundary ? { type: opType, display_name: serialized.data.title || 'Interface', category: 'Interface', input: { required: boundary === 'output' ? { value: [String(serialized.data.values?.portType || '*')] } : { ...(serialized.data.boundaryConfig ? { value: serialized.data.boundaryConfig } : {}) } }, output: boundary === 'input' ? [String(serialized.data.values?.portType || '*')] : [] } as NodeSpec : opType ? nodeDefs[opType] : undefined;
 
   const baseData: NodeData = {
+    group,
     opType: opType ?? '',
     title: serialized.data.title,
     color: serialized.data.color,
@@ -316,7 +330,7 @@ export function hydrateNodeFromSpec(
 
   return {
     id: serialized.id,
-    type: serialized.type ?? 'dynamic',
+    type: group ? 'groupFrame' : serialized.type ?? 'dynamic',
     position: positionOverride ?? serialized.position,
     data: baseData,
     selected: serialized.data?.selected ?? false,
@@ -368,6 +382,7 @@ export function validateEdgesWithLatestSpecs(
     }
 
     if (sourceNode.data._invalid || targetNode.data._invalid) return true;
+    if (isGroup(sourceNode) || isGroup(targetNode)) return false;
     const sourceHandleIndex = parseInt(edge.sourceHandle || '0');
     const targetHandleName = edge.targetHandle;
 
@@ -419,7 +434,9 @@ export function hydrateFlowWithLatestSpecs(
 ): HydrationResult {
   const warnings: string[] = [];
 
-  const hydratedNodes = hydrateNodesWithLatestSpecs(flow.nodes, nodeDefs);
+  // Stored interface types are hints. Recompute from current plugin specs and
+  // nested defaults before validating external links, including older documents.
+  const hydratedNodes = normalizeGraph({ nodes: hydrateNodesWithLatestSpecs(flow.nodes, nodeDefs), edges: flow.edges }).nodes;
 
   const unavailable = (nodes: Node<NodeData>[]): string[] => nodes.flatMap(n => n.data.subgraph
     ? unavailable(n.data.subgraph.nodes) : n.data._invalid ? [n.data.opType] : []);
@@ -523,6 +540,7 @@ export function parseStoredFlow(raw: unknown, depth = 0): SerializedFlow | null 
       },
       data: {
         opType: String(nodeData?.opType ?? ''),
+        group: parseGroup(nodeData?.group),
         values: nodeData?.values as Record<string, unknown> | undefined,
         dimensions: nodeData?.dimensions as Record<string, number> | undefined,
         selected: Boolean(nodeData?.selected),

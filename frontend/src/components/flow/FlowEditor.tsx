@@ -1,5 +1,7 @@
 import { SubgraphNode, BoundaryNode, InterfacePlaceholder } from './SubgraphNode';
 import SelectionToolbar from './SelectionToolbar';
+import GroupNode from './GroupNode';
+import { createGroup, expandGroupDrag, groupDragSnapshot, isGroup, type GroupDrag } from '../../utils/groups';
 import { useState, useCallback, useEffect, useRef, type ComponentType } from 'react';
 import { ReactFlow, Background, MiniMap, Panel, useReactFlow, useNodesInitialized, BackgroundVariant,
   ConnectionMode, SelectionMode, type Node, type NodeProps, type NodeTypes } from '@xyflow/react';
@@ -12,14 +14,15 @@ import CanvasToolbar from './CanvasToolbar';
 import type { NodeData } from '../../types';
 import { NEW_SUBGRAPH_INPUT, NEW_SUBGRAPH_OUTPUT, isInterfacePlaceholder } from '../../utils/subgraphs';
 
-const nodeTypes: NodeTypes = { dynamic: DynamicNode as ComponentType<NodeProps<Node<NodeData>>>, subgraph: SubgraphNode, boundary: BoundaryNode, interfacePlaceholder: InterfacePlaceholder };
+const nodeTypes: NodeTypes = { dynamic: DynamicNode as ComponentType<NodeProps<Node<NodeData>>>, subgraph: SubgraphNode, boundary: BoundaryNode, interfacePlaceholder: InterfacePlaceholder, groupFrame: GroupNode };
 
 export default function FlowEditor() {
-  const { nodes, edges, onNodesChange, onEdgesChange, onConnect, theme, addNodeAt, isValidConnection,
+  const { nodes, edges, editGraph, onNodesChange, onEdgesChange, onConnect, theme, addNodeAt, isValidConnection,
     onConnectStart, onConnectEnd, isExecutionLocked, isRecoveryGraphReadOnly, recoveredGraphView, activeWorkflowDocumentId, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph, activeWorkflow, openLibraryItem } = useFlow();
   const { screenToFlowPosition, fitView } = useReactFlow();
   const nodesInitialized = useNodesInitialized();
   const fittedDocumentRef = useRef<string | null>(null);
+  const groupDrag = useRef<GroupDrag | null>(null);
   const [mode, setMode] = useState<'pan' | 'select'>('pan');
   const [showMap, setShowMap] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; flowPos: { x: number; y: number } } | null>(null);
@@ -42,7 +45,7 @@ export default function FlowEditor() {
   // These two affordances exist only in the canvas. They never enter saved or executable graphs.
   const placeholders: Node<NodeData>[] = subgraphPath.length ? (['input', 'output'] as const).map(kind => {
     const boundaries = nodes.filter(n => n.data.boundary === kind);
-    const ordinary = nodes.filter(n => !n.data.boundary);
+    const ordinary = nodes.filter(n => !n.data.boundary && !isGroup(n));
     const x = boundaries[0]?.position.x ?? (kind === 'input' ? Math.min(280, ...ordinary.map(n => n.position.x)) - 280 : Math.max(620, ...ordinary.map(n => n.position.x + (n.measured?.width || 330))) + 100);
     const y = boundaries.length ? Math.max(...boundaries.map(n => n.position.y + (n.measured?.height || 100))) + 50 : 100;
     return { id: kind === 'input' ? NEW_SUBGRAPH_INPUT : NEW_SUBGRAPH_OUTPUT, type: 'interfacePlaceholder', position: { x, y },
@@ -66,7 +69,14 @@ export default function FlowEditor() {
       <div><span><MousePointer2 size={13} />Right-click to add nodes</span><MoveRight size={14} /><span>Connect & run</span></div>
     </div>}
     {isRecoveryGraphReadOnly && recoveredGraphView && <div className="canvas-recovery-note"><strong>Recovery graph · Read only</strong><span>Nodes can move; parameters and connections are locked.</span><code title={recoveredGraphView.recoveryDirectory}>{recoveredGraphView.recoveryDirectory}</code></div>}
-    <ReactFlow nodes={[...nodes, ...placeholders]} edges={edges} onNodesChange={changes => onNodesChange(changes.filter(change => !('id' in change) || !isInterfacePlaceholder(change.id)))} onEdgesChange={onEdgesChange}
+    <ReactFlow nodes={[...nodes.map(n => isGroup(n) ? { ...n, dragHandle: '.group-frame__title', connectable: false,
+      zIndex: -10 - Math.ceil(Math.log2(n.data.group!.width * n.data.group!.height)),
+      style: { ...n.style, width: n.data.group!.width, height: n.data.group!.height } } : n), ...placeholders]} edges={edges}
+      onNodesChange={changes => onNodesChange(expandGroupDrag(changes.filter(change => !('id' in change) || !isInterfacePlaceholder(change.id)), groupDrag.current))} onEdgesChange={onEdgesChange}
+      onNodeDragStart={(event, node) => { groupDrag.current = groupDragSnapshot(nodes, node.id, event.altKey); }}
+      onNodeDragStop={() => { groupDrag.current = null; }}
+      onSelectionDragStart={(event, selected) => { groupDrag.current = groupDragSnapshot(nodes, selected[0]?.id || '', event.altKey); }}
+      onSelectionDragStop={() => { groupDrag.current = null; }}
       onConnect={onConnect} onConnectStart={onConnectStart} onConnectEnd={onConnectEnd} nodeTypes={nodeTypes}
       defaultEdgeOptions={{ type: 'default', animated: false, style: { strokeWidth: 1.5, stroke: 'var(--color-edge)' } }}
       connectionMode={ConnectionMode.Loose} defaultViewport={{ x: 0, y: 0, zoom: 1 }} isValidConnection={isValidConnection}
@@ -83,7 +93,9 @@ export default function FlowEditor() {
       <Panel position="bottom-left" className="canvas-hint">{mode === 'pan' ? 'Drag to pan' : 'Drag to select'}<span>·</span>Scroll to zoom<span>·</span>Space to pan</Panel>
       <Panel position="bottom-right" className="canvas-tools-panel"><CanvasToolbar mode={mode} setMode={setMode} showMap={showMap} toggleMap={() => setShowMap(current => !current)} /></Panel>
     </ReactFlow>
-    {menu && <ContextMenu top={menu.y} left={menu.x} onClose={() => setMenu(null)} onAddNode={type => {
+    {menu && <ContextMenu top={menu.y} left={menu.x} onClose={() => setMenu(null)} onAddGroup={() => {
+      if (!isExecutionLocked) editGraph(graph => ({ ...graph, nodes: createGroup(graph.nodes, menu.flowPos) }));
+    }} onAddNode={type => {
       if (!isExecutionLocked) addNodeAt(type, menu.flowPos);
     }} />}
   </div>;

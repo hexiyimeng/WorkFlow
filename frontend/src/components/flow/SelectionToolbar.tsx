@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { NodeToolbar, Position, getNodesBounds, useViewport } from '@xyflow/react';
-import { Trash2, Info, Palette, Boxes, LogIn, Ungroup, SkipForward, Save, Pencil, Plug, Unplug } from 'lucide-react';
+import { Trash2, Info, Palette, Boxes, LogIn, Ungroup, SkipForward, Save, Pencil, Plug, Unplug, Group, Scan, MousePointer2 } from 'lucide-react';
+import { createGroup, fitGroup, groupContents, isGroup } from '../../utils/groups';
 import { useFlow } from '../../hooks/useFlowContext';
 import { bypassMapping, convertSelection, unpackSubgraph, exposePort, removeBoundary } from '../../utils/subgraphs';
 import NodeColorPicker from '../nodes/NodeColorPicker';
@@ -21,6 +22,15 @@ export default function SelectionToolbar() {
       <button aria-label="Delete selected nodes" title="删除所选节点" disabled={isExecutionLocked || !editable.length} onClick={handleDelete}><Trash2 size={16} /></button>
       <button aria-label="Node information" title="节点详情 · 参数 / 信息 / 设置" onClick={openNodeInspector}><Info size={16} /></button>
       <button aria-label="Node color" title="节点颜色" disabled={isExecutionLocked} onClick={() => setShowColors(value => !value)}><Palette size={16} /></button>
+      <button aria-label="Create group" title="为选区创建组（只整理布局）" disabled={isExecutionLocked}
+        onClick={() => editGraph(graph => ({ ...graph, nodes: createGroup(graph.nodes) }))}><Group size={16} /></button>
+      {single && isGroup(single) && <>
+        <button aria-label="Fit group to contents" title="组框适应内部节点" disabled={isExecutionLocked} onClick={() => editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => n.id === single.id ? fitGroup(n, graph.nodes) : n) }))}><Scan size={16} /></button>
+        <button aria-label="Select group contents" title="选择组内节点" onClick={() => editGraph(graph => {
+          const ids = new Set(groupContents(single, graph.nodes).map(n => n.id));
+          return { ...graph, nodes: graph.nodes.map(n => ({ ...n, selected: ids.has(n.id) })) };
+        })}><MousePointer2 size={16} /></button>
+      </>}
       {single && !single.data.boundary && <button aria-label="Rename node" title="重命名节点" disabled={isExecutionLocked}
         onClick={() => { const name = prompt('节点名称', single.data.title || single.data.nodeSpec.display_name); if (name?.trim()) updateNodeData(single.id, { title: name.trim() }); }}><Pencil size={16} /></button>}
       {single?.data.subgraph ? <>
@@ -29,7 +39,7 @@ export default function SelectionToolbar() {
         <button aria-label="Save subgraph to library" title="保存为可复用节点（Blueprint）" disabled={isExecutionLocked} onClick={() => saveSubgraphToLibrary(single)}><Save size={16} /></button>
       </> : <button aria-label="Convert selection to subgraph" title="将选区转化为子图（支持单个节点）" disabled={isExecutionLocked || !editable.length || editable.length !== selected.length}
         onClick={() => action(() => editGraph(graph => convertSelection(graph, single ? single.data.title || single.data.nodeSpec.display_name : '新子图')))}><Boxes size={16} /></button>}
-      {subgraphPath.length > 0 && single && !single.data.boundary && <button aria-label="Expose subgraph ports" title="公开输入 / 输出到父图" disabled={isExecutionLocked} onClick={() => setShowPorts(value => !value)}><Plug size={16} /></button>}
+      {subgraphPath.length > 0 && single && !single.data.boundary && !isGroup(single) && <button aria-label="Expose subgraph ports" title="公开输入 / 输出到父图" disabled={isExecutionLocked} onClick={() => setShowPorts(value => !value)}><Plug size={16} /></button>}
       {single?.data.boundary && subgraphPath.length > 0 && <button aria-label="Remove subgraph port" title="移除接口及外部连线" disabled={isExecutionLocked}
         onClick={() => editGraph(graph => removeBoundary(graph, single.id))}><Unplug size={16} /></button>}
       {showPorts && single && <div className="node-port-menu">

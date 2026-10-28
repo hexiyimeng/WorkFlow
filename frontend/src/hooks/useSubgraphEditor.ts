@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { Edge, Node } from '@xyflow/react';
 import type { NodeData } from '../types';
-import { graphAtPath, updateGraphAtPath, type Graph } from '../utils/subgraphs';
+import { graphAtPath, updateGraphAtPath, normalizeGraph, type Graph } from '../utils/subgraphs';
 
 export function useSubgraphEditor(root: Graph, setRoot: Dispatch<SetStateAction<Graph>>) {
   const [path, setPath] = useState<string[]>([]);
@@ -24,16 +24,16 @@ export function useSubgraphEditor(root: Graph, setRoot: Dispatch<SetStateAction<
   const editGraph = useCallback((change: (graph: Graph) => Graph) => {
     // Validate before entering a React updater so a rejected operation can be
     // reported by the toolbar without throwing during React rendering.
-    const next = updateGraphAtPath(root, validPath, change);
+    const next = normalizeGraph(updateGraphAtPath(root, validPath, change), root);
     setRoot(next);
   }, [root, validPath, setRoot]);
   const setNodes = useCallback<Dispatch<SetStateAction<Node<NodeData>[]>>>(action => {
-    setRoot(previous => updateGraphAtPath(previous, validPath,
-      current => ({ ...current, nodes: typeof action === 'function' ? action(current.nodes) : action })));
+    setRoot(previous => normalizeGraph(updateGraphAtPath(previous, validPath,
+      current => ({ ...current, nodes: typeof action === 'function' ? action(current.nodes) : action })), previous));
   }, [validPath, setRoot]);
   const setEdges = useCallback<Dispatch<SetStateAction<Edge[]>>>(action => {
-    setRoot(previous => updateGraphAtPath(previous, validPath,
-      current => ({ ...current, edges: typeof action === 'function' ? action(current.edges) : action })));
+    setRoot(previous => normalizeGraph(updateGraphAtPath(previous, validPath,
+      current => ({ ...current, edges: typeof action === 'function' ? action(current.edges) : action })), previous));
   }, [validPath, setRoot]);
   const breadcrumbs = validPath.map((id, index) => {
     const parent = graphAtPath(root, validPath.slice(0, index));

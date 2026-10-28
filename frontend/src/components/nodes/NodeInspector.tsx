@@ -11,6 +11,7 @@ import { inputMeta, isInputVisible } from '../../utils/inputVisibility';
 import { NodeParameter } from './NodeParameter';
 import NodeColorPicker from './NodeColorPicker';
 import './inspector.css';
+import { isGroup, groupContents, fitGroup } from '../../utils/groups';
 
 function EditableLabel({ value, label, disabled, onChange }: { value: string; label: string; disabled: boolean; onChange: (name: string) => void }) {
   return <input key={value} className="inspector-name" aria-label={label} title="修改显示名称，参数标识保持不变" defaultValue={value} disabled={disabled}
@@ -81,11 +82,15 @@ export default function NodeInspector() {
         {locked && <p className="inspector-note">当前为只读，可查看本次配置。</p>}
         {tab === 'parameters' && (!node ? <p className="inspector-empty">选择一个节点以编辑参数。可在设置中批量调整颜色。</p> : <>
           <input className="inspector-search" type="search" aria-label="搜索节点参数" placeholder="搜索参数或接口…" value={search} onChange={e => setSearch(e.target.value)} />
-          {sub ? <>
+          {isGroup(node) ? <>
+            <p className="inspector-note">组只整理画布，不改变依赖和任务执行。拖动标题移动组内节点，按住 Alt 仅移动框。删除组会保留内部节点。</p>
+            <p>{groupContents(node, nodes).filter(n => !isGroup(n)).length} 个成员 · {Math.round(node.data.group!.width)} × {Math.round(node.data.group!.height)}</p>
+            <button className="inspector-enter" disabled={locked} onClick={() => editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => n.id === node.id ? fitGroup(n, graph.nodes) : n) }))}>组框适应内部节点</button>
+          </> : sub ? <>
             <button className="inspector-enter" onClick={() => enterSubgraph(node.id)}><LogIn size={15} />进入子图</button>
             <h3>输入</h3>{sub.inputs.length ? sub.inputs.map((p, i) => portEditor(p, 'input', i, sub.inputs.length)) : <p className="inspector-note">进入子图，将“新增输入”的圆点连接到内部参数。</p>}
             <h3>输出</h3>{sub.outputs.map((p, i) => portEditor(p, 'output', i, sub.outputs.length))}
-            <details className="inspector-advanced"><summary>高级参数 · 内部节点</summary>{sub.nodes.filter(n => !n.data.boundary && matches(`${n.data.title || n.data.nodeSpec.display_name} ${Object.keys({ ...n.data.nodeSpec.input.required, ...n.data.nodeSpec.input.optional }).join(' ')}`)).map(child => <details key={child.id}><summary>{child.data.title || child.data.nodeSpec.display_name}</summary><InputFields node={child} edges={sub.edges} path={[node.id]} promote /></details>)}</details>
+            <details className="inspector-advanced"><summary>高级参数 · 内部节点</summary>{sub.nodes.filter(n => !n.data.boundary && !isGroup(n) && matches(`${n.data.title || n.data.nodeSpec.display_name} ${Object.keys({ ...n.data.nodeSpec.input.required, ...n.data.nodeSpec.input.optional }).join(' ')}`)).map(child => <details key={child.id}><summary>{child.data.title || child.data.nodeSpec.display_name}</summary><InputFields node={child} edges={sub.edges} path={[node.id]} promote /></details>)}</details>
           </> : <>
             <h3>{node.data.boundary ? '子图接口' : '输入'}</h3>
             {node.data.boundary && <FieldName value={node.data.title || '接口'} label="接口名称" />}
@@ -105,9 +110,9 @@ export default function NodeInspector() {
             ? <FieldName value={node.data.title || node.data.nodeSpec.display_name} label="接口名称" />
             : <EditableLabel value={node.data.title || node.data.nodeSpec.display_name} label="节点名称" disabled={locked} onChange={title => updateNodeData(node.id, { title })} />}</>}
           <h3>节点颜色</h3><NodeColorPicker color={node?.data.color} disabled={locked} onChange={color => editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => n.selected ? { ...n, data: { ...n.data, color } } : n) }))} />
-          {node && !sub && !node.data.boundary && <label className="inspector-checkbox"><input type="checkbox" checked={!!node.data.showAdvanced} disabled={locked} onChange={event => updateNodeData(node.id, { showAdvanced: event.target.checked })} />显示高级输入</label>}
-          {node && !node.data.boundary && <label className="inspector-checkbox"><input type="checkbox" checked={!!node.data.bypassed} disabled={locked || !bypassMapping(node)} onChange={event => updateNodeData(node.id, { bypassed: event.target.checked })} />忽略节点（Bypass）</label>}
-          {node && !bypassMapping(node) && !node.data.boundary && <p className="inspector-note">只有具备明确输入输出对应关系的节点支持忽略。</p>}
+          {node && !sub && !node.data.boundary && !isGroup(node) && <label className="inspector-checkbox"><input type="checkbox" checked={!!node.data.showAdvanced} disabled={locked} onChange={event => updateNodeData(node.id, { showAdvanced: event.target.checked })} />显示高级输入</label>}
+          {node && !node.data.boundary && !isGroup(node) && <label className="inspector-checkbox"><input type="checkbox" checked={!!node.data.bypassed} disabled={locked || !bypassMapping(node)} onChange={event => updateNodeData(node.id, { bypassed: event.target.checked })} />忽略节点（Bypass）</label>}
+          {node && !bypassMapping(node) && !node.data.boundary && !isGroup(node) && <p className="inspector-note">只有具备明确输入输出对应关系的节点支持忽略。</p>}
         </>}
       </>}
     </div>

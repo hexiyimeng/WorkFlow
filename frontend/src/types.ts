@@ -405,6 +405,8 @@ export interface ReloadNodesResponse {
 }
 
 export interface NodeData extends Record<string, unknown> {
+  /** Visual frame only; never becomes an execution task. */
+  group?: { width: number; height: number };
   opType: string;
   nodeSpec: NodeSpec;
   values: Record<string, unknown>;

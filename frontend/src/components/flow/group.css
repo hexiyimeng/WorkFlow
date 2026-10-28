@@ -1,0 +1,7 @@
+.react-flow__node-groupFrame { pointer-events: none !important; }
+.group-frame { width: 100%; height: 100%; border: 2px solid var(--group-color); border-radius: 10px; background: color-mix(in srgb, var(--group-color) 7%, transparent); }
+.group-frame__title { pointer-events: auto; cursor: grab; display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 14px; color: var(--color-text-primary); background: color-mix(in srgb, var(--group-color) 26%, var(--color-bg-surface)); border-radius: 8px 8px 0 0; user-select: none; }
+.group-frame__title strong { font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-frame__title span { margin-left: auto; font-size: 12px; opacity: .7; }
+.react-flow__node-groupFrame.selected .group-frame { outline: 2px solid var(--color-accent); outline-offset: 3px; }
+.group-frame .react-flow__resize-control { pointer-events: auto; }

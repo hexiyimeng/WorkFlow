@@ -161,9 +161,10 @@ interface ContextMenuProps {
   left: number;
   onClose: () => void;
   onAddNode: (type: string) => void;
+  onAddGroup?: () => void;
 }
 
-export default function ContextMenu({ top, left, onClose, onAddNode }: ContextMenuProps) {
+export default function ContextMenu({ top, left, onClose, onAddNode, onAddGroup }: ContextMenuProps) {
   const { nodeDefs } = useFlow();
   const [search, setSearch] = useState('');
 
@@ -273,6 +274,7 @@ export default function ContextMenu({ top, left, onClose, onAddNode }: ContextMe
         onClick={e => e.stopPropagation()}
         onContextMenu={e => e.stopPropagation()}
       >
+        {onAddGroup && <button className="px-4 py-3 text-left hover:bg-[var(--color-bg-hover)]" onClick={() => { onAddGroup(); onClose(); }}>创建组 · Group</button>}
         {/* Search header */}
         <div
           style={{

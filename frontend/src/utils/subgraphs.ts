@@ -3,6 +3,7 @@ import type { NodeData, NodeSpec, SubgraphGraph } from '../types';
 import { resolveNodeOutputTypes, canConnectPorts } from './portTypes.ts';
 import { visibleNodeInputNames } from './inputVisibility.ts';
 import { inputPortType, isWidgetInput, nodeInputValue, nodeInputValues, validInputLiteral, withNodeInputValue } from './nodeInputs.ts';
+import { isGroup, selectionWithContents } from './groups.ts';
 
 export type Graph = { nodes: Node<NodeData>[]; edges: Edge[] };
 export const newNodeId = () => `node-${crypto.randomUUID()}`;
@@ -34,12 +35,16 @@ export function graphAtPath(root: Graph, path: string[]): Graph {
 }
 
 export function updateGraphAtPath(root: Graph, path: string[], change: (graph: Graph) => Graph): Graph {
+  return normalizeGraph(updateAtPath(root, path, change));
+}
+
+function updateAtPath(root: Graph, path: string[], change: (graph: Graph) => Graph): Graph {
   if (!path.length) return change(root);
   const [id, ...rest] = path;
   let edges = root.edges;
   const nodes = root.nodes.map(node => {
     if (node.id !== id || !node.data.subgraph) return node;
-    const inner = updateGraphAtPath(node.data.subgraph, rest, change);
+    const inner = updateAtPath(node.data.subgraph, rest, change);
     const subgraph = refreshInterface({ ...node.data.subgraph, ...inner });
     edges = edges.flatMap(edge => {
       if (edge.target === id && !subgraph.inputs.some(p => p.id === edge.targetHandle)) return [];
@@ -55,7 +60,7 @@ export function updateGraphAtPath(root: Graph, path: string[], change: (graph: G
   return { ...root, nodes, edges };
 }
 
-function refreshInterface(subgraph: SubgraphGraph): SubgraphGraph {
+function refreshInterface(subgraph: SubgraphGraph, effective: Graph = subgraph): SubgraphGraph {
   const collect = (kind: 'input' | 'output') => {
     const previous = kind === 'input' ? subgraph.inputs : subgraph.outputs;
     const existing = previous.filter(p => subgraph.nodes.some(n => n.id === p.nodeId && n.data.boundary === kind));
@@ -68,9 +73,9 @@ function refreshInterface(subgraph: SubgraphGraph): SubgraphGraph {
     name: subgraph.nodes.find(n => n.id === port.nodeId)?.data.title || port.name }));
   const outputs = collect('output').map(port => {
     const edge = subgraph.edges.find(e => e.target === port.nodeId);
-    const source = subgraph.nodes.find(n => n.id === edge?.source);
+    const source = effective.nodes.find(n => n.id === edge?.source);
     return { ...port, name: subgraph.nodes.find(n => n.id === port.nodeId)?.data.title || port.name,
-      type: source ? resolveNodeOutputTypes(source.data.nodeSpec, nodeInputValues(source, subgraph))[Number(edge?.sourceHandle || 0)] || port.type : port.type };
+      type: source ? resolveNodeOutputTypes(source.data.nodeSpec, nodeInputValues(source, effective))[Number(edge?.sourceHandle || 0)] || port.type : port.type };
   });
   const nodes = subgraph.nodes.map(node => {
     const port = outputs.find(p => p.nodeId === node.id);
@@ -78,6 +83,43 @@ function refreshInterface(subgraph: SubgraphGraph): SubgraphGraph {
       nodeSpec: { ...node.data.nodeSpec, input: { required: { value: [port.type] as [string] } } } } } : node;
   });
   return { ...subgraph, nodes, inputs, outputs };
+}
+
+/** Refresh interfaces from effective defaults, including defaults crossing nested boundaries.
+ * Keep local fallback values intact. Only an actual visibility transition removes a link;
+ * title/colour/layout edits must never silently change dependencies.
+ */
+export function normalizeGraph(graph: Graph, previous?: Graph,
+  overrides: Record<string, unknown> = {}, previousOverrides: Record<string, unknown> = {}, depth = 0): Graph {
+  if (depth > 32) throw new Error('Subgraph nesting exceeds 32 levels.');
+  const effective = (current: Graph, values: Record<string, unknown>): Graph => ({ ...current,
+    nodes: current.nodes.map(n => n.data.boundary === 'input' && Object.hasOwn(values, n.id)
+      ? { ...n, data: { ...n.data, values: { ...n.data.values, value: values[n.id] } } } : n) });
+  const view = effective(graph, overrides);
+  const oldView = previous && effective(previous, previousOverrides);
+  const childOverrides = (node: Node<NodeData>, current: Graph) => {
+    const values = nodeInputValues(node, current);
+    return Object.fromEntries(node.data.subgraph!.inputs.filter(p => Object.hasOwn(values, p.id))
+      .map(p => [p.nodeId, values[p.id]]));
+  };
+  const nodes = graph.nodes.map(node => {
+    const sub = node.data.subgraph;
+    if (!sub) return node;
+    const old = oldView?.nodes.find(n => n.id === node.id);
+    const inherited = childOverrides(node, view);
+    const inner = normalizeGraph(sub, old?.data.subgraph, inherited,
+      old?.data.subgraph && oldView ? childOverrides(old, oldView) : {}, depth + 1);
+    const refreshed = refreshInterface({ ...sub, ...inner }, effective(inner, inherited));
+    return { ...node, data: { ...node.data, subgraph: refreshed, nodeSpec: subgraphSpec(refreshed) } };
+  });
+  const edges = graph.edges.filter(edge => {
+    if (!oldView || !edge.targetHandle) return true;
+    const node = view.nodes.find(n => n.id === edge.target), old = oldView.nodes.find(n => n.id === edge.target);
+    if (!node || !old || node.data.boundary || node.data.subgraph || isGroup(node)) return true;
+    return !visibleNodeInputNames(old.data.nodeSpec, nodeInputValues(old, oldView)).has(edge.targetHandle)
+      || visibleNodeInputNames(node.data.nodeSpec, nodeInputValues(node, view)).has(edge.targetHandle);
+  });
+  return { ...graph, nodes, edges };
 }
 
 export function exposePort(graph: Graph, nodeId: string, kind: 'input' | 'output', handle: string): Graph {
@@ -137,7 +179,7 @@ export function mapGraphNodes(nodes: Node<NodeData>[], change: (node: Node<NodeD
     let next = change(node.data.subgraph ? { ...node, data: { ...node.data,
       subgraph: { ...node.data.subgraph, nodes: mapGraphNodes(node.data.subgraph.nodes, change) } } } : node);
     if (next.data.subgraph) {
-      const states = next.data.subgraph.nodes.filter(n => !n.data.boundary).map(n => n.data.runState);
+      const states = next.data.subgraph.nodes.filter(n => !n.data.boundary && !isGroup(n)).map(n => n.data.runState);
       const state = states.includes('failed') ? 'failed' : states.includes('running') ? 'running' : states.includes('submitted') ? 'submitted'
         : states.length && states.every(s => s === 'done') ? 'done' : states.includes('cancelled') ? 'cancelled' : undefined;
       next = { ...next, data: { ...next.data, runState: state } };
@@ -147,8 +189,8 @@ export function mapGraphNodes(nodes: Node<NodeData>[], change: (node: Node<NodeD
 }
 
 export function convertSelection(graph: Graph, title: string): Graph {
-  const selected = graph.nodes.filter(n => n.selected && !n.data.boundary);
-  if (!selected.length) throw new Error('Select at least one ordinary node or subgraph.');
+  const selected = selectionWithContents(graph.nodes).filter(n => !n.data.boundary);
+  if (!selected.some(n => !isGroup(n))) throw new Error('请选择至少一个处理节点或子图。');
   const ids = new Set(selected.map(n => n.id));
   const id = newNodeId();
   const left = Math.min(...selected.map(n => n.position.x));
@@ -159,6 +201,7 @@ export function convertSelection(graph: Graph, title: string): Graph {
   const inputForTarget = new Map<string, string>();
   const outputForSource = new Map<string, number>();
   for (const node of selected) {
+    if (isGroup(node)) continue;
     const visible = visibleNodeInputNames(node.data.nodeSpec, nodeInputValues(node, graph));
     for (const [name, config] of Object.entries({ ...node.data.nodeSpec.input.required, ...node.data.nodeSpec.input.optional })) {
       const incoming = graph.edges.find(e => e.target === node.id && e.targetHandle === name);
@@ -212,6 +255,7 @@ function expand(graph: Graph, depth = 0): Graph {
   let nodes: Node<NodeData>[] = [];
   const edges = [...graph.edges];
   for (const node of graph.nodes) {
+    if (isGroup(node)) continue;
     if (!node.data.subgraph) { nodes.push(node); continue; }
     const sub = node.data.subgraph;
     const inner = expand(sub, depth + 1);
@@ -355,7 +399,7 @@ export function unpackSubgraph(graph: Graph, id: string): Graph {
 }
 
 export function bypassMapping(node: Node<NodeData>): Record<string, string> | null {
-  if (node.data.subgraph || node.data.boundary || node.data.nodeSpec.output_node) return null;
+  if (isGroup(node) || node.data.subgraph || node.data.boundary || node.data.nodeSpec.output_node) return null;
   // Rechunk is the only built-in shape-preserving identity bypass. Algorithms
   // can explicitly opt in through NodeSpec; matching array types alone is unsafe.
   const explicit = node.data.nodeSpec.bypassMapping;

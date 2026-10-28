@@ -21,7 +21,6 @@ import { useFlowEngine } from '../hooks/useFlowEngine';
 import { useWorkflows } from '../hooks/useWorkflows';
 import { useWorkflowExecutionSettingsStore } from '../hooks/useWorkflowExecutionSettingsStore';
 import { canConnectPorts, resolveNodeOutputTypes } from '../utils/portTypes';
-import { visibleNodeInputNames } from '../utils/inputVisibility';
 import {
   blocksExecutionChanges,
   filterLockedEdgeChanges,
@@ -221,7 +220,11 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const permittedChanges = isExecutionLocked
       ? filterLockedNodeChanges(changes)
       : changes;
-    if (permittedChanges.length > 0) setNodes(previous => applyNodes(permittedChanges.filter(change => change.type !== 'remove' || !previous.find(n => n.id === change.id)?.data.boundary), previous));
+    if (permittedChanges.length > 0) setNodes(previous => applyNodes(permittedChanges.filter(change => change.type !== 'remove' || !previous.find(n => n.id === change.id)?.data.boundary), previous).map(node => {
+      const size = permittedChanges.find(c => c.type === 'dimensions' && c.id === node.id && c.resizing);
+      return node.data.group && size?.type === 'dimensions' && size.dimensions
+        ? { ...node, data: { ...node.data, group: { ...size.dimensions } } } : node;
+    }));
   }, [setNodes, isExecutionLocked]);
 
   const onEdgesChange = useCallback<OnEdgesChange<Edge>>((changes) => {
@@ -660,18 +663,8 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const updateNodeData = useCallback((id: string, newData: Partial<NodeData>) => {
     if (isExecutionLocked) return;
-    const targetNode = nodes.find(n => n.id === id);
-    if (targetNode) {
-      const nextData = { ...targetNode.data, ...newData };
-      const visibleInputs = visibleNodeInputNames(nextData.nodeSpec, nextData.values ?? {});
-      setEdges(eds => eds.filter(edge => (
-        edge.target !== id
-        || !edge.targetHandle
-        || visibleInputs.has(edge.targetHandle)
-      )));
-    }
-    setNodes(nds => nds.map(n => n.id === id ? { ...n, data: { ...n.data, ...newData } } : n));
-  }, [isExecutionLocked, nodes, setEdges, setNodes]);
+    editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => n.id === id ? { ...n, data: { ...n.data, ...newData } } : n) }));
+  }, [isExecutionLocked, editGraph]);
 
   // ===========================================
   // 10. Editor and execution services exposed to the UI

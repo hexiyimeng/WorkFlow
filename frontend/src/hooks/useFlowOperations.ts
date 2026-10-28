@@ -4,6 +4,7 @@ import type { Node, Edge } from '@xyflow/react';
 import type { NodeData, LogEntry, NodeSpec } from '../types';
 import { stripRuntimeNodeData, hydrateNodeFromSpec } from '../utils/workflowPersistence';
 import { cloneGraphIds } from '../utils/subgraphs';
+import { selectionWithContents } from '../utils/groups';
 import type { SerializedNode } from '../utils/workflowPersistence';
 
 export const useFlowOperations = (
@@ -22,7 +23,7 @@ export const useFlowOperations = (
   // === Copy ===
   const handleCopy = useCallback(() => {
     if (isExecutionLocked) return;
-    const selectedNodes = nodes.filter(n => n.selected && !n.data.boundary);
+    const selectedNodes = selectionWithContents(nodes).filter(n => !n.data.boundary);
     if (selectedNodes.length === 0) return;
     const selectedIds = new Set(selectedNodes.map(n => n.id));
     const selectedEdges = edges.filter(e => selectedIds.has(e.source) && selectedIds.has(e.target));
@@ -53,8 +54,8 @@ export const useFlowOperations = (
     // Remap node ids before hydrating so pasted nodes get fresh ids
     cpNodes.forEach(n => {
       const newId = idMap.get(n.id)!;
-      const offsetX = 30 + Math.random() * 20;
-      const offsetY = 30 + Math.random() * 20;
+      const offsetX = 40;
+      const offsetY = 40;
       const remappedNode = { ...n, id: newId };
       const hydrated = hydrateNodeFromSpec(remappedNode, nodeDefs, {
         x: n.position.x + offsetX,

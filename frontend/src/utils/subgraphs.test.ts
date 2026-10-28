@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { Node } from '@xyflow/react';
 import type { NodeData, NodeSpec } from '../types';
-import { cloneGraphIds, convertSelection, editSubgraphPort, exposePort, flattenGraph, graphAtPath, unpackSubgraph, updateGraphAtPath, type Graph } from './subgraphs.ts';
+import { cloneGraphIds, convertSelection, editSubgraphPort, exposePort, flattenGraph, graphAtPath, unpackSubgraph, updateGraphAtPath, normalizeGraph, type Graph } from './subgraphs.ts';
 import { nodeInputValue, nodeInputValues, withNodeInputValue } from './nodeInputs.ts';
 import { compileWorkflow } from './compileWorkflow.ts';
 import { documentFingerprint } from './libraryApi.ts';
@@ -144,3 +144,33 @@ assert.throws(() => compileWorkflow(editSubgraphPort(changedPromoted, wrapperId,
 assert.throws(() => parseStoredFlow({ nodes: [{ id: 'bad', data: { inputLabels: { value: 3 } } }], edges: [] }), /display label/);
 assert.throws(() => parseStoredFlow({ nodes: [{ id: 'bad', data: { boundaryConfig: [3] } }], edges: [] }), /parameter definition/);
 console.log('scalar slots, promoted defaults, enum validation, nested values, interface editing and persistence tests passed');
+
+const inlineDtype = normalizeGraph({ ...dtypePromoted, nodes: dtypePromoted.nodes.map(n => n.id === dtypeId ? withNodeInputValue(n, dtypePort.id, 'uint16') : n) }, dtypePromoted);
+assert.equal(inlineDtype.nodes.find(n => n.id === dtypeId)!.data.nodeSpec.output[0], 'DASK_ARRAY[uint16]', 'inline edits also refresh interface types');
+const dtypeNested = convertSelection({ ...dtypePromoted, nodes: dtypePromoted.nodes.map(n => ({ ...n, selected: n.id === dtypeId })) }, 'Outer dtype');
+const dtypeOuter = dtypeNested.nodes.find(n => n.data.subgraph)!;
+const dtypeNestedExposed = updateGraphAtPath(dtypeNested, [dtypeOuter.id], g => exposePort(g, dtypeId, 'input', dtypePort.id));
+const dtypeOuterPort = dtypeNestedExposed.nodes.find(n => n.id === dtypeOuter.id)!.data.subgraph!.inputs.find(p => p.config)!;
+const dtypeNestedChanged = editSubgraphPort(dtypeNestedExposed, dtypeOuter.id, 'input', dtypeOuterPort.id, { value: 'uint16' });
+assert.equal(dtypeNestedChanged.nodes.find(n => n.id === dtypeOuter.id)!.data.nodeSpec.output[0], 'DASK_ARRAY[uint16]', 'types follow defaults through two boundary levels');
+assert.equal(compileWorkflow(dtypeNestedChanged).process.inputs.target_dtype, 'uint16');
+assert.equal(nodeInputValue(graphAtPath(dtypeNestedChanged, [dtypeOuter.id]).nodes.find(n => n.id === dtypeId)!, dtypePort.id), 'float32', 'contextual inference must not overwrite the nested fallback');
+const staleDocument = serializeFlowForStorage(dtypeNestedChanged.nodes, dtypeNestedChanged.edges);
+staleDocument.nodes.find(n => n.id === dtypeOuter.id)!.data.subgraph!.outputs[0].type = 'DASK_ARRAY[float32]';
+const freshTypes = hydrateFlowWithLatestSpecs(staleDocument, { ...definitions, DaskTypeCast: dtypeSpec });
+assert.equal(freshTypes.nodes.find(n => n.id === dtypeOuter.id)!.data.nodeSpec.output[0], 'DASK_ARRAY[uint16]', 'loading recomputes outdated interface type metadata');
+
+const conditionalSpec: NodeSpec = { ...paramSpec, input: { required: { mode: [['explicit', 'match'], { default: 'explicit' }] },
+  optional: { reference: ['DASK_ARRAY[float32]', { visible_when: { mode: 'match' } }] } } };
+const conditional: Graph = { nodes: [node('read', 'Reader'), { ...node('process', 'Process'), data: { opType: 'Process', nodeSpec: conditionalSpec, values: { mode: 'match' } } }],
+  edges: [{ id: 'reference-edge', source: 'read', target: 'process', sourceHandle: '0', targetHandle: 'reference' }] };
+const hidden = normalizeGraph({ ...conditional, nodes: conditional.nodes.map(n => n.id === 'process' ? withNodeInputValue(n, 'mode', 'explicit') : n) }, conditional);
+assert.equal(hidden.edges.length, 0, 'inspector and inline edits remove a link when its controlling parameter hides the input');
+const conditionalWrapped = convertSelection({ ...conditional, nodes: conditional.nodes.map(n => ({ ...n, selected: n.id === 'process' })) }, 'Conditional');
+const conditionalId = conditionalWrapped.nodes.find(n => n.data.subgraph)!.id;
+const conditionalExposed = updateGraphAtPath(conditionalWrapped, [conditionalId], g => exposePort(g, 'process', 'input', 'mode'));
+// Simulate a different fallback, while the exposed mode remains match.
+const differentFallback = updateGraphAtPath(conditionalExposed, [conditionalId], g => ({ ...g, nodes: g.nodes.map(n => n.id === 'process' ? withNodeInputValue(n, 'mode', 'explicit') : n) }));
+const renamedConditional = normalizeGraph(updateGraphAtPath(differentFallback, [conditionalId], g => ({ ...g, nodes: g.nodes.map(n => n.id === 'process' ? { ...n, data: { ...n.data, title: 'Renamed', showAdvanced: true } } : n) })), differentFallback);
+assert.deepEqual(compileWorkflow(renamedConditional), compileWorkflow(differentFallback), 'metadata edits preserve links controlled by a promoted default');
+console.log('conditional dependency edits and nested interface type regressions passed');

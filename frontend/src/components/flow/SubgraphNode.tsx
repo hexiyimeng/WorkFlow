@@ -5,6 +5,7 @@ import type { NodeData } from '../../types';
 import { useFlow } from '../../hooks/useFlowContext';
 import { NodeParameter } from '../nodes/NodeParameter';
 import { isWidgetInput, nodeInputValues, withNodeInputValue } from '../../utils/nodeInputs';
+import { isGroup } from '../../utils/groups';
 import { nodeColorStyle } from '../../utils/nodePresentation';
 
 export function SubgraphNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
@@ -30,7 +31,7 @@ export function SubgraphNode({ id, data, selected }: NodeProps<Node<NodeData>>) 
         onChange={(_, value) => editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => n.id === id ? withNodeInputValue(n, port.id, value) : n) }))}
         slot={<Handle type="target" position={Position.Left} id={port.id} className="node-widget-slot" aria-label={`Input ${port.name} (${port.type})`} isConnectable={!locked} />} />;
     })}</div>
-    <footer>{sub.nodes.filter(n => !n.data.boundary).length} 个节点 · 双击进入子图</footer>
+    <footer>{sub.nodes.filter(n => !n.data.boundary && !isGroup(n)).length} 个节点 · 双击进入子图</footer>
   </article>;
 }
 

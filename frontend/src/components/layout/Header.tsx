@@ -168,7 +168,7 @@ export default function Header() {
           <span className="workspace-divider" />
           <IconButton title="Undo" aria-label="Undo" disabled={isExecutionLocked} onClick={undo}><Undo2 size={15} /></IconButton>
           <IconButton title="Redo" aria-label="Redo" disabled={isExecutionLocked} onClick={redo}><Redo2 size={15} /></IconButton>
-          <span className="workspace-document-info">{nodes.length} nodes<span>·</span>{edges.length} connections</span>
+          <span className="workspace-document-info">{nodes.filter(n => !n.data.group).length} nodes<span>·</span>{edges.length} connections</span>
         </div>
         <div className="workspace-run-actions">
           {recoveredGraphView && <span className="workspace-recovery-badge">Recovery · Read only</span>}
