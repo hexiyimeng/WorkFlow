@@ -39,3 +39,11 @@
 
 .node-inspector .node-parameter { display: flex; flex-wrap: wrap; }
 .node-inspector .node-parameter__linked { width: 100%; margin: 0; }
+.inspector-multi-search { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; margin-bottom: 10px; }
+.inspector-node-section { border-bottom: 1px solid var(--color-border-default); }
+.inspector-node-section__heading { display: flex; align-items: center; gap: 3px; min-height: 56px; }
+.inspector-node-section__heading > button { padding: 6px; border-radius: 5px; display: flex; align-items: center; justify-content: center; }
+.inspector-node-section__toggle { flex: 1; min-width: 0; gap: 10px; text-align: left; }
+.inspector-node-section__toggle strong { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.inspector-node-section__toggle svg { flex-shrink: 0; }
+.inspector-node-section__body { padding: 0 4px 14px; }

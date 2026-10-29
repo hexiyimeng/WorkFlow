@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
-import type { Node } from '@xyflow/react';
+import { ReactFlowProvider, type Node } from '@xyflow/react';
 import type { NodeData } from '../../types';
 import type { FlowContextType } from '../../context/FlowContextDef';
 
@@ -24,7 +24,7 @@ async function main() {
       editGraph: (change: (graph: typeof snapshot) => typeof snapshot) => setGraph(change(graph)), updateNodeData: (id: string, change: Partial<NodeData>) => setGraph({ ...graph, nodes: graph.nodes.map(n => n.id === id ? { ...n, data: { ...n.data, ...change } } : n) }),
       addLog: (message: string) => { throw new Error(message); },
     } as unknown as FlowContextType;
-    return <FlowContext.Provider value={context}><NodeInspector /></FlowContext.Provider>;
+    return <ReactFlowProvider><FlowContext.Provider value={context}><NodeInspector /></FlowContext.Provider></ReactFlowProvider>;
   }
   const root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(<Harness />));
@@ -71,6 +71,49 @@ async function main() {
   await act(async () => { [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(e => e.textContent === '设置')!.click(); });
   assert.equal(document.querySelector('[aria-label="接口名称"]')!.tagName, 'SPAN', 'settings cannot bypass the field-name restriction');
   await act(async () => second.unmount());
+
+  snapshot = { nodes: [initial, { ...initial, id: 'second', data: { ...initial.data, title: 'Another Cellpose', values: { diameter: 28 } } },
+    { ...wrapped.nodes[0], selected: true }], edges: [{ id: 'linked', source: 'source', sourceHandle: '0', target: initial.id, targetHandle: 'diameter' }] };
+  const multi = createRoot(document.getElementById('root')!);
+  await act(async () => multi.render(<Harness />));
+  assert.equal(document.querySelectorAll('.inspector-node-section').length, 3, 'multi-selection lists each node and subgraph separately');
+  assert.deepEqual([...document.querySelectorAll('[role="tab"]')].map(e => e.textContent), ['节点', '设置']);
+  await act(async () => { [...document.querySelectorAll<HTMLButtonElement>('button')].find(e => e.textContent === '展开全部')!.click(); });
+  assert(document.querySelector<HTMLInputElement>('[data-node-id="process"] [aria-label="diameter"]')!.disabled);
+  await click('[data-node-id="second"] [aria-label="Increase diameter"]');
+  assert.equal(snapshot.nodes.find(n => n.id === 'second')!.data.values.diameter, 29);
+  assert.equal(snapshot.nodes.find(n => n.id === 'process')!.data.values.diameter, 12, 'same parameter names on other nodes remain independent');
+  assert(snapshot.nodes.every(n => n.selected), 'editing keeps multi-selection');
+  await click('[data-node-id="second"] [aria-label^="重置节点参数"]');
+  assert.equal(snapshot.nodes.find(n => n.id === 'second')!.data.values.diameter, 10);
+  assert.equal(snapshot.edges.length, 1, 'resetting an unrelated node preserves connected values');
+  assert(document.querySelector<HTMLButtonElement>('[data-node-id="process"] [aria-label^="重置节点参数"]')!.disabled);
+  const portId = wrapped.nodes[0].data.subgraph!.inputs.find(p => p.config)!.id;
+  await click(`[data-node-id="${wrapperId}"] [aria-label="Increase ${portId}"]`);
+  const { nodeInputValue } = await import('../../utils/nodeInputs');
+  assert.equal(nodeInputValue(snapshot.nodes.find(n => n.id === wrapperId)!, portId), 13, 'subgraph defaults can be edited without leaving multi-selection');
+  await click(`[data-node-id="${wrapperId}"] [aria-label^="重置节点参数"]`);
+  assert.equal(nodeInputValue(snapshot.nodes.find(n => n.id === wrapperId)!, portId), 10);
+  assert([...document.querySelectorAll('[aria-label^="输入名称"], [aria-label^="输出名称"]')].every(e => e.tagName === 'SPAN'));
+  const search = async (value: string) => act(async () => {
+    const input = document.querySelector<HTMLInputElement>('[aria-label="搜索所选节点和参数"]')!;
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+    input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  });
+  await search('another');
+  assert.equal(document.querySelectorAll('.inspector-node-section').length, 1, 'search filters node titles');
+  assert(document.querySelector('[data-node-id="second"] [aria-label="diameter"]'), 'title match displays all node parameters');
+  await search('diameter');
+  assert.equal(document.querySelectorAll('.inspector-node-section').length, 3, 'search includes public subgraph parameters');
+  await search('no-such-parameter');
+  assert.equal(document.querySelectorAll('.inspector-node-section').length, 0);
+  assert(document.querySelector('.inspector-empty'));
+  await search('');
+  await act(async () => multi.render(<Harness locked />));
+  assert([...document.querySelectorAll<HTMLButtonElement>('[aria-label^="重置节点参数"]')].every(b => b.disabled));
+  assert([...document.querySelectorAll<HTMLInputElement>('.inspector-node-section input')].every(input => input.disabled));
+  assert([...document.querySelectorAll<HTMLButtonElement>('[aria-label^="定位节点"]')].every(b => !b.disabled), 'locating remains available while running');
+  await act(async () => multi.unmount());
   dom.window.close();
   console.log('node inspector editing, connections, read-only field names, colors and execution lock tests passed');
 }
