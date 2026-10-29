@@ -1,5 +1,6 @@
 import { SubgraphNode, BoundaryNode, InterfacePlaceholder } from './SubgraphNode';
 import SelectionToolbar from './SelectionToolbar';
+import SelectionFrame from './SelectionFrame';
 import GroupNode from './GroupNode';
 import { createGroup, expandGroupDrag, groupDragSnapshot, isGroup, type GroupDrag } from '../../utils/groups';
 import { useState, useCallback, useEffect, useRef, type ComponentType } from 'react';
@@ -87,6 +88,7 @@ export default function FlowEditor() {
       nodesDraggable nodesConnectable={!isExecutionLocked} edgesReconnectable={!isExecutionLocked} elementsSelectable
       deleteKeyCode={null} onNodeDoubleClick={(_, node) => { if (node.data.subgraph) enterSubgraph(node.id); }}>
       <SelectionToolbar />
+      <SelectionFrame />
       <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="var(--color-canvas-grid-minor)" />
       {showMap && <MiniMap position="bottom-right" style={{ width: 192, height: 128, bottom: 66, right: 16, margin: 0 }}
         nodeColor="var(--color-border-strong)" maskColor="var(--color-bg-overlay)" zoomable pannable />}
