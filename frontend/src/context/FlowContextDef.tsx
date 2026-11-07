@@ -131,6 +131,8 @@ export interface FlowContextType extends ReturnType<typeof useWorkflowLibrary> {
 
   // === Workflow ===
   createWorkflow: () => void;
+  duplicateWorkflow: () => void;
+  clearWorkflow: () => void;
   switchWorkflow: (id: string) => void;
   deleteWorkflow: (id: string) => void;
   renameWorkflow: (id: string, name: string) => void;

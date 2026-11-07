@@ -341,7 +341,7 @@ export interface SubgraphGraph {
   outputs: SubgraphPort[];
 }
 
-export interface LibraryReference { id: string; revision: number; folder: string; fingerprint: string }
+export interface LibraryReference { id: string; revision: number; folder: string; fingerprint: string; kind?: 'workflows' | 'subgraphs' }
 export interface LibraryItem { id: string; name: string; folder: string; revision: number; updatedAt: number }
 
 export interface PluginLoadedEntry {
@@ -415,6 +415,7 @@ export interface NodeData extends Record<string, unknown> {
   inputLabels?: Record<string, string>;
   outputLabels?: Record<string, string>;
   showAdvanced?: boolean;
+  collapsed?: boolean;
   boundaryConfig?: InputDefinition;
   bypassed?: boolean;
   subgraph?: SubgraphGraph;

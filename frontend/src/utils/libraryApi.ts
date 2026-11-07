@@ -28,6 +28,7 @@ export const documentFingerprint = (document: SerializedWorkflowDocument): strin
     metadata: document.metadata || {}, graph: normalize(document.nodes, document.edges) }));
 };
 
-export const libraryReference = (record: LibraryRecord): LibraryReference => ({
+export const libraryReference = (record: LibraryRecord, kind: LibraryKind = 'workflows'): LibraryReference => ({
+  kind,
   id: record.id, revision: record.revision, folder: record.folder, fingerprint: documentFingerprint(record.document),
 });

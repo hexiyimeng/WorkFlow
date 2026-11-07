@@ -1,8 +1,8 @@
-import { Boxes, ChevronDown, Folder, GripVertical, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { Boxes, ChevronDown, Folder, GripVertical, Pencil, FilePenLine, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 
 export default function SubgraphLibraryGroup({ search, collapsed, toggle }: { search: string; collapsed: boolean; toggle: () => void }) {
-  const { libraryItems, libraryBusy, libraryError, refreshLibrary, openLibraryItem, deleteLibraryItem, renameLibraryItem, isExecutionLocked } = useFlow();
+  const { libraryItems, libraryBusy, libraryError, refreshLibrary, openLibraryItem, editSubgraphBlueprint, deleteLibraryItem, renameLibraryItem, isExecutionLocked } = useFlow();
   const terms = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const items = libraryItems.subgraphs.filter(item => terms.every(term => `${item.name} ${item.folder} 子图 Blueprint`.toLowerCase().includes(term)));
   const locked = libraryBusy || isExecutionLocked;
@@ -19,7 +19,9 @@ export default function SubgraphLibraryGroup({ search, collapsed, toggle }: { se
             if (locked) { event.preventDefault(); return; }
             event.dataTransfer.setData('application/workflow-subgraph', item.id); event.dataTransfer.effectAllowed = 'copy';
           }}><GripVertical size={11} className="library-node__grip" /><Boxes size={15} /><span><strong>{item.name}</strong>{item.folder && <small><Folder size={11} />{item.folder}</small>}</span><Plus size={13} className="library-node__add" /></button>
-        <div className="saved-workflow__actions"><button className="workspace-icon-button" aria-label={`Rename subgraph ${item.name}`} title="重命名已保存的子图节点" disabled={locked}
+        <div className="saved-workflow__actions"><button className="workspace-icon-button" aria-label={`Edit blueprint ${item.name}`} title="编辑蓝图 · 保存将更新原定义" disabled={locked}
+          onClick={() => { void editSubgraphBlueprint(item.id); }}><FilePenLine size={13} /></button>
+          <button className="workspace-icon-button" aria-label={`Rename subgraph ${item.name}`} title="重命名已保存的子图节点" disabled={locked}
           onClick={() => { const name = prompt('子图节点名称', item.name); if (name?.trim()) void renameLibraryItem('subgraphs', item, name.trim()); }}><Pencil size={13} /></button>
           <button className="workspace-icon-button" aria-label={`Delete subgraph ${item.name}`} title="从节点库移除" disabled={locked}
             onClick={() => { if (confirm(`从节点库移除“${item.name}”？画布中已有的实例会保留。`)) void deleteLibraryItem('subgraphs', item); }}><Trash2 size={13} /></button></div>

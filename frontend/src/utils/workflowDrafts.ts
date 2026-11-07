@@ -14,5 +14,6 @@ export function readLibraryReference(raw: unknown): LibraryReference | undefined
   if (!raw || typeof raw !== 'object') return undefined;
   const ref = raw as Partial<LibraryReference>;
   return typeof ref.id === 'string' && /^[0-9a-f-]{36}$/.test(ref.id) && Number.isSafeInteger(ref.revision) && Number(ref.revision) > 0
-    && typeof ref.folder === 'string' && typeof ref.fingerprint === 'string' ? ref as LibraryReference : undefined;
+    && typeof ref.folder === 'string' && typeof ref.fingerprint === 'string'
+    && (ref.kind === undefined || ref.kind === 'workflows' || ref.kind === 'subgraphs') ? ref as LibraryReference : undefined;
 }

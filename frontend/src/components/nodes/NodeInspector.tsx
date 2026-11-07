@@ -5,7 +5,7 @@ import { useFlow } from '../../hooks/useFlowContext';
 import { usePanelResize } from '../../hooks/usePanelResize';
 import type { NodeData, SubgraphPort } from '../../types';
 import { bypassMapping, editSubgraphPort, exposePort, graphAtPath, updateGraphAtPath } from '../../utils/subgraphs';
-import { inputDefault, inputPortType, isWidgetInput, nodeInputValues, withNodeInputValue } from '../../utils/nodeInputs';
+import { inputDefault, inputPortType, isWidgetInput, nodeInputValues, withNodeInputValue, inputSourceLabel } from '../../utils/nodeInputs';
 import { resolveNodeOutputTypes } from '../../utils/portTypes';
 import { inputMeta, isInputVisible } from '../../utils/inputVisibility';
 import { NodeParameter } from './NodeParameter';
@@ -36,8 +36,9 @@ function InputFields({ node, edges, path = [], promote, search = '' }: { node: N
       <div className="inspector-field__heading"><FieldName value={display} label={`输入名称 ${name}`} />
         <code>{inputPortType(config)}</code></div>
       {isWidgetInput(config) && <NodeParameter name={name} label={display} config={config} value={values[name]} disabled={locked || !!connection} linked={!!connection}
+        sourceLabel={inputSourceLabel(node.id, name, { nodes: graphAtPath({ nodes, edges }, path).nodes, edges })}
         onChange={(_, value) => change(n => withNodeInputValue(n, name, value))} />}
-      <div className="inspector-field__actions"><small>{connection ? '已连接 · 使用上游值' : isWidgetInput(config) ? '未连接时使用此值' : '等待上游连接'}{node.data.nodeSpec.input.optional?.[name] ? ' · 高级输入' : ''}</small>
+      <div className="inspector-field__actions"><small>{!isWidgetInput(config) ? inputSourceLabel(node.id, name, { nodes: graphAtPath({ nodes, edges }, path).nodes, edges }) : ''}{node.data.nodeSpec.input.optional?.[name] ? ' 高级输入' : ''}</small>
         {isWidgetInput(config) && <button title="恢复默认值" aria-label={`重置 ${name}`} disabled={locked || !!connection} onClick={() => change(n => withNodeInputValue(n, name, inputDefault(config)))}><RotateCcw size={14} /></button>}
         {connection && <button title="断开输入连接" aria-label={`断开 ${name}`} disabled={locked} onClick={() => editGraph(graph => updateGraphAtPath(graph, path, inner => ({ ...inner, edges: inner.edges.filter(e => e.id !== connection.id) })))}><Unplug size={14} /></button>}
         {promote && <button title={connection ? '请先断开此输入，再公开为子图参数' : '公开为子图输入，父图也可编辑或连线'} aria-label={`公开输入 ${name}`} disabled={locked || !!connection}
@@ -59,8 +60,9 @@ function NodeParameters({ node, search }: { node: Node<NodeData>; search: string
     return <section className="inspector-field" key={port.id} data-port={port.id}>
       <div className="inspector-field__heading"><FieldName value={port.name} label={`${kind === 'input' ? '输入' : '输出'}名称 ${port.id}`} /><code>{port.type}</code></div>
       {kind === 'input' && isWidgetInput(port.config) && <NodeParameter name={port.id} label={port.name} config={port.config!} value={nodeInputValues(node, { nodes, edges })[port.id]} disabled={locked || linked} linked={linked}
+        sourceLabel={inputSourceLabel(node.id, port.id, { nodes, edges })}
         onChange={(_, value) => action({ value })} />}
-      <div className="inspector-field__actions"><small>{linked ? '已连接 · 使用上游值' : kind === 'input' && port.config ? '父图与子图共享此默认值' : '子图接口'}</small>
+      <div className="inspector-field__actions"><small>{linked && !isWidgetInput(port.config) ? inputSourceLabel(node.id, port.id, { nodes, edges }) : ''}</small>
         {linked && <button title="断开外部连接" disabled={locked} onClick={() => editGraph(graph => ({ ...graph, edges: graph.edges.filter(e => e.target !== node.id || e.targetHandle !== port.id) }))}><Unplug size={14} /></button>}
         <button title="上移接口" disabled={locked || index === 0} onClick={() => action({ move: -1 })}><ArrowUp size={14} /></button>
         <button title="下移接口" disabled={locked || index === count - 1} onClick={() => action({ move: 1 })}><ArrowDown size={14} /></button>

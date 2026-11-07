@@ -2,6 +2,18 @@ import type { Node, Edge } from '@xyflow/react';
 import type { InputDefinition, NodeData } from '../types';
 
 const scalar = new Set(['INT', 'LONG', 'FLOAT', 'STRING', 'BOOLEAN']);
+/** Display connection metadata only. Never evaluate upstream tasks to preview an input. */
+export function inputSourceLabel(nodeId: string, input: string, graph: { nodes: Node<NodeData>[]; edges: Edge[] }): string | undefined {
+  const edge = graph.edges.find(e => e.target === nodeId && e.targetHandle === input);
+  if (!edge) return undefined;
+  const source = graph.nodes.find(n => n.id === edge.source);
+  if (!source) return `节点 ${edge.source} · 输出 ${edge.sourceHandle ?? '0'}`;
+  const index = Number(edge.sourceHandle ?? 0);
+  const title = source.data.title || source.data.nodeSpec.display_name || source.data.opType;
+  const output = source.data.outputLabels?.[String(index)] || source.data.subgraph?.outputs[index]?.name
+    || source.data.nodeSpec.output_name?.[index] || (source.data.boundary === 'input' ? '子图输入' : `输出 ${index + 1}`);
+  return `${title} · ${output}`;
+}
 export function isWidgetInput(config: InputDefinition | undefined): boolean {
   return !!config && (Array.isArray(config[0]) || scalar.has(config[0]));
 }

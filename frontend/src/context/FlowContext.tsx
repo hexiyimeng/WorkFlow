@@ -1,7 +1,8 @@
 import { useWorkflowLibrary } from '../hooks/useWorkflowLibrary';
+import { serializeWorkflowDocument, parseWorkflowDocument, hydrateFlowWithLatestSpecs } from '../utils/workflowPersistence';
 import { useSubgraphEditor } from '../hooks/useSubgraphEditor';
 import { inputPortType, nodeInputValues } from '../utils/nodeInputs';
-import { exposePort, NEW_SUBGRAPH_INPUT, NEW_SUBGRAPH_OUTPUT } from '../utils/subgraphs';
+import { exposePort, updateGraphAtPath, NEW_SUBGRAPH_INPUT, NEW_SUBGRAPH_OUTPUT } from '../utils/subgraphs';
 // src/context/FlowContext.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { applyNodeChanges as applyNodes, applyEdgeChanges as applyEdges, addEdge, type Connection, type Node, type Edge, type OnConnectStart, type OnConnectEnd, type OnNodesChange, type OnEdgesChange } from '@xyflow/react';
@@ -35,6 +36,7 @@ import {
 } from '../utils/executionExperience';
 import {
   buildNewRunExecutionConfig,
+  createWorkflowId,
   validateWorkflowExecutionSettings,
   withLastPreflightSummary,
 } from '../utils/workflowExecutionSettings';
@@ -49,7 +51,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     nodes: typeof action === 'function' ? action(previous.nodes) : action })), []);
   const setRootEdges = useCallback<React.Dispatch<React.SetStateAction<Edge[]>>>(action => setRootGraph(previous => ({ ...previous,
     edges: typeof action === 'function' ? action(previous.edges) : action })), []);
-  const { nodes, edges, setNodes, setEdges, editGraph, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph, resetSubgraph } = useSubgraphEditor(rootGraph, setRootGraph);
+  const { nodes, edges, setNodes, setEdges, editGraph, subgraphPath, breadcrumbs, enterSubgraph, navigateSubgraph, resetSubgraph, openSubgraphPath } = useSubgraphEditor(rootGraph, setRootGraph);
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try { return localStorage.getItem('WorkFlow_THEME') === 'dark' ? 'dark' : 'light'; }
     catch { return 'light'; }
@@ -175,8 +177,9 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const restoreAutosaveDocument = useCallback<typeof _loadWorkflowDocument>((document, restoredNodes, restoredEdges, reference) => {
     _loadWorkflowDocument(document, restoredNodes, restoredEdges, reference);
+    openSubgraphPath(reference?.kind === 'subgraphs' && restoredNodes[0]?.data.subgraph ? [restoredNodes[0].id] : []);
     resetHistory(restoredNodes, restoredEdges);
-  }, [_loadWorkflowDocument, resetHistory]);
+  }, [_loadWorkflowDocument, resetHistory, openSubgraphPath]);
 
   useAutoSave(
     rootNodes,
@@ -263,7 +266,9 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     resetSubgraph();
     resetExecutionSettingsUi();
     _switchWorkflow(id);
-  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _switchWorkflow, resetSubgraph]);
+    const target = workflows.find(w => w.id === id);
+    if (target?.libraryRef?.kind === 'subgraphs' && target.nodes[0]?.data.subgraph) openSubgraphPath([target.nodes[0].id]);
+  }, [isExecutionLocked, addLog, resetExecutionSettingsUi, _switchWorkflow, resetSubgraph, workflows, openSubgraphPath]);
 
   const deleteWorkflow = useCallback((id: string) => {
     if (isExecutionLocked) { addLog('Cannot delete workflow while executing', 'warning'); return; }
@@ -288,9 +293,30 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     resetSubgraph();
     resetExecutionSettingsUi();
     _openDocument(document, hydratedNodes, hydratedEdges, reference);
-  }, [_openDocument, resetSubgraph, resetExecutionSettingsUi]);
+    if (reference?.kind === 'subgraphs' && hydratedNodes[0]?.data.subgraph) openSubgraphPath([hydratedNodes[0].id]);
+  }, [_openDocument, resetSubgraph, resetExecutionSettingsUi, openSubgraphPath]);
   const library = useWorkflowLibrary({ nodes: rootNodes, edges: rootEdges, activeWorkflow, workflows, nodeDefs,
-    locked: isExecutionLocked, openDocument, updateWorkflow, switchWorkflow, editGraph, addLog });
+    locked: isExecutionLocked, subgraphPath, openDocument, updateWorkflow, switchWorkflow, editGraph, addLog });
+  const duplicateWorkflow = () => {
+    if (isExecutionLocked || library.libraryBusy || !activeWorkflow) return;
+    if (activeWorkflow.libraryRef?.kind === 'subgraphs') { library.requestLibrarySave(true); return; }
+    // A new document identity, with independent data and no server-file binding.
+    // Keep internal node IDs so execution settings referencing them remain valid.
+    const document = parseWorkflowDocument(structuredClone(serializeWorkflowDocument({ workflowId: createWorkflowId(),
+      workflowName: `${activeWorkflow.name} 副本`, metadata: activeWorkflow.metadata, nodes: rootNodes, edges: rootEdges })))!;
+    const graph = hydrateFlowWithLatestSpecs(document, nodeDefs);
+    openDocument(document, graph.nodes, graph.edges);
+  };
+  const clearWorkflow = () => {
+    if (isExecutionLocked || library.libraryBusy) return;
+    if (activeWorkflow?.libraryRef?.kind === 'subgraphs' && rootNodes[0]?.data.subgraph) {
+      setRootGraph(updateGraphAtPath(rootGraph, [rootNodes[0].id], () => ({ nodes: [], edges: [] })));
+      openSubgraphPath([rootNodes[0].id]);
+      return;
+    }
+    resetSubgraph();
+    setRootGraph({ nodes: [], edges: [] });
+  };
 
   const preflightExecutionSettings = useCallback(async (
     settings: WorkflowExecutionSettings,
@@ -420,6 +446,10 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const normalRunInFlightRef = useRef(false);
   const runFlow = useCallback(async (): Promise<void> => {
+    if (activeWorkflow?.libraryRef?.kind === 'subgraphs') {
+      addLog('正在编辑蓝图定义。请将蓝图插入工作流并连接输入后运行。', 'warning');
+      return;
+    }
     if (normalRunInFlightRef.current) return;
     normalRunInFlightRef.current = true;
     try {
@@ -479,6 +509,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [
     activeExecutionSettings,
     activeExecutionSettingsConfigured,
+    activeWorkflow?.libraryRef?.kind,
     activeWorkflowDocumentId,
     addLog,
     isRecoveryGraphReadOnly,
@@ -536,7 +567,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 8. Flow operations — paste hydrates with fresh specs
   // ===========================================
   const { handleCopy, handlePaste, handleDelete } = useFlowOperations(
-    nodes, edges, setNodes, setEdges,
+    nodes, edges, setNodes, setEdges, editGraph,
     undo, redo, addLog, isExecutionLocked || library.libraryBusy, nodeDefs
   );
 
@@ -702,7 +733,7 @@ export const FlowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     inspectRecoveryDirectory, openRecoveryDirectory, deleteRecoveryDirectory,
     executeRecoveryDirectory,
     closeRecoveredGraph, stopFlow, reloadNodes, clearLogs, addLog,
-    createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
+    createWorkflow, duplicateWorkflow, clearWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, saveCurrentWorkflow,
     loadWorkflowDocument,
     theme, toggleTheme, isConsoleOpen, toggleConsole,
     isValidConnection, undo, redo,

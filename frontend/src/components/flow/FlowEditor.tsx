@@ -11,6 +11,7 @@ import '@xyflow/react/dist/style.css';
 import { useFlow } from '../../hooks/useFlowContext';
 import DynamicNode from '../DynamicNode';
 import ContextMenu from './ContextMenu';
+import NodeContextMenu from './NodeContextMenu';
 import CanvasToolbar from './CanvasToolbar';
 import type { NodeData } from '../../types';
 import { NEW_SUBGRAPH_INPUT, NEW_SUBGRAPH_OUTPUT, isInterfacePlaceholder } from '../../utils/subgraphs';
@@ -27,8 +28,12 @@ export default function FlowEditor() {
   const [mode, setMode] = useState<'pan' | 'select'>('pan');
   const [showMap, setShowMap] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; flowPos: { x: number; y: number } } | null>(null);
+  const [nodeMenu, setNodeMenu] = useState<{ x: number; y: number; document: string } | null>(null);
   const onPaneContextMenu = useCallback((event: React.MouseEvent | globalThis.MouseEvent) => {
     event.preventDefault();
+    event.stopPropagation();
+    if ((event.target as HTMLElement).closest('.react-flow__node, .selection-toolbar')) return;
+    setNodeMenu(null);
     if (isExecutionLocked) return;
     const native = (event as React.MouseEvent).nativeEvent || event;
     setMenu({ x: native.clientX, y: native.clientY, flowPos: screenToFlowPosition({ x: native.clientX, y: native.clientY }) });
@@ -76,6 +81,12 @@ export default function FlowEditor() {
       onNodesChange={changes => onNodesChange(expandGroupDrag(changes.filter(change => !('id' in change) || !isInterfacePlaceholder(change.id)), groupDrag.current))} onEdgesChange={onEdgesChange}
       onNodeDragStart={(event, node) => { groupDrag.current = groupDragSnapshot(nodes, node.id, event.altKey); }}
       onNodeDragStop={() => { groupDrag.current = null; }}
+      onNodeContextMenu={(event, node) => {
+        event.preventDefault(); event.stopPropagation(); setMenu(null);
+        if (isInterfacePlaceholder(node.id)) return;
+        if (!node.selected) editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => ({ ...n, selected: n.id === node.id })), edges: graph.edges.map(e => ({ ...e, selected: false })) }));
+        setNodeMenu({ x: event.clientX, y: event.clientY, document: documentKey });
+      }}
       onSelectionDragStart={(event, selected) => { groupDrag.current = groupDragSnapshot(nodes, selected[0]?.id || '', event.altKey); }}
       onSelectionDragStop={() => { groupDrag.current = null; }}
       onConnect={onConnect} onConnectStart={onConnectStart} onConnectEnd={onConnectEnd} nodeTypes={nodeTypes}
@@ -84,7 +95,8 @@ export default function FlowEditor() {
       connectionLineStyle={{ stroke: 'var(--color-accent)', strokeWidth: 2 }}
       selectNodesOnDrag={false} panOnScroll={false} zoomOnScroll panOnDrag={mode === 'pan' ? [0, 1] : [1]}
       selectionOnDrag={mode === 'select'} selectionMode={SelectionMode.Partial} panActivationKeyCode="Space"
-      minZoom={.1} maxZoom={3} colorMode={theme} onPaneContextMenu={onPaneContextMenu} onPaneClick={() => setMenu(null)}
+      minZoom={.1} maxZoom={3} colorMode={theme} onPaneContextMenu={onPaneContextMenu} onPaneClick={() => { setMenu(null); setNodeMenu(null); }}
+      onMoveStart={() => { setMenu(null); setNodeMenu(null); }}
       nodesDraggable nodesConnectable={!isExecutionLocked} edgesReconnectable={!isExecutionLocked} elementsSelectable
       deleteKeyCode={null} onNodeDoubleClick={(_, node) => { if (node.data.subgraph) enterSubgraph(node.id); }}>
       <SelectionToolbar />
@@ -95,6 +107,7 @@ export default function FlowEditor() {
       <Panel position="bottom-left" className="canvas-hint">{mode === 'pan' ? 'Drag to pan' : 'Drag to select'}<span>·</span>Scroll to zoom<span>·</span>Space to pan</Panel>
       <Panel position="bottom-right" className="canvas-tools-panel"><CanvasToolbar mode={mode} setMode={setMode} showMap={showMap} toggleMap={() => setShowMap(current => !current)} /></Panel>
     </ReactFlow>
+    {nodeMenu && nodeMenu.document === documentKey && nodes.some(n => n.selected) && <NodeContextMenu key={`${nodeMenu.x}:${nodeMenu.y}`} x={nodeMenu.x} y={nodeMenu.y} onClose={() => setNodeMenu(null)} />}
     {menu && <ContextMenu top={menu.y} left={menu.x} onClose={() => setMenu(null)} onAddGroup={() => {
       if (!isExecutionLocked) editGraph(graph => ({ ...graph, nodes: createGroup(graph.nodes, menu.flowPos) }));
     }} onAddNode={type => {

@@ -31,9 +31,12 @@ async function main() {
   const click = async (selector: string) => act(async () => document.querySelector<HTMLButtonElement>(selector)!.click());
   const diameter = () => document.querySelector<HTMLInputElement>('[aria-label="diameter"]')!;
   assert(diameter().disabled, 'a connected parameter cannot overwrite its source value');
+  assert.equal(diameter().value, '节点 source · 输出 0', 'show the connection source, never the inactive literal');
+  assert(!document.body.textContent?.includes('未连接时使用此值'));
   assert.equal(document.querySelectorAll('[role="dialog"]').length, 0, 'information is a sidebar, not a modal');
   await click('[aria-label="断开 diameter"]');
   assert(!diameter().disabled);
+  assert.equal(diameter().value, '12', 'disconnect restores the preserved literal');
   assert.equal(snapshot.edges.length, 0);
   await click('[aria-label="Increase diameter"]');
   assert.equal(snapshot.nodes[0].data.values.diameter, 13, 'sidebar edits the same graph values as the node');

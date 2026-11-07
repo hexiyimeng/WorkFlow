@@ -90,6 +90,7 @@ export interface SerializedNode {
     inputLabels?: Record<string, string>;
     outputLabels?: Record<string, string>;
     showAdvanced?: boolean;
+    collapsed?: boolean;
     boundaryConfig?: InputDefinition;
     bypassed?: boolean;
     boundary?: 'input' | 'output';
@@ -120,6 +121,7 @@ export interface SerializedNodeForStorage {
     inputLabels?: Record<string, string>;
     outputLabels?: Record<string, string>;
     showAdvanced?: boolean;
+    collapsed?: boolean;
     boundaryConfig?: InputDefinition;
     bypassed?: boolean;
     boundary?: 'input' | 'output';
@@ -187,6 +189,7 @@ export function stripRuntimeNodeData(node: Node<NodeData>): SerializedNode {
       inputLabels: node.data.inputLabels,
       outputLabels: node.data.outputLabels,
       showAdvanced: node.data.showAdvanced || undefined,
+      collapsed: node.data.collapsed || undefined,
       boundaryConfig: node.data.boundaryConfig,
       bypassed: node.data.bypassed || undefined,
       boundary: node.data.boundary,
@@ -302,6 +305,7 @@ export function hydrateNodeFromSpec(
     inputLabels: serialized.data.inputLabels,
     outputLabels: serialized.data.outputLabels,
     showAdvanced: serialized.data.showAdvanced,
+    collapsed: serialized.data.collapsed,
     boundaryConfig: serialized.data.boundaryConfig,
     bypassed: serialized.data.bypassed,
     boundary,
@@ -548,6 +552,7 @@ export function parseStoredFlow(raw: unknown, depth = 0): SerializedFlow | null 
         inputLabels: parseDisplayLabels(nodeData?.inputLabels),
         outputLabels: parseDisplayLabels(nodeData?.outputLabels),
         showAdvanced: nodeData?.showAdvanced === true || undefined,
+        collapsed: nodeData?.collapsed === true || undefined,
         boundaryConfig: parseInputDefinition(nodeData?.boundaryConfig),
         color: typeof nodeData?.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(nodeData.color) ? nodeData.color : undefined,
         bypassed: nodeData?.bypassed === true || undefined,

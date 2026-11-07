@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent } from 'react';
 import { useReactFlow } from '@xyflow/react';
-import { Activity, FileDown, Save, Copy, FolderOpen, FolderClock, RefreshCw, SlidersHorizontal, Sun, Moon, Plus, X, Play, Square, Undo2, Redo2, Terminal, Workflow } from 'lucide-react';
+import { Activity, Boxes, FileDown, Save, Copy, FolderOpen, FolderClock, RefreshCw, SlidersHorizontal, Sun, Moon, Plus, X, Play, Square, Undo2, Redo2, Terminal, Workflow, Pencil, Trash2 } from 'lucide-react';
 import { useFlow } from '../../hooks/useFlowContext';
 import { Button } from '../ui/Button';
 import { IconButton } from '../ui/IconButton';
+import ActionMenu from '../ui/ActionMenu';
 import { serializeWorkflowDocument, parseWorkflowDocument, hydrateFlowWithLatestSpecs } from '../../utils/workflowPersistence';
 import { formatWorkflowExecutionSettingsSummary } from '../../utils/workflowExecutionSettings';
 
@@ -11,7 +12,7 @@ export default function Header() {
   const {
     rootNodes, rootEdges, workflowDirty, requestLibrarySave, libraryBusy,
     theme, toggleTheme, workflows, activeWorkflow, activeWorkflowId,
-    createWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, loadWorkflowDocument,
+    createWorkflow, duplicateWorkflow, clearWorkflow, switchWorkflow, deleteWorkflow, renameWorkflow, loadWorkflowDocument,
     activeExecutionSettings, activeExecutionSettingsConfigured, openExecutionSettings,
     runFlow, stopFlow, reloadNodes, nodeDefs, dashboardUrl, isReloadingNodes,
     executionState, isConnected, isExecuting, isPreflighting, isExecutionLocked,
@@ -19,12 +20,16 @@ export default function Header() {
     undo, redo, toggleConsole, isConsoleOpen, nodes = [], edges = [],
   } = useFlow();
   const reactFlowInstance = useReactFlow();
+  const editingBlueprint = activeWorkflow?.libraryRef?.kind === 'subgraphs';
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [nameDraft, setNameDraft] = useState('');
+  const [tabMenu, setTabMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const cancelRenameRef = useRef(false);
   const saveRequestRef = useRef(requestLibrarySave);
   useLayoutEffect(() => { saveRequestRef.current = requestLibrarySave; }, [requestLibrarySave]);
+  const tabContextRef = useRef({ switchWorkflow, activeWorkflowId, locked: isExecutionLocked || libraryBusy });
+  useLayoutEffect(() => { tabContextRef.current = { switchWorkflow, activeWorkflowId, locked: isExecutionLocked || libraryBusy }; }, [switchWorkflow, activeWorkflowId, isExecutionLocked, libraryBusy]);
   // === Save (export stripped/serialized workflow JSON) ===
   const handleExport = () => {
     if (!reactFlowInstance) return;
@@ -133,7 +138,20 @@ export default function Header() {
       <div className="workspace-titlebar">
         <div className="workspace-brand"><span className="workspace-brand__mark"><Workflow size={19} /></span><span>BrainFlow<small>Workflow Studio</small></span></div>
         <div className="workflow-tabs" role="tablist" aria-label="Open workflows">
-          {workflows.map(wf => <div key={wf.id} className="workflow-tab" data-active={wf.id === activeWorkflowId || undefined}>
+          {workflows.map(wf => <div key={wf.id} className="workflow-tab" data-active={wf.id === activeWorkflowId || undefined}
+            onContextMenu={event => {
+              event.preventDefault(); event.stopPropagation();
+              if (isExecutionLocked || libraryBusy) return;
+              if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+              const position = { id: wf.id, x: event.clientX, y: event.clientY };
+              // Let blur commit a numeric draft before persisting/switching tabs.
+              requestAnimationFrame(() => {
+                const latest = tabContextRef.current;
+                if (latest.locked) return;
+                if (wf.id !== latest.activeWorkflowId) latest.switchWorkflow(wf.id);
+                setTabMenu(position);
+              });
+            }}>
             {renaming === wf.id ? <input autoFocus className="workflow-tab__rename" aria-label="Workflow name" value={nameDraft}
               onChange={event => setNameDraft(event.target.value)} onBlur={() => commitRename(wf.id)}
               onKeyDown={event => {
@@ -143,7 +161,7 @@ export default function Header() {
               }} /> : <button role="tab" aria-selected={wf.id === activeWorkflowId} disabled={isExecutionLocked}
                 title={`${wf.name} · Double-click to rename`} onClick={() => switchWorkflow(wf.id)}
                 onDoubleClick={() => { if (!isExecutionLocked) { setNameDraft(wf.name); setRenaming(wf.id); } }}>
-                <Workflow size={13} /><span>{wf.name}{wf.id === activeWorkflowId && workflowDirty ? ' *' : ''}</span>
+                {wf.libraryRef?.kind === 'subgraphs' ? <Boxes size={13} /> : <Workflow size={13} />}<span>{wf.libraryRef?.kind === 'subgraphs' ? '蓝图 · ' : ''}{wf.name}{wf.id === activeWorkflowId && workflowDirty ? ' *' : ''}</span>
               </button>}
             <button className="workflow-tab__close" title={`Close ${wf.name}`} aria-label={`Close ${wf.name}`} disabled={isExecutionLocked || libraryBusy}
               onClick={() => { if (confirm(`Close "${wf.name}"?`)) deleteWorkflow(wf.id); }}><X size={12} /></button>
@@ -162,8 +180,8 @@ export default function Header() {
       <div className="workspace-actionbar">
         <div className="workspace-file-actions" role="toolbar" aria-label="Workflow actions">
           <button className="workspace-text-button" title="Import workflow JSON" onClick={() => fileInputRef.current?.click()} disabled={isExecutionLocked}><FolderOpen size={15} /><span>Import</span></button>
-          <button className="workspace-text-button" title="Save workflow (Ctrl+S)" onClick={() => requestLibrarySave()} disabled={isExecutionLocked || libraryBusy}><Save size={15} /><span>Save</span></button>
-          <button className="workspace-text-button" title="Save as a new workflow (Ctrl+Shift+S)" onClick={() => requestLibrarySave(true)} disabled={isExecutionLocked || libraryBusy}><Copy size={15} /><span>Save as</span></button>
+          <button className="workspace-text-button" title={editingBlueprint ? '覆盖保存蓝图定义 (Ctrl+S)' : 'Save workflow (Ctrl+S)'} onClick={() => requestLibrarySave()} disabled={isExecutionLocked || libraryBusy}><Save size={15} /><span>{editingBlueprint ? '保存蓝图' : 'Save'}</span></button>
+          <button className="workspace-text-button" title={editingBlueprint ? '另存为新蓝图 (Ctrl+Shift+S)' : 'Save as a new workflow (Ctrl+Shift+S)'} onClick={() => requestLibrarySave(true)} disabled={isExecutionLocked || libraryBusy}><Copy size={15} /><span>{editingBlueprint ? '另存为蓝图' : 'Save as'}</span></button>
           <button className="workspace-text-button" title="Export workflow JSON" onClick={handleExport} disabled={isExecutionLocked}><FileDown size={15} /><span>Export</span></button>
           <span className="workspace-divider" />
           <IconButton title="Undo" aria-label="Undo" disabled={isExecutionLocked} onClick={undo}><Undo2 size={15} /></IconButton>
@@ -171,6 +189,7 @@ export default function Header() {
           <span className="workspace-document-info">{nodes.filter(n => !n.data.group).length} nodes<span>·</span>{edges.length} connections</span>
         </div>
         <div className="workspace-run-actions">
+          {editingBlueprint ? <span className="workspace-settings-summary">编辑蓝图定义 · 已有实例保持独立</span> : <>
           {recoveredGraphView && <span className="workspace-recovery-badge">Recovery · Read only</span>}
           <span className="workspace-settings-summary" title={executionSettingsSummary} data-configured={activeExecutionSettingsConfigured || undefined}>
             {!activeExecutionSettingsConfigured && <span className="workspace-status-dot" />}{activeExecutionSettingsConfigured ? executionSettingsSummary : `Not configured · ${executionSettingsSummary}`}
@@ -188,8 +207,18 @@ export default function Header() {
               loading={isPreflighting} disabled={isExecutionLocked || libraryBusy || !isConnected || recoveredGraphView !== null}>
               {isPreflighting ? 'Checking...' : 'Run'}
             </Button>}
+          </>}
         </div>
       </div>
+      {tabMenu && tabMenu.id === activeWorkflowId && activeWorkflow && <ActionMenu x={tabMenu.x} y={tabMenu.y} label="工作流标签菜单" onClose={() => setTabMenu(null)} items={[
+        { label: '重命名', icon: <Pencil size={16} />, disabled: isExecutionLocked, action: () => { setNameDraft(activeWorkflow.name); setRenaming(activeWorkflowId); } },
+        { label: '复制', icon: <Copy size={16} />, disabled: isExecutionLocked, action: duplicateWorkflow },
+        { label: '保存', icon: <Save size={16} />, shortcut: 'Ctrl+S', separator: true, disabled: isExecutionLocked || libraryBusy, action: () => requestLibrarySave() },
+        { label: '另存为', icon: <Copy size={16} />, shortcut: 'Ctrl+Shift+S', disabled: isExecutionLocked || libraryBusy, action: () => requestLibrarySave(true) },
+        { label: '导出', icon: <FileDown size={16} />, disabled: isExecutionLocked, action: handleExport },
+        { label: editingBlueprint ? '清空蓝图内容' : '清空工作流', icon: <Trash2 size={16} />, separator: true, disabled: isExecutionLocked, action: () => { if (confirm(`清空“${activeWorkflow.name}”中的节点和连线？可以撤销，已保存的文件不受影响。`)) clearWorkflow(); } },
+        { label: '关闭标签', icon: <X size={16} />, disabled: isExecutionLocked || libraryBusy, action: () => { if (confirm(`关闭“${activeWorkflow.name}”？未保存的更改将丢失，已保存的文件会保留。`)) deleteWorkflow(activeWorkflowId); } },
+      ]} />}
     </header>
   );
 }

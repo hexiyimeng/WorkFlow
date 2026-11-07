@@ -3,7 +3,7 @@ import { useRef, useCallback, useEffect } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import type { NodeData, LogEntry, NodeSpec } from '../types';
 import { stripRuntimeNodeData, hydrateNodeFromSpec } from '../utils/workflowPersistence';
-import { cloneGraphIds } from '../utils/subgraphs';
+import { cloneGraphIds, deleteSelection, type Graph } from '../utils/subgraphs';
 import { selectionWithContents } from '../utils/groups';
 import type { SerializedNode } from '../utils/workflowPersistence';
 
@@ -12,6 +12,7 @@ export const useFlowOperations = (
   edges: Edge[],
   setNodes: React.Dispatch<React.SetStateAction<Node<NodeData>[]>>,
   setEdges: React.Dispatch<React.SetStateAction<Edge[]>>,
+  editGraph: (change: (graph: Graph) => Graph) => void,
   undo: () => void,
   redo: () => void,
   addLog: (msg: string, type?: LogEntry['type']) => void,
@@ -87,10 +88,8 @@ export const useFlowOperations = (
     const selectedNodes = nodes.filter(n => n.selected);
     const selectedEdges = edges.filter(e => e.selected);
     if (selectedNodes.length === 0 && selectedEdges.length === 0) return;
-    const deleted = new Set(selectedNodes.filter(n => !n.data.boundary).map(n => n.id));
-    setNodes(nds => nds.filter(n => !deleted.has(n.id)));
-    setEdges(eds => eds.filter(e => !e.selected && !deleted.has(e.source) && !deleted.has(e.target)));
-  }, [nodes, edges, setNodes, setEdges, isExecutionLocked]);
+    editGraph(deleteSelection);
+  }, [nodes, edges, editGraph, isExecutionLocked]);
 
   // === Keyboard shortcuts ===
   useEffect(() => {
@@ -104,7 +103,7 @@ export const useFlowOperations = (
       else if (isCtrl && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
       else if (isCtrl && e.key.toLowerCase() === 'c') { e.preventDefault(); handleCopy(); }
       else if (isCtrl && e.key.toLowerCase() === 'v') { e.preventDefault(); handlePaste(); }
-      else if (e.key === 'Delete' || e.key === 'Backspace') { handleDelete(); }
+      else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); handleDelete(); }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);

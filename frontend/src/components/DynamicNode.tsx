@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState, useRef, useLayoutEffect, type CSSProperties } from 'react';
+import { memo, useCallback, useMemo, useRef, useLayoutEffect, type CSSProperties } from 'react';
 import { Handle, Position, NodeResizer, useNodeConnections, useUpdateNodeInternals, type NodeProps, type Node } from '@xyflow/react';
 import { ChevronDown, Database, ScanLine, SlidersHorizontal, Save } from 'lucide-react';
 import type { NodeData } from '../types';
@@ -6,7 +6,8 @@ import { useFlow } from '../hooks/useFlowContext';
 import { parsePortType, resolveNodeOutputTypes } from '../utils/portTypes';
 import { inputMeta, isInputVisible } from '../utils/inputVisibility';
 import { NodeParameter } from './nodes/NodeParameter';
-import { inputPortType, nodeInputValues } from '../utils/nodeInputs';
+import { inputPortType, nodeInputValues, inputSourceLabel } from '../utils/nodeInputs';
+import CollapsedPorts from './nodes/CollapsedPorts';
 import { nodeColorStyle } from '../utils/nodePresentation';
 
 const TYPE_COLORS: Record<string, string> = {
@@ -31,7 +32,8 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
   const { nodeSpec, values = {}, message, _invalid, _warning, runState, waitingFor } = data;
   const { isExecutionLocked, updateNodeData, nodes, edges } = useFlow();
   const locked = isExecutionLocked ?? false;
-  const [collapsed, setCollapsed] = useState(false);
+  const collapsed = !!data.collapsed;
+  const toggleCollapsed = () => { if (!locked) updateNodeData(id, { collapsed: !collapsed }); };
   const valuesRef = useRef(values);
   useLayoutEffect(() => { valuesRef.current = values; }, [values]);
   const effectiveValues = useMemo(() => nodeInputValues({ id, data }, { nodes, edges }), [id, data, nodes, edges]);
@@ -75,15 +77,15 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
   return (
     <>
       <NodeResizer color="var(--color-accent)" isVisible={Boolean(selected) && !collapsed && !locked}
-        minWidth={300} minHeight={96} handleStyle={{ width: 7, height: 7 }} />
+        minWidth={330} minHeight={96} handleStyle={{ width: 7, height: 7 }} />
       <article className="workflow-node node-wrapper" data-node-id={id} data-status={status}
         data-selected={selected || undefined} data-invalid={_invalid || undefined}
         data-bypassed={data.bypassed || undefined} data-collapsed={collapsed || undefined} style={nodeColorStyle(data.color, color)}>
         <header className="workflow-node__header" title={nodeSpec?.description || `${title} · ${nodeSpec?.category || data.opType}`}
-          onDoubleClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
+          onDoubleClick={event => { event.stopPropagation(); toggleCollapsed(); }}>
           <button type="button" className="workflow-node__collapse nodrag" title={collapsed ? '展开节点' : '收起节点'} aria-label={collapsed ? 'Expand node' : 'Collapse node'}
-            aria-expanded={!collapsed} onDoubleClick={event => event.stopPropagation()}
-            onClick={event => { event.stopPropagation(); setCollapsed(current => !current); }}>
+            aria-expanded={!collapsed} disabled={locked} onDoubleClick={event => event.stopPropagation()}
+            onClick={event => { event.stopPropagation(); toggleCollapsed(); }}>
             <ChevronDown size={14} />
           </button>
           <span className="workflow-node__category" aria-hidden="true"><Icon size={14} /></span>
@@ -91,22 +93,19 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
           {nodeSpec?.output_node && <span className="workflow-node__output" title="Output node" aria-label="Output node"><Save size={13} /></span>}
           {collapsed && hasStatus && <span className="node-status-dot" title={STATUS_LABELS[status]} />}
         </header>
-        {_invalid && <div className="workflow-node__warning" role="alert">{_warning || 'Node type unavailable. Replace this node.'}</div>}
-        {(inputs.length > 0 || outputs.length > 0 || (collapsed && widgets.length > 0)) && (
+        {!collapsed && _invalid && <div className="workflow-node__warning" role="alert">{_warning || 'Node type unavailable. Replace this node.'}</div>}
+        {collapsed && <CollapsedPorts nodeId={id} inputs={[...inputs.map(p => ({ id: p.name, name: p.label })), ...widgets.map(p => ({ id: p.name, name: p.name }))]}
+          outputs={outputs.map((p, index) => ({ id: String(index), name: p.name }))} />}
+        {!collapsed && (inputs.length > 0 || outputs.length > 0) && (
           <div className="node-ports" aria-label="Node connections">
             <div className="node-ports__column">
-              {inputs.map(input => <div key={input.name} className="node-port" title={`${input.name} · ${input.type}`}>
+              {inputs.map(input => <div key={input.name} className="node-port" title={`${input.name} · ${input.type}${inputSourceLabel(id, input.name, { nodes, edges }) ? `\n来源：${inputSourceLabel(id, input.name, { nodes, edges })}` : ''}`}>
                 <Handle type="target" position={Position.Left} id={input.name}
                   aria-label={`Input ${input.name} (${input.type})`}
                   className="node-port__handle node-port__handle--input"
                   data-connected={connectedInputs.has(input.name) || undefined}
                   style={{ '--port-color': input.color } as CSSProperties} />
                 <span className="node-port__name">{input.label}</span>
-              </div>)}
-              {collapsed && widgets.map(widget => <div key={widget.name} className="node-port">
-                <Handle type="target" position={Position.Left} id={widget.name} className="node-port__handle node-port__handle--input"
-                  style={{ '--port-color': getTypeColor(inputPortType(widget.config)) } as CSSProperties} />
-                <span>{data.inputLabels?.[widget.name] || widget.name}</span>
               </div>)}
             </div>
             <div className="node-ports__column node-ports__column--outputs">
@@ -126,6 +125,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
             {widgets.map(widget => <NodeParameter key={widget.name} {...widget}
               label={data.inputLabels?.[widget.name]} value={effectiveValues[widget.name]} onChange={handleUpdate}
               disabled={locked || connectedInputs.has(widget.name)} linked={connectedInputs.has(widget.name)}
+              sourceLabel={inputSourceLabel(id, widget.name, { nodes, edges })}
               slot={<Handle type="target" position={Position.Left} id={widget.name}
                 aria-label={`Input ${widget.name} (${inputPortType(widget.config)})`} title={`${widget.name} · ${inputPortType(widget.config)} · 可输入或连线`}
                 className="node-port__handle node-widget-slot" isConnectable={!locked} data-connected={connectedInputs.has(widget.name) || undefined}
@@ -134,7 +134,7 @@ const DynamicNode = ({ id, data, selected }: NodeProps<Node<NodeData>>) => {
         )}
         {!collapsed && Object.keys(nodeSpec.input.optional || {}).length > 0 && <button className="node-advanced-toggle nodrag"
           disabled={locked} onClick={() => updateNodeData(id, { showAdvanced: !data.showAdvanced })}>{data.showAdvanced ? '隐藏高级输入' : '显示高级输入'}</button>}
-        {hasStatus && <footer className="workflow-node__status" role="status" title={message}>
+        {!collapsed && hasStatus && <footer className="workflow-node__status" role="status" title={message}>
           <span className="node-status-dot" />
           <span className="workflow-node__status-label">{STATUS_LABELS[status] || status}</span>
           {footerMessage && footerMessage !== STATUS_LABELS[status] && <span className="workflow-node__status-message">{footerMessage}</span>}

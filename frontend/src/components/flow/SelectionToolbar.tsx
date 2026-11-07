@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { NodeToolbar, Position, getNodesBounds, useViewport } from '@xyflow/react';
-import { Trash2, Info, Palette, Boxes, LogIn, Ungroup, SkipForward, Save, Pencil, Plug, Unplug, Group, Scan, MousePointer2 } from 'lucide-react';
+import { Trash2, Info, Palette, Boxes, LogIn, Ungroup, SkipForward, Save, Pencil, Plug, Unplug, Group, Scan, MousePointer2, Minimize2, Maximize2 } from 'lucide-react';
 import { createGroup, fitGroup, groupContents, isGroup } from '../../utils/groups';
 import { useFlow } from '../../hooks/useFlowContext';
-import { bypassMapping, convertSelection, unpackSubgraph, exposePort, removeBoundary } from '../../utils/subgraphs';
+import { bypassMapping, convertSelection, unpackSubgraph, exposePort } from '../../utils/subgraphs';
 import NodeColorPicker from '../nodes/NodeColorPicker';
 
 export default function SelectionToolbar() {
@@ -15,12 +15,16 @@ export default function SelectionToolbar() {
   const [showColors, setShowColors] = useState(false);
   if (!selected.length) return null;
   const editable = selected.filter(n => !n.data.boundary);
+  const collapsible = editable.filter(n => !isGroup(n));
+  const collapsed = collapsible.every(n => n.data.collapsed);
   const canBypass = editable.length > 0 && editable.length === selected.length && editable.every(n => bypassMapping(n));
   const action = (operation: () => void) => { try { operation(); } catch (error) { addLog((error as Error).message, 'error'); } };
   return <NodeToolbar nodeId={selected.map(n => n.id)} isVisible={!selected.some(n => n.dragging)} position={getNodesBounds(selected).y * viewport.zoom + viewport.y < 60 ? Position.Bottom : Position.Top} offset={14}>
     <div className="selection-toolbar nodrag nopan" role="toolbar" aria-label="Selected node actions">
-      <button aria-label="Delete selected nodes" title="删除所选节点" disabled={isExecutionLocked || !editable.length} onClick={handleDelete}><Trash2 size={16} /></button>
+      <button aria-label="Delete selected nodes" title={selected.some(n => n.data.boundary) ? '删除所选节点 / 子图接口及连线' : '删除所选节点'} disabled={isExecutionLocked} onClick={handleDelete}><Trash2 size={16} /></button>
       <button aria-label="Node information" title="节点详情 · 参数 / 信息 / 设置" onClick={openNodeInspector}><Info size={16} /></button>
+      {collapsible.length > 0 && <button aria-label={collapsed ? 'Expand selected nodes' : 'Minimize selected nodes'} title={collapsed ? '展开节点' : '最小化节点'} disabled={isExecutionLocked}
+        onClick={() => editGraph(graph => ({ ...graph, nodes: graph.nodes.map(n => collapsible.some(c => c.id === n.id) ? { ...n, data: { ...n.data, collapsed: !collapsed } } : n) }))}>{collapsed ? <Maximize2 size={16} /> : <Minimize2 size={16} />}</button>}
       <button aria-label="Node color" title="节点颜色" disabled={isExecutionLocked} onClick={() => setShowColors(value => !value)}><Palette size={16} /></button>
       <button aria-label="Create group" title="为选区创建组（只整理布局）" disabled={isExecutionLocked}
         onClick={() => editGraph(graph => ({ ...graph, nodes: createGroup(graph.nodes) }))}><Group size={16} /></button>
@@ -41,7 +45,7 @@ export default function SelectionToolbar() {
         onClick={() => action(() => editGraph(graph => convertSelection(graph, single ? single.data.title || single.data.nodeSpec.display_name : '新子图')))}><Boxes size={16} /></button>}
       {subgraphPath.length > 0 && single && !single.data.boundary && !isGroup(single) && <button aria-label="Expose subgraph ports" title="公开输入 / 输出到父图" disabled={isExecutionLocked} onClick={() => setShowPorts(value => !value)}><Plug size={16} /></button>}
       {single?.data.boundary && subgraphPath.length > 0 && <button aria-label="Remove subgraph port" title="移除接口及外部连线" disabled={isExecutionLocked}
-        onClick={() => editGraph(graph => removeBoundary(graph, single.id))}><Unplug size={16} /></button>}
+        onClick={handleDelete}><Unplug size={16} /></button>}
       {showPorts && single && <div className="node-port-menu">
         <strong>公开到父图</strong>
         {Object.keys({ ...single.data.nodeSpec.input.required, ...single.data.nodeSpec.input.optional }).map(name => <button key={name} disabled={edges.some(e => e.target === single.id && e.targetHandle === name)} onClick={() => action(() => { editGraph(graph => exposePort(graph, single.id, 'input', name)); setShowPorts(false); })}>输入 → {single.data.inputLabels?.[name] || name}</button>)}

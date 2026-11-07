@@ -11,6 +11,7 @@ interface NodeParameterProps {
   label?: string;
   slot?: ReactNode;
   linked?: boolean;
+  sourceLabel?: string;
 }
 
 function parameterLabel(name: string): string {
@@ -93,7 +94,8 @@ export function NodeParameter(props: NodeParameterProps) {
       onKeyDown={stopKey}>
       {props.slot}
       <span id={labelId} className="node-parameter__label" title={`${label}\n${tooltip}`}>{label}</span>
-      {isString ? (
+      {props.linked ? <input className="node-linked-source" aria-label={name} disabled
+        value={props.sourceLabel || '上游输出'} title={props.sourceLabel || '上游输出'} /> : isString ? (
         <>
           <button type="button" className="node-text-field" disabled={disabled}
             aria-label={`Edit ${name}`} title={String(value ?? '') || tooltip}
@@ -123,7 +125,6 @@ export function NodeParameter(props: NodeParameterProps) {
           <ChevronDown size={12} aria-hidden="true" />
         </div>
       ) : ['INT', 'FLOAT', 'LONG'].includes(String(type)) ? <NumberField {...props} /> : null}
-      {props.linked && <small className="node-parameter__linked">连线优先</small>}
     </div>
   );
 }

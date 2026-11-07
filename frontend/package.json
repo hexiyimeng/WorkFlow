@@ -13,7 +13,8 @@
     "test:workspace": "esbuild src/components/layout/workspaceInteractions.test.tsx --bundle --packages=external --platform=node --format=cjs --jsx=automatic --outfile=node_modules/.tmp/workspaceInteractions.test.cjs && node node_modules/.tmp/workspaceInteractions.test.cjs && npm run test:documents",
     "test:nodes": "esbuild src/components/nodes/nodeParameters.test.tsx --bundle --packages=external --platform=node --format=cjs --jsx=automatic --outfile=node_modules/.tmp/nodeParameters.test.cjs && node node_modules/.tmp/nodeParameters.test.cjs && esbuild src/components/nodes/nodeInspector.test.tsx --bundle --packages=external --platform=node --format=cjs --jsx=automatic --loader:.css=empty --outfile=node_modules/.tmp/nodeInspector.test.cjs && node node_modules/.tmp/nodeInspector.test.cjs",
     "preview": "vite preview",
-    "test:documents": "esbuild src/hooks/workflowDocuments.test.tsx --bundle --packages=external --platform=node --format=esm --jsx=automatic --outfile=node_modules/.tmp/workflowDocuments.test.mjs && node node_modules/.tmp/workflowDocuments.test.mjs"
+    "test:documents": "esbuild src/hooks/workflowDocuments.test.tsx --bundle --packages=external --platform=node --format=esm --jsx=automatic --outfile=node_modules/.tmp/workflowDocuments.test.mjs && node node_modules/.tmp/workflowDocuments.test.mjs && npm run test:blueprints",
+    "test:blueprints": "esbuild src/hooks/blueprintLibrary.test.tsx --bundle --packages=external --platform=node --format=esm --jsx=automatic --outfile=node_modules/.tmp/blueprintLibrary.test.mjs && node node_modules/.tmp/blueprintLibrary.test.mjs"
   },
   "dependencies": {
     "@types/lodash-es": "^4.17.12",

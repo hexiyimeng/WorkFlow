@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { Node } from '@xyflow/react';
 import type { NodeData, NodeSpec } from '../types';
-import { cloneGraphIds, convertSelection, editSubgraphPort, exposePort, flattenGraph, graphAtPath, unpackSubgraph, updateGraphAtPath, normalizeGraph, type Graph } from './subgraphs.ts';
+import { cloneGraphIds, convertSelection, editSubgraphPort, exposePort, flattenGraph, graphAtPath, unpackSubgraph, updateGraphAtPath, normalizeGraph, deleteSelection, type Graph } from './subgraphs.ts';
 import { nodeInputValue, nodeInputValues, withNodeInputValue } from './nodeInputs.ts';
 import { compileWorkflow } from './compileWorkflow.ts';
 import { documentFingerprint } from './libraryApi.ts';
@@ -16,6 +16,16 @@ const graph: Graph = { nodes: [node('read', 'Reader'), node('process', 'Process'
 ] };
 const semantic = (g: Graph) => ({ ids: g.nodes.map(n => n.id).sort(), edges: g.edges.map(e => [e.source, e.sourceHandle, e.target, e.targetHandle].join('/')).sort() });
 const original = JSON.stringify(graph);
+const isolated = convertSelection({ nodes: [{ ...node('process', 'Process'), selected: true }], edges: [] }, 'Private ports');
+assert.equal(isolated.nodes[0].data.subgraph!.inputs.length, 0, 'unconnected inputs stay private by default');
+assert.equal(isolated.nodes[0].data.subgraph!.outputs.length, 0, 'unconnected outputs stay private by default');
+const wholePipeline = convertSelection({ ...graph, nodes: graph.nodes.map(n => ({ ...n, selected: true })) }, 'Pipeline');
+assert.equal(wholePipeline.nodes[0].data.subgraph!.inputs.length, 0);
+assert.equal(wholePipeline.nodes[0].data.subgraph!.outputs.length, 0, 'internal connections do not create public ports');
+assert.deepEqual(compileWorkflow(wholePipeline), compileWorkflow(graph), 'private interfaces do not change internal execution');
+const manualInterfaces = updateGraphAtPath(isolated, [isolated.nodes[0].id], inner => exposePort(exposePort(inner, 'process', 'input', 'image'), 'process', 'output', '0'));
+assert.equal(manualInterfaces.nodes[0].data.subgraph!.inputs.length, 1);
+assert.equal(manualInterfaces.nodes[0].data.subgraph!.outputs.length, 1, 'inputs and outputs can still be exposed explicitly');
 const converted = convertSelection({ ...graph, nodes: graph.nodes.map(n => ({ ...n, selected: n.id === 'process' })) }, 'One node');
 const wrapper = converted.nodes.find(n => n.data.subgraph)!;
 assert(wrapper && wrapper.data.subgraph!.nodes.filter(n => !n.data.boundary).length === 1);
@@ -174,3 +184,22 @@ const differentFallback = updateGraphAtPath(conditionalExposed, [conditionalId],
 const renamedConditional = normalizeGraph(updateGraphAtPath(differentFallback, [conditionalId], g => ({ ...g, nodes: g.nodes.map(n => n.id === 'process' ? { ...n, data: { ...n.data, title: 'Renamed', showAdvanced: true } } : n) })), differentFallback);
 assert.deepEqual(compileWorkflow(renamedConditional), compileWorkflow(differentFallback), 'metadata edits preserve links controlled by a promoted default');
 console.log('conditional dependency edits and nested interface type regressions passed');
+
+const wiredBeforeDelete = JSON.stringify(wired);
+const deletedParameter = updateGraphAtPath(wired, [wrapperId], inner => deleteSelection({ ...inner,
+  nodes: inner.nodes.map(n => ({ ...n, selected: n.id === diameterPort.nodeId })) }));
+assert(!graphAtPath(deletedParameter, [wrapperId]).nodes.some(n => n.id === diameterPort.nodeId));
+assert(!deletedParameter.nodes.find(n => n.id === wrapperId)!.data.subgraph!.inputs.some(p => p.id === diameterPort.id), 'deleting an interface removes the public port');
+assert(!deletedParameter.edges.some(e => e.id === 'number-edge'), 'deleting an interface removes its external connection');
+assert.equal(compileWorkflow(deletedParameter).process.inputs.diameter, 36, 'deleting an input retains the edited default on its consumer');
+assert.equal(JSON.stringify(wired), wiredBeforeDelete, 'selection deletion preserves the previous graph for undo');
+const outputBoundary = paramWrapper.data.subgraph!.outputs[0].nodeId;
+const deletedOutput = updateGraphAtPath(wired, [wrapperId], inner => deleteSelection({ ...inner,
+  nodes: inner.nodes.map(n => ({ ...n, selected: n.id === outputBoundary })) }));
+assert(!deletedOutput.edges.some(e => e.source === wrapperId), 'output deletion removes parent connections');
+const mixedDeleted = updateGraphAtPath(wired, [wrapperId], inner => deleteSelection({ ...inner,
+  nodes: inner.nodes.map(n => ({ ...n, selected: n.id === diameterPort.nodeId || n.id === 'process' })) }));
+const mixedInner = graphAtPath(mixedDeleted, [wrapperId]);
+assert(!mixedInner.nodes.some(n => n.id === 'process' || n.id === diameterPort.nodeId));
+assert(mixedInner.edges.every(e => mixedInner.nodes.some(n => n.id === e.source) && mixedInner.nodes.some(n => n.id === e.target)), 'mixed node/interface deletion leaves no dangling internal links');
+console.log('selection deletion, interface defaults and parent connection cleanup tests passed');

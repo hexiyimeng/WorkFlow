@@ -45,5 +45,6 @@ export function useSubgraphEditor(root: Graph, setRoot: Dispatch<SetStateAction<
       if (graph.nodes.find(n => n.id === id)?.data.subgraph) setPath([...validPath, id]);
     },
     navigateSubgraph: (depth: number) => setPath(validPath.slice(0, depth)),
-    resetSubgraph: useCallback(() => setPath([]), []) };
+    resetSubgraph: useCallback(() => setPath([]), []),
+    openSubgraphPath: useCallback((ids: string[]) => setPath(ids), []) };
 }

@@ -174,6 +174,16 @@ export function removeBoundary(graph: Graph, id: string): Graph {
   }), edges: graph.edges.filter(e => e.source !== id && e.target !== id) };
 }
 
+/** One deletion path for toolbar, keyboard and context menu, including interfaces. */
+export function deleteSelection(graph: Graph): Graph {
+  const selected = graph.nodes.filter(n => n.selected && !isInterfacePlaceholder(n.id));
+  const ids = new Set(selected.map(n => n.id));
+  // Removing an input retains its current literal as the internal node's fallback.
+  const withoutInterfaces = selected.filter(n => n.data.boundary).reduce((next, n) => removeBoundary(next, n.id), graph);
+  return { ...withoutInterfaces, nodes: withoutInterfaces.nodes.filter(n => !ids.has(n.id)),
+    edges: withoutInterfaces.edges.filter(e => !e.selected && !ids.has(e.source) && !ids.has(e.target)) };
+}
+
 export function mapGraphNodes(nodes: Node<NodeData>[], change: (node: Node<NodeData>) => Node<NodeData>): Node<NodeData>[] {
   return nodes.map(node => {
     let next = change(node.data.subgraph ? { ...node, data: { ...node.data,
@@ -205,10 +215,9 @@ export function convertSelection(graph: Graph, title: string): Graph {
     const visible = visibleNodeInputNames(node.data.nodeSpec, nodeInputValues(node, graph));
     for (const [name, config] of Object.entries({ ...node.data.nodeSpec.input.required, ...node.data.nodeSpec.input.optional })) {
       const incoming = graph.edges.find(e => e.target === node.id && e.targetHandle === name);
-      if (!visible.has(name) || (incoming && ids.has(incoming.source))) continue;
-      // Scalar widgets keep their local editor and slot. Only promote a scalar
-      // automatically when an existing external connection crosses the boundary.
-      if (isWidgetInput(config) && !incoming) continue;
+      // New interfaces are opt-in. Only bridge existing cross-boundary links
+      // so wrapping an already connected selection cannot break its workflow.
+      if (!visible.has(name) || !incoming || ids.has(incoming.source)) continue;
       const boundaryId = newNodeId();
       const portId = `in_${sub.inputs.length}`;
       const portName = selected.length === 1 ? name : `${node.data.title || node.data.nodeSpec.display_name} · ${name}`;
@@ -223,6 +232,7 @@ export function convertSelection(graph: Graph, title: string): Graph {
       sub.edges.push({ id: newNodeId(), source: boundaryId, sourceHandle: '0', target: node.id, targetHandle: name });
     }
     resolveNodeOutputTypes(node.data.nodeSpec, nodeInputValues(node, graph)).forEach((type, index) => {
+      if (!graph.edges.some(e => e.source === node.id && (e.sourceHandle || '0') === String(index) && !ids.has(e.target))) return;
       const boundaryId = newNodeId();
       const name = node.data.nodeSpec.output_name?.[index] || `Output ${index + 1}`;
       outputForSource.set(`${node.id}:${index}`, sub.outputs.length);
