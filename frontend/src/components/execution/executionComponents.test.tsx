@@ -4,7 +4,7 @@ import ExecutionSettingsDrawer from './ExecutionSettingsDrawer';
 import RecoveryBrowserDialog from './RecoveryBrowserDialog';
 import Header from '../layout/Header';
 import { FlowContext, type FlowContextType } from '../../context/FlowContextDef';
-import type { ExecutionPreflightResponse, WorkflowExecutionSettings } from '../../types';
+import type { ExecutionPreflightResponse, WorkflowExecutionSettings, SubmittedExecutionSettings } from '../../types';
 
 function assert(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -61,7 +61,37 @@ const executionSettingsMarkup = renderToStaticMarkup(
   </FlowContext.Provider>,
 );
 assert(executionSettingsMarkup.includes('Execution Settings'), 'settings drawer must render');
+assert(!executionSettingsMarkup.includes('Save Worker Resources'), 'worker drafts share Save Settings');
 assert(executionSettingsMarkup.includes('Window Shape'), 'Window settings must render');
+
+const submittedSettings: SubmittedExecutionSettings = {
+  executionId: 'running-execution',
+  config: { mode: 'window', windowShape: [32, 128, 128], maxInFlightWindows: 3, resumeAction: 'new', recoveryLocation: { mode: 'custom', directory: '/submitted/recovery' } },
+  workerProfiles: [{ name: 'CPU', physical_resources: { cpu: 12, memory: '24GB', gpu: 0 }, logical_resources: { CPU: 12 }, capabilities: ['CPU'], threads: 12 }],
+  workerPools: [{ profile: 'CPU', minimum_jobs: 1, maximum_jobs: 4, processes: 2 }],
+  preflight: { windowable: true, totalWindows: 3, outputShape: [96, 128, 128] },
+};
+for (const phase of ['graph_building', 'submitted', 'running', 'cancelling', 'disconnected'] as const) {
+  const markup = renderToStaticMarkup(<FlowContext.Provider value={{ ...baseContext,
+    activeExecutionSettings: { version: 1, mode: 'full_graph' },
+    submittedExecutionSettings: submittedSettings,
+    executionState: { phase, executionId: 'running-execution' },
+    isExecuting: phase !== 'disconnected',
+  } as FlowContextType}><ExecutionSettingsDrawer /></FlowContext.Provider>);
+  assert(markup.includes('Submitted settings') && markup.includes('/submitted/recovery') && markup.includes('24GB'), `${phase} shows this run's immutable settings`);
+  assert(!markup.includes('<input') && !markup.includes('Save Settings') && !markup.includes('<form'), `${phase} cannot edit, reset, or save`);
+}
+const unknownSettingsMarkup = renderToStaticMarkup(<FlowContext.Provider value={{ ...baseContext,
+  submittedExecutionSettings: submittedSettings, isExecuting: true,
+  executionState: { phase: 'running', executionId: 'another-execution' },
+} as FlowContextType}><ExecutionSettingsDrawer /></FlowContext.Provider>);
+assert(unknownSettingsMarkup.includes('not available in this browser') && !unknownSettingsMarkup.includes('24GB'), 'missing snapshots must not display saved drafts or a different run');
+const recoveredSettingsMarkup = renderToStaticMarkup(<FlowContext.Provider value={{ ...baseContext,
+  submittedExecutionSettings: submittedSettings, isExecuting: false,
+  executionState: { phase: 'succeeded', executionId: 'running-execution' },
+  recoveredGraphView: { executionConfig: { mode: 'window', windowShape: [16, 64, 64], resumeAction: 'new', recoveryLocation: { mode: 'custom', directory: '/other/recovery' } }, summary: { executionId: 'recovery-execution' } },
+} as unknown as FlowContextType}><ExecutionSettingsDrawer /></FlowContext.Provider>);
+assert(recoveredSettingsMarkup.includes('/other/recovery') && recoveredSettingsMarkup.includes('recovery-execution') && !recoveredSettingsMarkup.includes('/submitted/recovery'), 'Recovery preview must not show an unrelated previous execution snapshot');
 assert(
   executionSettingsMarkup.includes('value="64"')
     && executionSettingsMarkup.includes('value="8"'),

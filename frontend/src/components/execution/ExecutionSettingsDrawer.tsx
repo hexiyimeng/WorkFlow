@@ -1,9 +1,11 @@
 import {
   useEffect,
+  useImperativeHandle,
   useMemo,
   useRef,
   useState,
   type FormEvent,
+  type Ref,
 } from 'react';
 import { useFlow } from '../../hooks/useFlowContext';
 import type {
@@ -23,9 +25,12 @@ import {
   loadWorkerProfiles,
   normalizeRequiredWorkerProfiles,
   saveRequiredWorkerResources,
+  saveWorkerResources,
   synchronizeLogicalResources,
 } from '../../utils/workerResources';
 import { Button } from '../ui/Button';
+import ExecutionSettingsInspector from './ExecutionSettingsInspector';
+import { blocksExecutionChanges } from '../../utils/executionRuntime';
 
 const DEFAULT_SETTINGS: WorkflowExecutionSettings = {
   version: 1,
@@ -167,21 +172,24 @@ const nonnegativeIntegerDraft = (value: string): number | null => {
     : null;
 };
 
+interface WorkerResourcesHandle {
+  save: () => () => void;
+}
+
 const WorkerResourcesSection = ({
   requiredProfiles,
   disabled,
-  onSaved,
+  ref,
 }: {
   requiredProfiles: string[];
   disabled: boolean;
-  onSaved: () => Promise<void>;
+  ref: Ref<WorkerResourcesHandle>;
 }) => {
   const [profiles, setProfiles] = useState<WorkerProfile[]>([]);
   const [pools, setPools] = useState<WorkerPool[]>([]);
   const [drafts, setDrafts] = useState<Record<string, WorkerResourceDraft>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, WorkerDraftErrors>>({});
   const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
 
   const requirementKey = requiredProfiles.join('|');
   useEffect(() => {
@@ -228,8 +236,7 @@ const WorkerResourcesSection = ({
     }));
     setError(null);
   };
-  const save = async () => {
-    setSaving(true);
+  const save = () => {
     setError(null);
     try {
       const nextErrors: Record<string, WorkerDraftErrors> = {};
@@ -289,16 +296,16 @@ const WorkerResourcesSection = ({
           `Worker Profile "${profileName}" — ${field ? WORKER_FIELD_LABELS[field] : 'invalid'}: ${message}`,
         );
       }
+      const previousProfiles = loadWorkerProfiles();
+      const previousPools = loadWorkerPools();
       saveRequiredWorkerResources(nextProfiles, nextPools);
-      setProfiles(nextProfiles);
-      setPools(nextPools);
-      await onSaved();
+      return () => saveWorkerResources(previousProfiles, previousPools);
     } catch (caught) {
       setError((caught as Error).message);
-    } finally {
-      setSaving(false);
+      throw caught;
     }
   };
+  useImperativeHandle(ref, () => ({ save }));
 
   if (requiredProfiles.length === 0) {
     return (
@@ -332,7 +339,7 @@ const WorkerResourcesSection = ({
           ? `${minimum * processes} - ${maximum * processes}`
           : null;
         return (
-          <fieldset key={profile.name} disabled={disabled || saving}
+          <fieldset key={profile.name} disabled={disabled}
             className="rounded border p-2" style={{ borderColor: 'var(--color-border-subtle)' }}>
             <legend className="px-1 font-mono text-[10px] font-semibold">{profile.name}</legend>
             <div className="grid grid-cols-2 gap-2 text-[9px]">
@@ -361,7 +368,7 @@ const WorkerResourcesSection = ({
                 <input type="number" min="0" max="1" step="1"
                   value={fixedGpu === undefined ? draft.gpu : String(fixedGpu)}
                   aria-invalid={Boolean(errors.gpu)}
-                  disabled={disabled || saving || fixedGpu !== undefined}
+                  disabled={disabled || fixedGpu !== undefined}
                   onChange={event => {
                     const gpu = event.target.value;
                     updateDraft(profile.name, 'gpu', gpu);
@@ -379,7 +386,7 @@ const WorkerResourcesSection = ({
               <label>Processes / Job
                 <input type="number" min="1" step="1" value={gpuProfile ? '1' : draft.processes}
                   aria-invalid={Boolean(errors.processes)}
-                  disabled={disabled || saving || gpuProfile}
+                  disabled={disabled || gpuProfile}
                   onChange={event => updateDraft(profile.name, 'processes', event.target.value)}
                   className="mt-1 h-8 w-full rounded border bg-[var(--color-bg-field)] px-2 disabled:opacity-60" />
                 <FieldError message={errors.processes} />
@@ -401,12 +408,6 @@ const WorkerResourcesSection = ({
         );
       })}
       {error && <FieldError message={error} />}
-      <div className="flex justify-end">
-        <Button type="button" variant="secondary" size="sm" loading={saving}
-          disabled={disabled} onClick={() => { void save(); }}>
-          Save Worker Resources
-        </Button>
-      </div>
     </section>
   );
 };
@@ -424,7 +425,13 @@ export default function ExecutionSettingsDrawer() {
     isConnected,
     isExecuting,
     isPreflighting,
+    executionState,
+    submittedExecutionSettings,
+    recoveredGraphView,
   } = useFlow();
+
+  const hasActiveExecution = isExecuting || blocksExecutionChanges(executionState?.phase ?? 'idle');
+  const readOnly = hasActiveExecution || Boolean(recoveredGraphView);
 
   const savedSettings = activeExecutionSettings ?? DEFAULT_SETTINGS;
   const [draft, setDraft] = useState<SettingsDraft>(() => (
@@ -437,6 +444,7 @@ export default function ExecutionSettingsDrawer() {
   const [actionError, setActionError] = useState<string | null>(null);
   const wasOpenRef = useRef(false);
   const draftWorkflowIdRef = useRef<string | null>(null);
+  const workerResourcesRef = useRef<WorkerResourcesHandle>(null);
 
   useEffect(() => {
     const workflowChanged = draftWorkflowIdRef.current !== activeWorkflowDocumentId;
@@ -529,7 +537,7 @@ export default function ExecutionSettingsDrawer() {
   const locationError = contextualError('newRunRecoveryLocation');
   const modeError = contextualError('mode');
   const versionError = contextualError('version');
-  const canSave = !isExecuting
+  const canSave = !readOnly
     && !isSaving
     && !isPreflighting
     && !versionError
@@ -552,14 +560,20 @@ export default function ExecutionSettingsDrawer() {
     if (!canSave) return;
     setIsSaving(true);
     setActionError(null);
+    let rollbackWorkers: (() => void) | undefined;
     try {
+      // Preflight must inspect the new Worker draft. Restore the previous
+      // configuration if execution settings cannot be saved.
+      rollbackWorkers = workerResourcesRef.current?.save();
       const saved = await saveExecutionSettings(currentDraftSettings());
       if (saved) {
         closeExecutionSettings();
       } else {
+        rollbackWorkers?.();
         setDirtyFields(new Set());
       }
     } catch (error) {
+      rollbackWorkers?.();
       setDirtyFields(new Set());
       setActionError((error as Error).message);
     } finally {
@@ -592,6 +606,12 @@ export default function ExecutionSettingsDrawer() {
   };
 
   if (!isExecutionSettingsOpen) return null;
+  if (readOnly) return <ExecutionSettingsInspector
+    snapshot={hasActiveExecution && submittedExecutionSettings?.executionId === executionState?.executionId ? submittedExecutionSettings : null}
+    recoveryConfig={recoveredGraphView?.executionConfig}
+    recoverySummary={recoveredGraphView?.summary}
+    executionId={hasActiveExecution ? executionState?.executionId : recoveredGraphView?.summary.executionId}
+    onClose={closeExecutionSettings} />;
 
   const requiredResources = executionPreflight?.requiredResources;
   const availableResources = executionPreflight?.availableResources;
@@ -638,7 +658,7 @@ export default function ExecutionSettingsDrawer() {
       role="dialog"
       aria-modal="false"
       aria-labelledby="execution-settings-title"
-      className="fixed bottom-0 right-0 top-12 z-[90] flex w-full max-w-[440px] flex-col border-l"
+      className="fixed bottom-0 right-0 top-[var(--workspace-header-height)] z-[90] flex w-full max-w-[440px] flex-col border-l"
       style={{
         backgroundColor: 'var(--color-bg-surface)',
         borderColor: 'var(--color-border-default)',
@@ -976,9 +996,9 @@ export default function ExecutionSettingsDrawer() {
           )}
 
           <WorkerResourcesSection
+            ref={workerResourcesRef}
             requiredProfiles={workerProfileNames}
             disabled={isExecuting || isSaving}
-            onSaved={async () => refreshExecutionSettingsPreflight()}
           />
 
           <section

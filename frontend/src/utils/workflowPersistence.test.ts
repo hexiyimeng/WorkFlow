@@ -1,4 +1,5 @@
 import type { Edge, Node } from '@xyflow/react';
+import { inputSourceLabel } from './nodeInputs.ts';
 import type {
   NodeData,
   WorkflowExecutionSettings,
@@ -8,6 +9,7 @@ import {
   parseStoredFlow,
   parseWorkflowDocument,
   serializeWorkflowDocument,
+  hydrateFlowWithLatestSpecs,
 } from './workflowPersistence.ts';
 
 function assert(condition: boolean, message: string): asserts condition {
@@ -268,3 +270,19 @@ try {
   threwForEmptyId = true;
 }
 assert(threwForEmptyId, 'serializer must reject an empty stable workflowId');
+
+const minimized = makeNode('minimized', 7);
+minimized.data.collapsed = true;
+const minimizedDocument = parseWorkflowDocument(serializeWorkflowDocument({ workflowId: 'minimized-document', nodes: [minimized], edges: [] }))!;
+const restoredMinimized = hydrateFlowWithLatestSpecs(minimizedDocument, { ExampleNode: minimized.data.nodeSpec }).nodes[0];
+assert(restoredMinimized.data.collapsed === true, 'minimization survives export, parsing and hydration');
+assert(restoredMinimized.data.values.threshold === 7 && !restoredMinimized.data.runState, 'presentation state must not change parameters or restore stale execution state');
+
+const sourceLabelNode = makeNode('reader-source', 1);
+sourceLabelNode.data.title = '读取图像';
+sourceLabelNode.data.nodeSpec.output_name = ['image'];
+const sourceLabelGraph = { nodes: [sourceLabelNode], edges: [{ id: 'source-label-edge', source: sourceLabelNode.id, sourceHandle: '0', target: 'process', targetHandle: 'image' }] };
+assert(inputSourceLabel('process', 'image', sourceLabelGraph) === '读取图像 · image', 'connection labels show the upstream title and output name without evaluating values');
+assert(inputSourceLabel('process', 'unconnected', sourceLabelGraph) === undefined, 'literal inputs have no source label');
+sourceLabelNode.data.outputLabels = { '0': '图像输出' };
+assert(inputSourceLabel('process', 'image', sourceLabelGraph) === '读取图像 · 图像输出', 'existing output display labels remain recognizable');

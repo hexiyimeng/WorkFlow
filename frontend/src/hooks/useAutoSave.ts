@@ -1,7 +1,8 @@
 // src/hooks/useAutoSave.ts
 import { useEffect, useRef, useState } from 'react';
 import type { Node, Edge } from '@xyflow/react';
-import type { Workflow, NodeData, NodeSpec } from '../types';
+import type { Workflow, NodeData, NodeSpec, LibraryReference } from '../types';
+import { readLibraryReference, workflowDraftKey, workflowServer } from '../utils/workflowDrafts';
 import {
   hydrateFlowWithLatestSpecs,
   parseWorkflowDocument,
@@ -16,6 +17,7 @@ export type AutoSaveDocumentLoader = (
   document: ParsedWorkflowDocument,
   hydratedNodes: Node<NodeData>[],
   hydratedEdges: Edge[],
+  libraryRef?: LibraryReference,
 ) => void;
 
 /**
@@ -59,6 +61,8 @@ export const useAutoSave = (
     }
 
     try {
+      const stored = JSON.parse(savedData);
+      if (stored._server && stored._server !== workflowServer()) return;
       const parsed = parseWorkflowDocument(JSON.parse(savedData), {
         // useWorkflows already migrated a legacy autosave synchronously. Reuse
         // that ID instead of generating a second identity while hydrating it.
@@ -72,7 +76,7 @@ export const useAutoSave = (
       }
 
       const result = hydrateFlowWithLatestSpecs(parsed, nodeDefs);
-      loadWorkflowDocument(parsed, result.nodes, result.edges);
+      loadWorkflowDocument(parsed, result.nodes, result.edges, readLibraryReference(JSON.parse(savedData)._libraryRef));
 
       result.warnings.forEach(warning => console.warn('[AutoSave]', warning));
       if (result.invalidNodeTypes.length > 0) {
@@ -125,7 +129,9 @@ export const useAutoSave = (
         timestamp: Date.now(),
       });
       try {
-        localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(document));
+        const saved = JSON.stringify({ ...document, _libraryRef: activeWorkflow.libraryRef, _server: workflowServer() });
+        localStorage.setItem(AUTOSAVE_KEY, saved);
+        localStorage.setItem(workflowDraftKey(workflowId, workflowServer()), saved);
       } catch (error) {
         console.error('[AutoSave] Save failed:', error);
       }

@@ -76,7 +76,7 @@ export WorkFlow_DASK_TLS_KEY=/absolute/private/dask-service.key
 
 启动脚本会拒绝缺项、相对路径、symlink 或不可读文件。证书文件“已配置”不等于 mTLS 已验收；必须在实际 deployment 中确认 Scheduler 地址为 `tls://`，并完成 Worker 注册和计算测试。
 
-当前目标集群尚未提供并实测 mTLS 证书。只在管理员确认的可信隔离内网和严格 ACL 下进行临时验收时，才可显式使用：
+如果目标集群暂未配置 mTLS 证书，只在管理员确认的可信隔离内网和严格 ACL 下进行临时验收时，才可显式使用：
 
 ```bash
 export WorkFlow_DASK_ALLOW_INSECURE_CLUSTER=1
@@ -226,12 +226,12 @@ Window resume/restart 仍由 Recovery 界面显式发起，并使用 recovery �
 
 ## 外部访问页面
 
-先连接管理员提供的 OpenVPN，然后在 Windows checkout 中运行：
+如果集群需要 VPN，先按管理员要求连接，再在 Windows checkout 中运行。将 `YOUR_CLUSTER_HOST` 替换为集群提供的 SSH 登录地址：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
   -User YOUR_CLUSTER_USER `
-  -ClusterHost 10.200.201.2
+  -ClusterHost YOUR_CLUSTER_HOST
 ```
 
 打开 `http://127.0.0.1:18000/`。脚本使用已有 SSH 认证，不生成、读取或保存密码/私钥。不要把 Uvicorn 改成监听公网 `0.0.0.0`；多人生产访问应由管理员在 service node 前部署带 TLS 和身份认证的反向代理。
@@ -240,7 +240,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\hpc\open_workflow_tunnel.ps1 `
 
 ### 最低资源与 Adaptive 实测
 
-已完成的真实集群结果见 [2026-09-20 实测记录](validation/slurm-adaptive-2026-09-20.md)，包含扩缩容通过与 GPU 扩容排队两种情况及验证边界。
+请在实际部署的集群验证最低资源申请、扩容、缩容和排队行为；分区、配额及可用资源会影响测试结果。
 
 在共享 checkout 已同步到当前版本、Python 环境与后端一致、没有正在执行的工作流时，使用后端相同的 `WorkFlow_*` 环境变量运行：
 

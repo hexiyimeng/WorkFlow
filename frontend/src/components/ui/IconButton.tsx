@@ -57,6 +57,8 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
         ref={ref}
         className={`${base} ${className}`}
         title={title}
+        type="button"
+        aria-label={title}
         {...props}
       >
         <span className="w-4 h-4 flex items-center justify-center">{children}</span>

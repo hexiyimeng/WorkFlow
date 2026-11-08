@@ -1,3 +1,4 @@
+import LibrarySaveDialog from './components/layout/LibrarySaveDialog';
 import Header from './components/layout/Header';
 import PluginDiagnosticsBanner from './components/layout/PluginDiagnosticsBanner';
 import Sidebar from './components/layout/Sidebar';
@@ -5,22 +6,25 @@ import BottomPanel from './components/layout/BottomPanel';
 import FlowEditor from './components/flow/FlowEditor';
 import ExecutionSettingsDrawer from './components/execution/ExecutionSettingsDrawer';
 import RecoveryBrowserDialog from './components/execution/RecoveryBrowserDialog';
+import NodeInspector from './components/nodes/NodeInspector';
 
 export default function App() {
   return (
-    <div className="w-screen h-screen flex flex-col overflow-hidden font-sans transition-colors duration-300"
+    <div className="workspace w-screen h-screen flex flex-col overflow-hidden font-sans"
       style={{ backgroundColor: 'var(--color-bg-app)', color: 'var(--color-text-primary)' }}>
       <Header />
       <PluginDiagnosticsBanner />
-      <div className="flex-1 flex overflow-hidden relative">
+      <div className="workspace-body">
         <Sidebar />
-        <main className="flex-1 relative flex flex-col overflow-hidden">
+        <main className="workspace-main">
           <FlowEditor />
           <BottomPanel />
         </main>
+        <NodeInspector />
       </div>
       <ExecutionSettingsDrawer />
       <RecoveryBrowserDialog />
+      <LibrarySaveDialog />
     </div>
   );
 }

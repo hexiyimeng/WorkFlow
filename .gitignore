@@ -40,3 +40,8 @@ backend/examples/
 
 output/pdf
 tmp/
+
+# Local design documents and historical cluster validation records
+/docs/
+/deploy/hpc/validation/
+/user/

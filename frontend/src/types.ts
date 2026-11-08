@@ -166,6 +166,15 @@ export type ExecutionConfig =
       recoveryLocation: RecoveryLocation;
     };
 
+/** Browser-local, immutable copy of the settings sent with one execution. */
+export interface SubmittedExecutionSettings {
+  executionId: string;
+  config: ExecutionConfig;
+  workerProfiles: WorkerProfile[];
+  workerPools: WorkerPool[];
+  preflight: ExecutionPreflightResponse | null;
+}
+
 export interface ExecutionOutput {
   nodeId: string;
   nodeType: string;
@@ -320,7 +329,20 @@ export interface NodeSpec {
   output_name?: string[];
   output_node?: boolean;
   required_worker_profile?: string;
+  bypassMapping?: Record<string, string>;
 }
+
+export type InputDefinition = [string | string[], Record<string, unknown>?];
+export interface SubgraphPort { id: string; name: string; type: string; nodeId: string; config?: InputDefinition }
+export interface SubgraphGraph {
+  nodes: Node<NodeData>[];
+  edges: Edge[];
+  inputs: SubgraphPort[];
+  outputs: SubgraphPort[];
+}
+
+export interface LibraryReference { id: string; revision: number; folder: string; fingerprint: string; kind?: 'workflows' | 'subgraphs' }
+export interface LibraryItem { id: string; name: string; folder: string; revision: number; updatedAt: number }
 
 export interface PluginLoadedEntry {
   module: string;
@@ -383,9 +405,21 @@ export interface ReloadNodesResponse {
 }
 
 export interface NodeData extends Record<string, unknown> {
+  /** Visual frame only; never becomes an execution task. */
+  group?: { width: number; height: number };
   opType: string;
   nodeSpec: NodeSpec;
   values: Record<string, unknown>;
+  title?: string;
+  color?: string;
+  inputLabels?: Record<string, string>;
+  outputLabels?: Record<string, string>;
+  showAdvanced?: boolean;
+  collapsed?: boolean;
+  boundaryConfig?: InputDefinition;
+  bypassed?: boolean;
+  subgraph?: SubgraphGraph;
+  boundary?: 'input' | 'output';
   message?: string;
   runState?: RunState;
   waitingFor?: string[];
@@ -423,6 +457,11 @@ export type WSMessageType =
 export interface WSMessage {
   type: WSMessageType;
   message?: string;
+  errorType?: string;
+  traceback?: string;
+  nodeType?: string;
+  stage?: string;
+  taskKey?: string;
   taskId?: string;
   executionId?: string;
   jobId?: string;
@@ -477,6 +516,7 @@ export interface Workflow {
   nodes: Node<NodeData>[];
   edges: Edge[];
   timestamp: number;
+  libraryRef?: LibraryReference;
 }
 
 export interface LogEntry {
@@ -484,4 +524,5 @@ export interface LogEntry {
   timestamp: number;
   type: 'info' | 'success' | 'error' | 'warning';
   message: string;
+  details?: string;
 }

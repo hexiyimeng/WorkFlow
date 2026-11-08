@@ -1,5 +1,8 @@
-﻿import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
+import { compileWorkflow as buildExecutionGraph } from '../utils/compileWorkflow';
+import { mapGraphNodes } from '../utils/subgraphs';
+import { useState, useEffect, useRef, useCallback, useReducer } from 'react';
 import type { Node, Edge } from '@xyflow/react';
+import { executionDiagnostic } from '../utils/executionDiagnostics';
 import type {
   NodeData,
   WSMessage,
@@ -12,6 +15,7 @@ import type {
   PluginDiagnostics,
   ReloadNodesResponse,
   ExecutionConfig,
+  SubmittedExecutionSettings,
   ExecutionPreflightResponse,
   WindowExecutionProgress,
   RecoveredGraphView,
@@ -55,12 +59,13 @@ import {
   websocketReconnectDelayMs,
 } from '../utils/executionRuntime';
 import { workerResourcePayload } from '../utils/workerResources';
+import { copySubmittedExecutionSettings, rememberSubmittedExecutionSettings, readSubmittedExecutionSettings } from '../utils/submittedExecutionSettings';
 
 // === Reset helper ===
 const resetRuntimeNodeState = (
   setNodes: React.Dispatch<React.SetStateAction<Node<NodeData>[]>>,
 ) => {
-  setNodes(nds => nds.map(n => ({
+  setNodes(nds => mapGraphNodes(nds, n => ({
     ...n,
     data: { ...n.data, message: '', runState: undefined, waitingFor: undefined, device: undefined, executionId: undefined },
   })));
@@ -113,23 +118,6 @@ type ExecutionGraph = Record<string, {
   type: string;
   inputs: Record<string, unknown>;
 }>;
-
-const buildExecutionGraph = (
-  nodes: Node<NodeData>[],
-  edges: Edge[],
-): ExecutionGraph => {
-  const graph: ExecutionGraph = {};
-  nodes.forEach(node => {
-    const inputs = { ...node.data.values };
-    edges.forEach(edge => {
-      if (edge.target === node.id && edge.targetHandle) {
-        inputs[edge.targetHandle] = [edge.source, parseInt(edge.sourceHandle || '0')];
-      }
-    });
-    graph[node.id] = { type: node.data.opType, inputs };
-  });
-  return graph;
-};
 
 // === Execution state reducer ===
 type ExecutionAction =
@@ -209,7 +197,7 @@ export const useFlowEngine = (
   edges: Edge[],
   setNodes: React.Dispatch<React.SetStateAction<Node<NodeData>[]>>,
   setEdges: React.Dispatch<React.SetStateAction<Edge[]>>,
-  addLog: (msg: string, type?: LogEntry['type']) => void
+  addLog: (msg: string, type?: LogEntry['type'], details?: string) => void
 ) => {
   // --- Connection state ---
   const [websocketStatus, setWebsocketStatus] = useState<WebSocketStatus>('disconnected');
@@ -221,6 +209,7 @@ export const useFlowEngine = (
   const [isPreflighting, setIsPreflighting] = useState(false);
   const [executionPreflight, setExecutionPreflight] = useState<ExecutionPreflightResponse | null>(null);
   const [lastSubmittedExecutionConfig, setLastSubmittedExecutionConfig] = useState<ExecutionConfig | null>(null);
+  const [submittedExecutionSettings, setSubmittedExecutionSettings] = useState<SubmittedExecutionSettings | null>(readSubmittedExecutionSettings);
   const [isRecoveryBrowserOpen, setIsRecoveryBrowserOpen] = useState(false);
   const [recoveredGraphView, setRecoveredGraphView] = useState<RecoveredGraphView | null>(null);
 
@@ -235,6 +224,7 @@ export const useFlowEngine = (
   const reconnectAttemptRef = useRef(0);
   const lastReconnectWarningAtRef = useRef(0);
   const finishedRef = useRef(false);
+  const loggedNodeStatesRef = useRef(new Set<string>());
   const restoredExecutionRef = useRef(false); // tracks if current session was restored via subscribe
   const reconciliationSnapshotReceivedRef = useRef(false);
   const isSubmittingRunRef = useRef(false); // prevents double-submit
@@ -574,6 +564,7 @@ export const useFlowEngine = (
         // execution_finished: authoritative terminal event
         if (msgType === 'error') {
           const msgText = msg.message || '';
+          const diagnostic = executionDiagnostic(msg);
           const hasStatus = isTerminalStatus(msg.status);
           if (
             restoredExecutionRef.current
@@ -592,8 +583,9 @@ export const useFlowEngine = (
               setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
               dispatchExecution({ type: 'FINISH', status, message: msg.message });
               addLog(
-                msgText || `Execution ${status}`,
+                diagnostic.message,
                 status === 'interrupted' || status === 'cancelled' ? 'warning' : 'error',
+                diagnostic.details,
               );
             }
             return;
@@ -607,7 +599,7 @@ export const useFlowEngine = (
           setWebsocketStatus('connected');
           sessionStorage.removeItem('WorkFlow_execution_id');
           dispatchExecution({ type: 'RESET' });
-          addLog(msgText || 'Unknown Error', 'error');
+          addLog(diagnostic.message, 'error', diagnostic.details);
           setEdges(eds => eds.map(e => e.animated ? { ...e, animated: false } : e));
           resetRuntimeNodeState(setNodes);
           return;
@@ -616,6 +608,7 @@ export const useFlowEngine = (
         // execution_started
         if (msgType === 'execution_started') {
           if (!msg.executionId) return;
+          loggedNodeStatesRef.current.clear();
           finishedRef.current = false;
           windowProgressProtocolRef.current = createWindowProgressProtocolState(
             msg.executionId,
@@ -753,7 +746,7 @@ export const useFlowEngine = (
             }
           }
           if (!msg.taskId) return;
-          setNodes(nds => nds.map(n => {
+          setNodes(nds => mapGraphNodes(nds, n => {
             if (n.id !== msg.taskId) return n;
             return {
               ...n,
@@ -774,8 +767,15 @@ export const useFlowEngine = (
             dispatchExecution({ type: 'SET_PHASE', phase: 'running' });
           }
 
-          if (msg.message?.toLowerCase().includes('error')) {
-            addLog(`[${msg.taskId}] ${msg.message}`, 'error');
+          const nodeStateKey = `${msg.executionId}:${msg.taskId}:${msg.runState}`;
+          if (!loggedNodeStatesRef.current.has(nodeStateKey) && msg.message !== 'Initializing...') {
+            loggedNodeStatesRef.current.add(nodeStateKey);
+            if (msg.runState === 'failed') {
+              const diagnostic = executionDiagnostic(msg);
+              addLog(diagnostic.message, 'error', diagnostic.details);
+            } else if (['ready', 'running', 'done'].includes(msg.runState ?? '')) {
+              addLog(`${msg.nodeType || 'Node'} [${msg.taskId}]: ${msg.message || msg.runState}`, 'info');
+            }
           }
           return;
         }
@@ -808,10 +808,15 @@ export const useFlowEngine = (
 
           const logType: LogEntry['type'] = status === 'succeeded'
             ? 'success'
-            : status === 'interrupted'
+            : status === 'interrupted' || status === 'cancelled'
               ? 'warning'
               : 'error';
-          addLog(msg.message || `Execution ${status}`, logType);
+          if (status === 'failed') {
+            const diagnostic = executionDiagnostic(msg);
+            addLog(diagnostic.message, logType, diagnostic.details);
+          } else {
+            addLog(msg.message || `Execution ${status}`, logType);
+          }
           return;
         }
 
@@ -1087,7 +1092,7 @@ export const useFlowEngine = (
     dispatchExecution({ type: 'START', executionId });
 
     setEdges(currentEdges => currentEdges.map(edge => ({ ...edge, animated: true })));
-    setNodes(currentNodes => currentNodes.map(node => ({
+    setNodes(currentNodes => mapGraphNodes(currentNodes, node => ({
       ...node,
       data: {
         ...node.data,
@@ -1100,13 +1105,19 @@ export const useFlowEngine = (
     })));
 
     try {
+      const snapshot = copySubmittedExecutionSettings({
+        executionId, config: executionConfig, ...workerResourcePayload(), preflight: executionPreflightRef.current,
+      });
       ws.send(JSON.stringify({
         command: 'execute_graph',
         graph,
         executionId,
         executionConfig,
-        ...workerResourcePayload(),
+        workerProfiles: snapshot.workerProfiles,
+        workerPools: snapshot.workerPools,
       }));
+      setSubmittedExecutionSettings(snapshot);
+      rememberSubmittedExecutionSettings(snapshot);
       addLog(
         executionConfig.mode === 'window' && executionConfig.resumeAction === 'resume'
           ? 'Resuming Workflow...'
@@ -1185,7 +1196,7 @@ export const useFlowEngine = (
       throw new Error('Another execution is already active.');
     }
 
-    const graph = buildExecutionGraph(nodes, edges);
+    const graph = buildExecutionGraph({ nodes, edges });
     const requestId = preflightRequestIdRef.current + 1;
     preflightRequestIdRef.current = requestId;
     preflightAbortRef.current?.abort();
@@ -1400,6 +1411,7 @@ export const useFlowEngine = (
     isPreflighting,
     executionPreflight,
     lastSubmittedExecutionConfig,
+    submittedExecutionSettings,
     isRecoveryBrowserOpen,
     recoveredGraphView,
     executionState,

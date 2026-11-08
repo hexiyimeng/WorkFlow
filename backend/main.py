@@ -19,6 +19,7 @@ from core.state_manager import ExecutionStatus, state_manager
 # 引入路由模块
 from api.http_routes import router as http_router
 from api.websocket import router as ws_router
+from api.library_routes import router as library_router
 
 from core.logger import logger
 
@@ -181,6 +182,7 @@ app.add_middleware(
 
 # 注册业务 API 路由
 app.include_router(http_router)
+app.include_router(library_router)
 app.include_router(ws_router)
 
 # ==========================================

@@ -30,6 +30,15 @@ const resumed = normalizeWindowProgress({
 });
 assert(resumed?.completedWindows === 4, 'resume progress should preserve completed Windows');
 
+const concurrent = normalizeWindowProgress({
+  currentWindow: 3, completedWindows: 0, totalWindows: 3, progress: 100, windowStatus: 'running',
+});
+assert(concurrent?.progress === 0, 'submitting all concurrent Windows must not fill the completion bar');
+const outOfOrder = normalizeWindowProgress({
+  currentWindow: 3, completedWindows: 1, totalWindows: 3, windowStatus: 'running',
+});
+assert(outOfOrder?.progress === 100 / 3, 'out-of-order completions count exactly one completed Window');
+
 const finalizing = normalizeWindowProgress({
   currentWindow: 125,
   completedWindows: 125,

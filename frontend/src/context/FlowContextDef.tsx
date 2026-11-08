@@ -9,6 +9,7 @@ import type {
   WebSocketStatus,
   PluginDiagnostics,
   ExecutionPreflightResponse,
+  SubmittedExecutionSettings,
   RecoveredGraphView,
   RecoveryOpenResponse,
   RecoveryDeleteResponse,
@@ -17,10 +18,22 @@ import type {
   WorkflowExecutionSettings,
   WorkflowExecutionSettingsSource,
   WorkflowExecutionSettingsValidation,
+  LibraryReference,
 } from '../types';
+import type { useWorkflowLibrary } from '../hooks/useWorkflowLibrary';
 import type { ParsedWorkflowDocument } from '../utils/workflowPersistence';
 
-export interface FlowContextType {
+export interface FlowContextType extends ReturnType<typeof useWorkflowLibrary> {
+  rootNodes: Node<NodeData>[];
+  rootEdges: Edge[];
+  editGraph: (change: (graph: { nodes: Node<NodeData>[]; edges: Edge[] }) => { nodes: Node<NodeData>[]; edges: Edge[] }) => void;
+  subgraphPath: string[];
+  breadcrumbs: Array<{ id: string; name: string }>;
+  enterSubgraph: (id: string) => void;
+  navigateSubgraph: (depth: number) => void;
+  isNodeInspectorOpen: boolean;
+  openNodeInspector: () => void;
+  closeNodeInspector: () => void;
   // === State ===
   nodes: Node<NodeData>[];
   edges: Edge[];
@@ -48,6 +61,7 @@ export interface FlowContextType {
   isCancelling: boolean;       // phase === 'cancelling'
   isPreflighting: boolean;
   executionPreflight: ExecutionPreflightResponse | null;
+  submittedExecutionSettings: SubmittedExecutionSettings | null;
   isExecutionSettingsOpen: boolean;
   executionSettingsValidation: WorkflowExecutionSettingsValidation | null;
   isRecoveryBrowserOpen: boolean;
@@ -104,7 +118,7 @@ export interface FlowContextType {
   stopFlow: () => void;
   reloadNodes: () => Promise<void>;
   clearLogs: () => void;
-  addLog: (message: string, level?: 'info' | 'warning' | 'error' | 'success') => void;
+  addLog: (message: string, level?: 'info' | 'warning' | 'error' | 'success', details?: string) => void;
 
   // === Undo/Redo ===
   undo: () => void;
@@ -117,6 +131,8 @@ export interface FlowContextType {
 
   // === Workflow ===
   createWorkflow: () => void;
+  duplicateWorkflow: () => void;
+  clearWorkflow: () => void;
   switchWorkflow: (id: string) => void;
   deleteWorkflow: (id: string) => void;
   renameWorkflow: (id: string, name: string) => void;
@@ -125,6 +141,7 @@ export interface FlowContextType {
     document: ParsedWorkflowDocument,
     hydratedNodes: Node<NodeData>[],
     hydratedEdges: Edge[],
+    libraryRef?: LibraryReference,
   ) => void;
 }
 

@@ -1,0 +1,22 @@
+/* Only the perimeter catches the mouse. Widgets, slots, nodes and the empty
+   canvas inside remain accessible, unlike React Flow's filled drag overlay. */
+.workspace-canvas .react-flow__nodesselection-rect {
+  pointer-events: none;
+  border: 0;
+  background: transparent;
+  outline: none;
+}
+.workspace-canvas .react-flow__nodesselection-rect::after {
+  content: '';
+  position: absolute;
+  inset: -14px;
+  border: 1.5px dashed var(--color-accent);
+  border-radius: 10px;
+  pointer-events: auto;
+  cursor: grab;
+  /* Hollow hit area, 10 graph pixels wide. */
+  clip-path: polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0,
+    10px 10px, 10px calc(100% - 10px), calc(100% - 10px) calc(100% - 10px),
+    calc(100% - 10px) 10px, 10px 10px);
+}
+.workspace-canvas .react-flow__nodesselection-rect:active::after { cursor: grabbing; }

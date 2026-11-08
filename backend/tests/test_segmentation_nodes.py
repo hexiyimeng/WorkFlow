@@ -627,10 +627,23 @@ def test_is_block_dim_matches_nearest_rank_percentile():
     assert not _is_block_dim(np.full((4, 4), 5, dtype=np.uint16), 1.0, "cpu")
 
 
-def test_seg_models_scanned_from_node_directory():
+def test_seg_models_scanned_from_node_directory(tmp_path, monkeypatch):
+    from pathlib import Path
+    import core.model_registry as registry_module
+    import nodes.cellpose_segmentation_node as segmentation_module
     from core.model_registry import resolve_model_path
     from nodes.cellpose_segmentation_node import list_seg_models
 
+    # Discovery checks names and paths, not model weights. Keep the test usable
+    # on clean checkouts without the production machine's private checkpoints.
+    model_dir = tmp_path / "cellpose_segmentation"
+    model_dir.mkdir()
+    for name in ("199082", "cpdino-vitb"):
+        (model_dir / name).touch()
+    registry = registry_module.ModelRegistry(tmp_path / "models")
+    registry.register_search_root("cellpose", model_dir)
+    monkeypatch.setattr(registry_module, "model_registry", registry)
+    monkeypatch.setattr(segmentation_module, "SEG_MODELS_DIR", model_dir)
     seg_models = list_seg_models()
     assert "199082" in seg_models
     assert "cpdino-vitb" in seg_models
@@ -645,13 +658,15 @@ def test_seg_models_scanned_from_node_directory():
     for name in seg_models:
         resolved = resolve_model_path("cellpose", name)
         assert resolved is not None
-        assert resolved.endswith(f"cellpose_segmentation/{name}")
+        assert Path(resolved) == model_dir / name
 
 
-def test_duplicate_terminal_output_paths_rejected():
+def test_duplicate_terminal_output_paths_rejected(monkeypatch):
     import nodes.write_seg_cell_table_node  # noqa: F401  (register)
     import nodes.zarr_writer_node  # noqa: F401  (register)
     from services.executor import validate_graph_types
+
+    monkeypatch.setenv("WorkFlow_EXECUTION_BACKEND", "slurm")
 
     def graph_with(table_dir, zarr_path):
         return {
